@@ -1,0 +1,23 @@
+# Development dependencies for Instagram Downloader
+# Install with: pip install -r requirements-dev.txt
+
+# Include production dependencies
+-r requirements.txt
+
+# Code Quality Tools
+pre-commit>=3.5.0
+black>=24.1.0
+isort>=5.13.0
+ruff>=0.1.0
+
+# Security Scanning
+safety>=3.0.0
+pip-audit>=2.6.0
+detect-secrets>=1.4.0
+
+# Testing (optional, for future use)
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Type Checking (optional, for future use)
+mypy>=1.8.0

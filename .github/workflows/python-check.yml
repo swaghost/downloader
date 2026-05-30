@@ -1,0 +1,99 @@
+name: Python Code Quality
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "**.py"
+      - "requirements.txt"
+      - ".github/workflows/python-check.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "**.py"
+      - "requirements.txt"
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff black isort safety
+
+      - name: Display Python version
+        run: python --version
+
+      - name: Check Python syntax (AST validation)
+        run: |
+          echo "Checking Python syntax for all .py files..."
+          python -m py_compile $(find . -name "*.py" -not -path "./.venv/*" -not -path "./__pycache__/*")
+
+      - name: Run Ruff linter
+        run: |
+          echo "Running Ruff linter..."
+          ruff check . --line-length=120 --ignore=E501,F401,F841
+        continue-on-error: true
+
+      - name: Check code formatting with Black
+        run: |
+          echo "Checking code formatting..."
+          black --check --line-length=120 --diff .
+        continue-on-error: true
+
+      - name: Check import sorting with isort
+        run: |
+          echo "Checking import order..."
+          isort --check-only --profile=black --line-length=120 .
+        continue-on-error: true
+
+      - name: Security check with Safety
+        run: |
+          echo "Checking for known security vulnerabilities..."
+          safety check --ignore=70612
+        continue-on-error: true
+
+      - name: Import test for main modules
+        run: |
+          echo "Testing if main modules can be imported..."
+          python -c "import account_manager; print('✓ account_manager')"
+          python -c "import instagram_manager; print('✓ instagram_manager')"
+          python -c "import content_database_manager; print('✓ content_database_manager')"
+          python -c "import database_manager_sqlserver; print('✓ database_manager_sqlserver')"
+          python -c "import config; print('✓ config')"
+          echo "✓ All core modules imported successfully"
+
+      - name: Check for hardcoded secrets
+        run: |
+          echo "Checking for potential hardcoded secrets..."
+          ! grep -r "password.*=.*['\"]" --include="*.py" --exclude="config_constants.py" . || echo "⚠️  Potential hardcoded passwords found"
+          ! grep -r "ig_password" --include="*.py" . || echo "⚠️  Instagram password references found"
+
+  summary:
+    needs: code-quality
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check overall status
+        run: |
+          if [ "${{ needs.code-quality.result }}" == "success" ]; then
+            echo "✅ All code quality checks passed!"
+          else
+            echo "⚠️  Some checks failed or were skipped"
+            exit 1
+          fi

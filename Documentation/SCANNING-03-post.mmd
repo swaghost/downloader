@@ -1,0 +1,62 @@
+%% Instagram Scanning Process - Post Subprocess
+%% Detailed flow for scanning Instagram Posts including carousel detection
+
+flowchart TD
+    PostStart([Post Detected]) --> ExtractOG[Extract og:image/og:video<br/>- Primary media URL<br/>- Instagram's official designation]
+
+    ExtractOG --> ValidateOG[Validate OG URLs<br/>- Check malformation<br/>- Detect expiration<br/>- Auto-correct if needed]
+
+    ValidateOG --> OGValid{OG URL<br/>Valid?}
+    OGValid -->|Malformed| CorrectOG[🔧 Auto-Correct<br/>- Fix query separator<br/>- Log Instagram issue]
+    OGValid -->|Valid| CheckCarousel
+
+    CorrectOG --> CheckCarousel[Check for Carousel<br/>- Inspect DOM for carousel arrows<br/>- Check JSON-LD data<br/>- Count carousel dots]
+
+    CheckCarousel --> IsCarousel{Is<br/>Carousel?}
+    IsCarousel -->|No| SingleItem[Process Single Item<br/>- Trust og:image/og:video<br/>- Set content_sub_type]
+    IsCarousel -->|Yes| ScanCarousel[🎠 Scan Carousel Items]
+
+    SingleItem --> SingleType{Media<br/>Type?}
+    SingleType -->|Image| ProcessImage[Process Single Image<br/>- Validate resolution<br/>- Check for preview/thumbnail<br/>- Prefer full resolution]
+    SingleType -->|Video| ProcessVideo[Process Single Video<br/>- Enable CDP for segments<br/>- Capture audio if present]
+
+    ProcessImage --> CreateImageFile[Create Image File Entry<br/>- og:image URL (corrected)<br/>- High quality flag<br/>- Instagram issue metadata]
+    ProcessVideo --> CreateVideoFile[Create Video File Entry<br/>- Video segments<br/>- Audio segments<br/>- Quality metadata]
+
+    CreateImageFile --> PostSuccess
+    CreateVideoFile --> PostSuccess
+
+    ScanCarousel --> CarouselStrategy{Detection<br/>Strategy}
+    CarouselStrategy --> JSONParse[Strategy 1: Parse JSON-LD<br/>- Extract structured data<br/>- Get all carousel URLs]
+    CarouselStrategy --> DOMScrape[Strategy 2: DOM Scraping<br/>- Find all carousel images<br/>- Navigate carousel if needed]
+    CarouselStrategy --> CDPCapture[Strategy 3: CDP Network<br/>- Capture as carousel loads<br/>- Filter thumbnails]
+
+    JSONParse --> ValidateJSON{Valid<br/>Data?}
+    ValidateJSON -->|Yes| ProcessCarouselItems
+    ValidateJSON -->|No| DOMScrape
+
+    DOMScrape --> ValidateDOM{Items<br/>Found?}
+    ValidateDOM -->|Yes| ProcessCarouselItems
+    ValidateDOM -->|No| CDPCapture
+
+    CDPCapture --> ValidateCDP{Items<br/>Found?}
+    ValidateCDP -->|Yes| ProcessCarouselItems[Process Each Carousel Item<br/>For each item 1..N:<br/>- Validate URL<br/>- Determine type<br/>- Check quality]
+    ValidateCDP -->|No| CarouselError[❌ CAROUSEL_DETECTION_FAILED<br/>- No items found<br/>- All strategies failed]
+
+    ProcessCarouselItems --> DedupeItems[Deduplicate Items<br/>- Group by base URL<br/>- Remove thumbnails<br/>- Select highest quality]
+
+    DedupeItems --> CountValid{Item Count<br/>Valid?}
+    CountValid -->|Yes, 1-10| CreateCarouselFiles[Create File Entries<br/>For each item:<br/>- File number (01, 02, etc.)<br/>- CDN URL<br/>- Type (image/video)<br/>- Quality score]
+    CountValid -->|No, >10| FilterSidebar[⚠️ Too Many Items<br/>- Filter sidebar images<br/>- Remove profile pics<br/>- Limit to actual carousel items]
+    CountValid -->|No, 0| CarouselError
+
+    FilterSidebar --> CreateCarouselFiles
+    CreateCarouselFiles --> PostSuccess
+
+    PostSuccess([✅ Post Scan Complete])
+    CarouselError --> PostFail([❌ Post Scan Failed])
+
+    style PostStart fill:#90EE90
+    style PostSuccess fill:#90EE90
+    style PostFail fill:#FF6B6B
+    style CarouselError fill:#FF6B6B

@@ -1,0 +1,87 @@
+# Pre-commit hooks for code quality and consistency
+# Install: pip install pre-commit
+# Setup: pre-commit install
+# Run manually: pre-commit run --all-files
+# https://pre-commit.com
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^Documentation/
+      - id: end-of-file-fixer
+        exclude: ^Documentation/
+      - id: check-yaml
+      - id: check-json
+        exclude: settings.json # User-specific, may be malformed during dev
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  # Python-specific checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-ast # Validate Python syntax
+      - id: check-docstring-first
+      - id: debug-statements # Check for debugger imports and breakpoints
+      - id: name-tests-test
+        args: ["--pytest-test-first"]
+        exclude: ^test_
+
+  # Python code formatting with Black
+  - repo: https://github.com/psf/black
+    rev: 24.1.1
+    hooks:
+      - id: black
+        language_version: python3
+        args: ["--line-length=120"]
+
+  # Import sorting with isort
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile=black", "--line-length=120"]
+
+  # Security checks - detect secrets/passwords
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: |
+          (?x)^(
+            config_constants\.py|
+            config_local\.py|
+            config_local\.example\.py|
+            \.github/|
+            Documentation/
+          )$
+
+  # Python linting with Ruff (faster alternative to flake8)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.15
+    hooks:
+      - id: ruff
+        args: ["--fix", "--line-length=120"]
+
+  # Check requirements.txt formatting
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: requirements-txt-fixer
+
+# CI configuration
+ci:
+  autofix_commit_msg: |
+    [pre-commit.ci] auto fixes from pre-commit hooks
+  autofix_prs: true
+  autoupdate_commit_msg: "[pre-commit.ci] pre-commit autoupdate"
+  autoupdate_schedule: weekly
+  skip: [detect-secrets] # Skip secret detection in CI (requires baseline file)

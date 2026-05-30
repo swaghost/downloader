@@ -1,0 +1,37 @@
+%% Instagram Scanning Process - URL Validation Subprocess
+%% Validates CDN URLs, auto-corrects malformed queries, and checks expiration
+
+flowchart TD
+    URLInput([URL to Validate]) --> ParseURL[Parse URL<br/>- Extract components<br/>- Identify parameters]
+
+    ParseURL --> CheckFormat{Format<br/>Valid?}
+    CheckFormat -->|Invalid| FormatError[❌ INVALID_URL_FORMAT]
+    CheckFormat -->|Valid| CheckMalform
+
+    CheckMalform[Check for Malformation<br/>Pattern: \.ext&] --> IsMalformed{Malformed<br/>Query?}
+
+    IsMalformed -->|Yes: .ext&| AutoCorrect[🔧 Auto-Correct<br/>- Replace first & with ?<br/>- Log: instagram_malformed_query]
+    IsMalformed -->|No| CheckExpiry
+
+    AutoCorrect --> LogCorrection[Log Instagram Issue<br/>- url_source_issue<br/>- url_auto_corrected=TRUE<br/>- url_correction_log]
+
+    LogCorrection --> CheckExpiry
+
+    CheckExpiry[Check Expiration<br/>Parse 'oe' parameter] --> HasOE{Has oe<br/>Parameter?}
+
+    HasOE -->|Yes| ParseHex[Parse Hex Timestamp<br/>- Convert to datetime<br/>- Compare with now]
+    HasOE -->|No| ReturnValid
+
+    ParseHex --> IsExpired{Is<br/>Expired?}
+    IsExpired -->|Yes| LogExpired[Log Expiration<br/>- url_source_issue=instagram_expired<br/>- Calculate days expired<br/>- Suggest rescan]
+    IsExpired -->|No| ReturnValid
+
+    LogExpired --> ReturnExpired([Return: Expired URL<br/>+ Correction Log])
+    ReturnValid([Return: Valid URL<br/>+ Correction Log if corrected])
+    FormatError --> ReturnError([Return: Invalid])
+
+    style URLInput fill:#90EE90
+    style ReturnValid fill:#90EE90
+    style ReturnExpired fill:#FFD700
+    style ReturnError fill:#FF6B6B
+    style FormatError fill:#FF6B6B

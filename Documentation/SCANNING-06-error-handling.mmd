@@ -1,0 +1,29 @@
+%% Instagram Scanning Process - Error Detection and Handling
+%% Classifies errors and determines retry strategy
+
+flowchart TD
+    Error([Error Detected]) --> ClassifyError{Error<br/>Type?}
+
+    ClassifyError -->|Network| NetworkError[Network Error<br/>- Timeout<br/>- Connection refused<br/>- DNS failure]
+    ClassifyError -->|Access| AccessError[Access Error<br/>- Login required<br/>- Private account<br/>- Content deleted]
+    ClassifyError -->|Instagram| InstagramError[Instagram Error<br/>- Malformed URL<br/>- Expired signature<br/>- Rate limiting]
+    ClassifyError -->|System| SystemError[System Error<br/>- Browser crash<br/>- CDP failure<br/>- Memory error]
+
+    NetworkError --> LogError[Log Error Details<br/>- Error type<br/>- Error message<br/>- Timestamp]
+    AccessError --> LogError
+    InstagramError --> TrackInstagram[Track Instagram Issue<br/>- has_instagram_issues=TRUE<br/>- instagram_issue_notes<br/>- Separate from code bugs]
+    SystemError --> LogError
+
+    TrackInstagram --> UpdateStatus
+    LogError --> UpdateStatus[Update Entry Status<br/>- cdn_acquisition_status=error<br/>- download_status=error<br/>- Store error details]
+
+    UpdateStatus --> ShouldRetry{Retryable<br/>Error?}
+    ShouldRetry -->|Yes| ScheduleRetry[Suggest Rescan<br/>- User notification<br/>- Retry counter]
+    ShouldRetry -->|No| MarkFailed[Mark as Failed<br/>- Permanent failure<br/>- Needs manual review]
+
+    ScheduleRetry --> ErrorHandled([Error Handled])
+    MarkFailed --> ErrorHandled
+
+    style Error fill:#FF6B6B
+    style ErrorHandled fill:#FFD700
+    style TrackInstagram fill:#87CEEB

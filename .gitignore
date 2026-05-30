@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Pre-commit
+.pre-commit-config.yaml.swp
+
+# Logs
+*.log
+app_output.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project specific
+chrome_profile/
+test_data/
+test_data_path/
+test_download/
+test_download_real/
+test_DXmON03E/
+
+# Session files (stored in user directory, not in repo)
+*.session
+
+# User-specific configuration
+settings.json
+config_local.py
+
+# Temporary test accounts
+sassenheimer/
+G/
+
+# Database files (if any)
+*.db
+*.sqlite
+*.sqlite3

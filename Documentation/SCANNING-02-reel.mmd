@@ -1,0 +1,53 @@
+%% Instagram Scanning Process - Reel Subprocess
+%% Detailed flow for scanning Instagram Reels including CDP capture and validation
+
+flowchart TD
+    ReelStart([Reel Detected]) --> EnableCDP[Enable CDP Network Capture<br/>- Listen for video requests<br/>- Capture segments]
+
+    EnableCDP --> ExtractMeta[Extract Meta Tags<br/>- og:video<br/>- og:image]
+
+    ExtractMeta --> MetaFound{Meta Tags<br/>Found?}
+    MetaFound -->|Yes| ValidateMeta[Validate URL<br/>- Check for malformation<br/>- Detect expiration<br/>- Auto-correct if needed]
+    MetaFound -->|No| MetaFallback[⚠️ No meta tags<br/>- Try CDP only<br/>- Check for login wall]
+
+    ValidateMeta --> MetaValidation{URL<br/>Valid?}
+    MetaValidation -->|Malformed| CorrectURL[🔧 Auto-Correct URL<br/>- Fix .ext& to .ext?<br/>- Log Instagram issue]
+    MetaValidation -->|Expired| ExpiredURL[⚠️ Mark as expired<br/>- Set instagram_expired flag<br/>- Suggest rescan]
+    MetaValidation -->|Valid| CaptureVideo
+
+    CorrectURL --> CaptureVideo[Capture Video from CDP<br/>- Get all video segments<br/>- Capture audio if present]
+
+    CaptureVideo --> SegmentCheck{Segments<br/>Captured?}
+    SegmentCheck -->|Yes| ValidateSegments[Validate Segments<br/>- Check byte ranges<br/>- Verify sequence<br/>- Check for gaps]
+    SegmentCheck -->|No| CDPError[❌ CDP_CAPTURE_FAILED<br/>- No network traffic<br/>- Blocked by Instagram<br/>- Extension interference]
+
+    ValidateSegments --> SegmentValid{Segments<br/>Valid?}
+    SegmentValid -->|Yes| CheckAudio{Has<br/>Audio?}
+    SegmentValid -->|Gap at start| GapError[❌ MISSING_INITIAL_SEGMENTS<br/>- Segments don't start at 0<br/>- CDP capture started late]
+    SegmentValid -->|Gaps in middle| GapWarning[⚠️ SEGMENT_GAPS<br/>- Missing ranges<br/>- May need re-scan]
+
+    CheckAudio -->|Yes| CaptureAudio[Capture Audio Segments<br/>- Separate audio track<br/>- Match to video segments]
+    CheckAudio -->|No| CreateFileEntry
+
+    CaptureAudio --> AudioValid{Audio<br/>Complete?}
+    AudioValid -->|Yes| CreateFileEntry[Create File Entry<br/>- Store CDN URL<br/>- Record segments<br/>- Set file metadata]
+    AudioValid -->|No| AudioWarning[⚠️ AUDIO_INCOMPLETE<br/>- Flag for review]
+
+    AudioWarning --> CreateFileEntry
+    GapWarning --> CreateFileEntry
+
+    CreateFileEntry --> ReelSuccess([✅ Reel Scan Complete])
+
+    MetaFallback --> CaptureVideo
+    ExpiredURL --> CDPError
+    CDPError --> ReelFail([❌ Reel Scan Failed])
+    GapError --> ReelFail
+
+    style ReelStart fill:#90EE90
+    style ReelSuccess fill:#90EE90
+    style ReelFail fill:#FF6B6B
+    style CDPError fill:#FF6B6B
+    style GapError fill:#FF6B6B
+    style MetaWarning fill:#FFD700
+    style GapWarning fill:#FFD700
+    style AudioWarning fill:#FFD700

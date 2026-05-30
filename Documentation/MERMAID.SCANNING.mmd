@@ -1,0 +1,289 @@
+%% Instagram Scanning Process - Flow Diagrams
+%% This shows the complete scanning process for Instagram content entries,
+%% highlighting decision points, error paths, and areas for improvement
+
+%% ============================================
+%% Main Scanning Flow
+%% ============================================
+
+flowchart TD
+Start([User Clicks Scan]) --> Init[Initialize Downloader<br/>- Create Selenium driver<br/>- Set Chrome options<br/>- Configure CDP]
+
+    Init --> CheckLogin{Is User<br/>Logged In?}
+    CheckLogin -->|No| Login[Attempt Login<br/>- Navigate to Instagram<br/>- Enter credentials<br/>- Handle 2FA if needed]
+    CheckLogin -->|Yes| ValidateURL
+    Login --> LoginSuccess{Login<br/>Successful?}
+    LoginSuccess -->|No| LoginError[❌ LOGIN_FAILED<br/>- Record error<br/>- Update status]
+    LoginSuccess -->|Yes| ValidateURL
+
+    ValidateURL[Validate Instagram URL<br/>- Check URL format<br/>- Extract post ID<br/>- Determine type hint] --> Navigate[Navigate to URL<br/>- Load page in browser<br/>- Wait for content]
+
+    Navigate --> PageLoaded{Page<br/>Loaded?}
+    PageLoaded -->|No| NavError[❌ PAGE_LOAD_FAILED<br/>- Timeout<br/>- Network error<br/>- Blocked access]
+    PageLoaded -->|Yes| DetectType[Detect Content Type<br/>- Check URL pattern<br/>- Inspect page elements<br/>- Determine: post/reel/story]
+
+    DetectType --> TypeDecision{Content<br/>Type?}
+
+    TypeDecision -->|Reel| ScanReel[🎬 Scan Reel Process]
+    TypeDecision -->|Post| ScanPost[📷 Scan Post Process]
+    TypeDecision -->|Story| ScanStory[⏱️  Scan Story Process]
+    TypeDecision -->|Unknown| TypeError[❌ TYPE_DETECTION_FAILED<br/>- Ambiguous page structure<br/>- Login required?<br/>- Content deleted?]
+
+    ScanReel --> ReelFlow
+    ScanPost --> PostFlow
+    ScanStory --> StoryFlow
+
+    LoginError --> ErrorEnd[Record Error in Database<br/>- Set status: error<br/>- Save error details]
+    NavError --> ErrorEnd
+    TypeError --> ErrorEnd
+    ErrorEnd --> End([End])
+
+    style Start fill:#90EE90
+    style End fill:#FFB6C1
+    style LoginError fill:#FF6B6B
+    style NavError fill:#FF6B6B
+    style TypeError fill:#FF6B6B
+    style ErrorEnd fill:#FFA07A
+
+    click ScanReel "#reel-scanning-subprocess"
+    click ScanPost "#post-scanning-subprocess"
+
+%% ============================================
+%% Reel Scanning Subprocess
+%% ============================================
+
+flowchart TD
+ReelStart([Reel Detected]) --> EnableCDP[Enable CDP Network Capture<br/>- Listen for video requests<br/>- Capture segments]
+
+    EnableCDP --> ExtractMeta[Extract Meta Tags<br/>- og:video<br/>- og:image]
+
+    ExtractMeta --> MetaFound{Meta Tags<br/>Found?}
+    MetaFound -->|Yes| ValidateMeta[Validate URL<br/>- Check for malformation<br/>- Detect expiration<br/>- Auto-correct if needed]
+    MetaFound -->|No| MetaFallback[⚠️ No meta tags<br/>- Try CDP only<br/>- Check for login wall]
+
+    ValidateMeta --> MetaValidation{URL<br/>Valid?}
+    MetaValidation -->|Malformed| CorrectURL[🔧 Auto-Correct URL<br/>- Fix .ext& to .ext?<br/>- Log Instagram issue]
+    MetaValidation -->|Expired| ExpiredURL[⚠️ Mark as expired<br/>- Set instagram_expired flag<br/>- Suggest rescan]
+    MetaValidation -->|Valid| CaptureVideo
+
+    CorrectURL --> CaptureVideo[Capture Video from CDP<br/>- Get all video segments<br/>- Capture audio if present]
+
+    CaptureVideo --> SegmentCheck{Segments<br/>Captured?}
+    SegmentCheck -->|Yes| ValidateSegments[Validate Segments<br/>- Check byte ranges<br/>- Verify sequence<br/>- Check for gaps]
+    SegmentCheck -->|No| CDPError[❌ CDP_CAPTURE_FAILED<br/>- No network traffic<br/>- Blocked by Instagram<br/>- Extension interference]
+
+    ValidateSegments --> SegmentValid{Segments<br/>Valid?}
+    SegmentValid -->|Yes| CheckAudio{Has<br/>Audio?}
+    SegmentValid -->|Gap at start| GapError[❌ MISSING_INITIAL_SEGMENTS<br/>- Segments don't start at 0<br/>- CDP capture started late]
+    SegmentValid -->|Gaps in middle| GapWarning[⚠️ SEGMENT_GAPS<br/>- Missing ranges<br/>- May need re-scan]
+
+    CheckAudio -->|Yes| CaptureAudio[Capture Audio Segments<br/>- Separate audio track<br/>- Match to video segments]
+    CheckAudio -->|No| CreateFileEntry
+
+    CaptureAudio --> AudioValid{Audio<br/>Complete?}
+    AudioValid -->|Yes| CreateFileEntry[Create File Entry<br/>- Store CDN URL<br/>- Record segments<br/>- Set file metadata]
+    AudioValid -->|No| AudioWarning[⚠️ AUDIO_INCOMPLETE<br/>- Flag for review]
+
+    AudioWarning --> CreateFileEntry
+    GapWarning --> CreateFileEntry
+
+    CreateFileEntry --> ReelSuccess([✅ Reel Scan Complete])
+
+    MetaFallback --> CaptureVideo
+    ExpiredURL --> CDPError
+    CDPError --> ReelFail([❌ Reel Scan Failed])
+    GapError --> ReelFail
+
+    style ReelStart fill:#90EE90
+    style ReelSuccess fill:#90EE90
+    style ReelFail fill:#FF6B6B
+    style CDPError fill:#FF6B6B
+    style GapError fill:#FF6B6B
+    style MetaWarning fill:#FFD700
+    style GapWarning fill:#FFD700
+    style AudioWarning fill:#FFD700
+
+%% ============================================
+%% Post Scanning Subprocess
+%% ============================================
+
+flowchart TD
+PostStart([Post Detected]) --> ExtractOG[Extract og:image/og:video<br/>- Primary media URL<br/>- Instagram's official designation]
+
+    ExtractOG --> ValidateOG[Validate OG URLs<br/>- Check malformation<br/>- Detect expiration<br/>- Auto-correct if needed]
+
+    ValidateOG --> OGValid{OG URL<br/>Valid?}
+    OGValid -->|Malformed| CorrectOG[🔧 Auto-Correct<br/>- Fix query separator<br/>- Log Instagram issue]
+    OGValid -->|Valid| CheckCarousel
+
+    CorrectOG --> CheckCarousel[Check for Carousel<br/>- Inspect DOM for carousel arrows<br/>- Check JSON-LD data<br/>- Count carousel dots]
+
+    CheckCarousel --> IsCarousel{Is<br/>Carousel?}
+    IsCarousel -->|No| SingleItem[Process Single Item<br/>- Trust og:image/og:video<br/>- Set content_sub_type]
+    IsCarousel -->|Yes| ScanCarousel[🎠 Scan Carousel Items]
+
+    SingleItem --> SingleType{Media<br/>Type?}
+    SingleType -->|Image| ProcessImage[Process Single Image<br/>- Validate resolution<br/>- Check for preview/thumbnail<br/>- Prefer full resolution]
+    SingleType -->|Video| ProcessVideo[Process Single Video<br/>- Enable CDP for segments<br/>- Capture audio if present]
+
+    ProcessImage --> CreateImageFile[Create Image File Entry<br/>- og:image URL (corrected)<br/>- High quality flag<br/>- Instagram issue metadata]
+    ProcessVideo --> CreateVideoFile[Create Video File Entry<br/>- Video segments<br/>- Audio segments<br/>- Quality metadata]
+
+    CreateImageFile --> PostSuccess
+    CreateVideoFile --> PostSuccess
+
+    ScanCarousel --> CarouselStrategy{Detection<br/>Strategy}
+    CarouselStrategy --> JSONParse[Strategy 1: Parse JSON-LD<br/>- Extract structured data<br/>- Get all carousel URLs]
+    CarouselStrategy --> DOMScrape[Strategy 2: DOM Scraping<br/>- Find all carousel images<br/>- Navigate carousel if needed]
+    CarouselStrategy --> CDPCapture[Strategy 3: CDP Network<br/>- Capture as carousel loads<br/>- Filter thumbnails]
+
+    JSONParse --> ValidateJSON{Valid<br/>Data?}
+    ValidateJSON -->|Yes| ProcessCarouselItems
+    ValidateJSON -->|No| DOMScrape
+
+    DOMScrape --> ValidateDOM{Items<br/>Found?}
+    ValidateDOM -->|Yes| ProcessCarouselItems
+    ValidateDOM -->|No| CDPCapture
+
+    CDPCapture --> ValidateCDP{Items<br/>Found?}
+    ValidateCDP -->|Yes| ProcessCarouselItems[Process Each Carousel Item<br/>For each item 1..N:<br/>- Validate URL<br/>- Determine type<br/>- Check quality]
+    ValidateCDP -->|No| CarouselError[❌ CAROUSEL_DETECTION_FAILED<br/>- No items found<br/>- All strategies failed]
+
+    ProcessCarouselItems --> DedupeItems[Deduplicate Items<br/>- Group by base URL<br/>- Remove thumbnails<br/>- Select highest quality]
+
+    DedupeItems --> CountValid{Item Count<br/>Valid?}
+    CountValid -->|Yes, 1-10| CreateCarouselFiles[Create File Entries<br/>For each item:<br/>- File number (01, 02, etc.)<br/>- CDN URL<br/>- Type (image/video)<br/>- Quality score]
+    CountValid -->|No, >10| FilterSidebar[⚠️ Too Many Items<br/>- Filter sidebar images<br/>- Remove profile pics<br/>- Limit to actual carousel items]
+    CountValid -->|No, 0| CarouselError
+
+    FilterSidebar --> CreateCarouselFiles
+    CreateCarouselFiles --> PostSuccess
+
+    PostSuccess([✅ Post Scan Complete])
+    CarouselError --> PostFail([❌ Post Scan Failed])
+
+    style PostStart fill:#90EE90
+    style PostSuccess fill:#90EE90
+    style PostFail fill:#FF6B6B
+    style CarouselError fill:#FF6B6B
+
+%% ============================================
+%% URL Validation Subprocess
+%% ============================================
+
+flowchart TD
+URLInput([URL to Validate]) --> ParseURL[Parse URL<br/>- Extract components<br/>- Identify parameters]
+
+    ParseURL --> CheckFormat{Format<br/>Valid?}
+    CheckFormat -->|Invalid| FormatError[❌ INVALID_URL_FORMAT]
+    CheckFormat -->|Valid| CheckMalform
+
+    CheckMalform[Check for Malformation<br/>Pattern: \.ext&] --> IsMalformed{Malformed<br/>Query?}
+
+    IsMalformed -->|Yes: .ext&| AutoCorrect[🔧 Auto-Correct<br/>- Replace first & with ?<br/>- Log: instagram_malformed_query]
+    IsMalformed -->|No| CheckExpiry
+
+    AutoCorrect --> LogCorrection[Log Instagram Issue<br/>- url_source_issue<br/>- url_auto_corrected=TRUE<br/>- url_correction_log]
+
+    LogCorrection --> CheckExpiry
+
+    CheckExpiry[Check Expiration<br/>Parse 'oe' parameter] --> HasOE{Has oe<br/>Parameter?}
+
+    HasOE -->|Yes| ParseHex[Parse Hex Timestamp<br/>- Convert to datetime<br/>- Compare with now]
+    HasOE -->|No| ReturnValid
+
+    ParseHex --> IsExpired{Is<br/>Expired?}
+    IsExpired -->|Yes| LogExpired[Log Expiration<br/>- url_source_issue=instagram_expired<br/>- Calculate days expired<br/>- Suggest rescan]
+    IsExpired -->|No| ReturnValid
+
+    LogExpired --> ReturnExpired([Return: Expired URL<br/>+ Correction Log])
+    ReturnValid([Return: Valid URL<br/>+ Correction Log if corrected])
+    FormatError --> ReturnError([Return: Invalid])
+
+    style URLInput fill:#90EE90
+    style ReturnValid fill:#90EE90
+    style ReturnExpired fill:#FFD700
+    style ReturnError fill:#FF6B6B
+    style FormatError fill:#FF6B6B
+
+%% ============================================
+%% Caption and Tag Extraction
+%% ============================================
+
+flowchart TD
+ExtractStart([Extract Caption & Tags]) --> FindCaption[Find Caption Element<br/>- Locate description meta tag<br/>- Find article body<br/>- Check JSON-LD]
+
+    FindCaption --> CaptionFound{Caption<br/>Exists?}
+    CaptionFound -->|Yes| ExtractText[Extract Full Text<br/>- Unescape HTML entities<br/>- Preserve line breaks]
+    CaptionFound -->|No| NoCaption[Set: caption = empty]
+
+    ExtractText --> SeparateTags[Separate Caption from Tags<br/>- Identify hashtags (#)<br/>- Split into caption_text and tags]
+
+    SeparateTags --> ValidateTags{Tags<br/>Found?}
+    ValidateTags -->|Yes| ParseTags[Parse Tags<br/>- Extract each #tag<br/>- Space-separate list]
+    ValidateTags -->|No| NoTags[Set: tags = empty]
+
+    ParseTags --> StoreBoth[Store Both<br/>- file_caption (text only)<br/>- file_tags (space-separated)]
+    NoTags --> StoreBoth
+    NoCaption --> NoTags
+
+    StoreBoth --> ExtractComplete([✅ Caption/Tags Complete])
+
+    style ExtractStart fill:#90EE90
+    style ExtractComplete fill:#90EE90
+
+%% ============================================
+%% Error Detection and Handling
+%% ============================================
+
+flowchart TD
+Error([Error Detected]) --> ClassifyError{Error<br/>Type?}
+
+    ClassifyError -->|Network| NetworkError[Network Error<br/>- Timeout<br/>- Connection refused<br/>- DNS failure]
+    ClassifyError -->|Access| AccessError[Access Error<br/>- Login required<br/>- Private account<br/>- Content deleted]
+    ClassifyError -->|Instagram| InstagramError[Instagram Error<br/>- Malformed URL<br/>- Expired signature<br/>- Rate limiting]
+    ClassifyError -->|System| SystemError[System Error<br/>- Browser crash<br/>- CDP failure<br/>- Memory error]
+
+    NetworkError --> LogError[Log Error Details<br/>- Error type<br/>- Error message<br/>- Timestamp]
+    AccessError --> LogError
+    InstagramError --> TrackInstagram[Track Instagram Issue<br/>- has_instagram_issues=TRUE<br/>- instagram_issue_notes<br/>- Separate from code bugs]
+    SystemError --> LogError
+
+    TrackInstagram --> UpdateStatus
+    LogError --> UpdateStatus[Update Entry Status<br/>- cdn_acquisition_status=error<br/>- download_status=error<br/>- Store error details]
+
+    UpdateStatus --> ShouldRetry{Retryable<br/>Error?}
+    ShouldRetry -->|Yes| ScheduleRetry[Suggest Rescan<br/>- User notification<br/>- Retry counter]
+    ShouldRetry -->|No| MarkFailed[Mark as Failed<br/>- Permanent failure<br/>- Needs manual review]
+
+    ScheduleRetry --> ErrorHandled([Error Handled])
+    MarkFailed --> ErrorHandled
+
+    style Error fill:#FF6B6B
+    style ErrorHandled fill:#FFD700
+    style TrackInstagram fill:#87CEEB
+
+%% ============================================
+%% IMPROVEMENT AREAS (Reference Only)
+%% ============================================
+%%
+%% 🎯 High Priority Improvements:
+%% 1. Type Detection Reliability - Multiple strategies, confidence scoring
+%% 2. Carousel Item Detection - JSON-LD, DOM, CDP strategies
+%% 3. URL Validation - Retry logic for expired URLs
+%% 4. Segment Capture - Gap filling, audio sync validation
+%% 5. Error Attribution - Better categorization
+%%
+%% 🔧 Medium Priority:
+%% 6. Quality Verification - Resolution validation
+%% 7. Login Handling - Session persistence, 2FA
+%% 8. Caption/Tag Extraction - Multiple strategies
+%%
+%% 📊 Testing & Validation:
+%% 9. Test Case System - Automated regression testing
+%% 10. Validation Checkpoints - At key process stages
+%%
+%% Legend:
+%% 🟢 Success Path | 🔴 Error Path | 🟡 Warning/Fallback
+%% 🔧 Auto-Correction | ⚠️ Needs Attention
+%% ✅ Completed | ❌ Failed

@@ -1,0 +1,24 @@
+%% Instagram Scanning Process - Caption and Tag Extraction
+%% Extracts and separates caption text from hashtags
+
+flowchart TD
+    ExtractStart([Extract Caption & Tags]) --> FindCaption[Find Caption Element<br/>- Locate description meta tag<br/>- Find article body<br/>- Check JSON-LD]
+
+    FindCaption --> CaptionFound{Caption<br/>Exists?}
+    CaptionFound -->|Yes| ExtractText[Extract Full Text<br/>- Unescape HTML entities<br/>- Preserve line breaks]
+    CaptionFound -->|No| NoCaption[Set: caption = empty]
+
+    ExtractText --> SeparateTags[Separate Caption from Tags<br/>- Identify hashtags (#)<br/>- Split into caption_text and tags]
+
+    SeparateTags --> ValidateTags{Tags<br/>Found?}
+    ValidateTags -->|Yes| ParseTags[Parse Tags<br/>- Extract each #tag<br/>- Space-separate list]
+    ValidateTags -->|No| NoTags[Set: tags = empty]
+
+    ParseTags --> StoreBoth[Store Both<br/>- file_caption (text only)<br/>- file_tags (space-separated)]
+    NoTags --> StoreBoth
+    NoCaption --> NoTags
+
+    StoreBoth --> ExtractComplete([✅ Caption/Tags Complete])
+
+    style ExtractStart fill:#90EE90
+    style ExtractComplete fill:#90EE90

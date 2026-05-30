@@ -1,0 +1,41 @@
+%% Instagram Scanning Process - Main Flow
+%% Overall process from user click to scan completion
+
+flowchart TD
+    Start([User Clicks Scan]) --> Init[Initialize Downloader<br/>- Create Selenium driver<br/>- Set Chrome options<br/>- Configure CDP]
+
+    Init --> CheckLogin{Is User<br/>Logged In?}
+    CheckLogin -->|No| Login[Attempt Login<br/>- Navigate to Instagram<br/>- Enter credentials<br/>- Handle 2FA if needed]
+    CheckLogin -->|Yes| ValidateURL
+    Login --> LoginSuccess{Login<br/>Successful?}
+    LoginSuccess -->|No| LoginError[❌ LOGIN_FAILED<br/>- Record error<br/>- Update status]
+    LoginSuccess -->|Yes| ValidateURL
+
+    ValidateURL[Validate Instagram URL<br/>- Check URL format<br/>- Extract post ID<br/>- Determine type hint] --> Navigate[Navigate to URL<br/>- Load page in browser<br/>- Wait for content]
+
+    Navigate --> PageLoaded{Page<br/>Loaded?}
+    PageLoaded -->|No| NavError[❌ PAGE_LOAD_FAILED<br/>- Timeout<br/>- Network error<br/>- Blocked access]
+    PageLoaded -->|Yes| DetectType[Detect Content Type<br/>- Check URL pattern<br/>- Inspect page elements<br/>- Determine: post/reel/story]
+
+    DetectType --> TypeDecision{Content<br/>Type?}
+
+    TypeDecision -->|Reel| ScanReel[🎬 Scan Reel Process]
+    TypeDecision -->|Post| ScanPost[📷 Scan Post Process]
+    TypeDecision -->|Story| ScanStory[⏱️  Scan Story Process]
+    TypeDecision -->|Unknown| TypeError[❌ TYPE_DETECTION_FAILED<br/>- Ambiguous page structure<br/>- Login required?<br/>- Content deleted?]
+
+    ScanReel --> ReelFlow
+    ScanPost --> PostFlow
+    ScanStory --> StoryFlow
+
+    LoginError --> ErrorEnd[Record Error in Database<br/>- Set status: error<br/>- Save error details]
+    NavError --> ErrorEnd
+    TypeError --> ErrorEnd
+    ErrorEnd --> End([End])
+
+    style Start fill:#90EE90
+    style End fill:#FFB6C1
+    style LoginError fill:#FF6B6B
+    style NavError fill:#FF6B6B
+    style TypeError fill:#FF6B6B
+    style ErrorEnd fill:#FFA07A
