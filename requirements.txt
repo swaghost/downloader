@@ -1,7 +1,7 @@
 # Instagram Downloader - Minimal Dependencies
 
 # Core Instagram functionality
-instaloader>=4.10
+instaloader>=4.15.1
 
 # GUI framework
 PyQt5>=5.15.0
