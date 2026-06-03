@@ -277,13 +277,21 @@ class LoadPageThread(QThread):
             
             # Map filter dropdown to filter type
             filter_type = None
-            if filter_ui == 'Only Ignored':
+            if filter_ui == 'Only Ignored (Black) Items':
                 filter_type = 'ignored'
             elif filter_ui == 'Only Uncategorized':
                 filter_type = 'uncategorized'
+            elif filter_ui == 'Only Categorized & Undownloaded':
+                filter_type = 'categorized_undownloaded'
+            elif filter_ui == 'Only Error Items':
+                filter_type = 'error'
+            elif filter_ui == 'Specific Topic-Undownloaded':
+                filter_type = 'specific_topic_undownloaded'
             
-            # Use topic name directly (or None if "All Topics")
-            topic_name = None if topic_filter == 'All Topics' else topic_filter
+            # Only apply topic criteria for the specific-topic filter mode.
+            topic_name = None
+            if filter_ui == 'Specific Topic-Undownloaded':
+                topic_name = None if topic_filter == 'All Topics' else topic_filter
             
             logger.info(f"[LoadPageThread] Page {self.page_num}: Calling get_all_account_entries with sort_by={sort_by_db}, direction={sort_direction}")
             
@@ -493,6 +501,14 @@ class DownloadThread(QThread):
                 
                 # Emit the actual exception message
                 self.download_complete.emit(shortcode, False, "", error_msg, [], {})
+
+            # Emit detailed action report after each processed item.
+            completed = success + failed
+            percent = int((completed * 100) / total) if total else 100
+            if failed > 0:
+                self.status.emit(f"{completed} / {total} ({percent}%, {failed} failures)")
+            else:
+                self.status.emit(f"{completed} / {total} ({percent}%)")
         
         self.finished.emit(success, failed)
 
@@ -1542,16 +1558,25 @@ class InstagramDownloaderGUI(QMainWindow):
         # Filter dropdown
         controls.addWidget(QLabel("Filter:"))
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All (Unfiltered)", "Only Ignored", "Only Uncategorized"])
+        self.filter_combo.addItems([
+            "All (Unfiltered)",
+            "Only Ignored (Black) Items",
+            "Only Uncategorized",
+            "Only Categorized & Undownloaded",
+            "Only Error Items",
+            "Specific Topic-Undownloaded",
+        ])
         self.filter_combo.setCurrentText("All (Unfiltered)")
         self.filter_combo.currentTextChanged.connect(self.apply_sort_and_filter)
-        self.filter_combo.setToolTip("Filter posts by category")
+        self.filter_combo.setToolTip("Filter posts by status:\n• Ignored (Black) Items - user marked as ignored\n• Uncategorized - no topic assigned\n• Categorized & Undownloaded - pink items with topic but not downloaded\n• Error Items - red items where download failed\n• Specific Topic-Undownloaded - pick a topic from the topic list")
         controls.addWidget(self.filter_combo)
         
         # Topic filter dropdown (dynamically populated)
         controls.addWidget(QLabel("Topic:"))
         self.topic_filter_combo = QComboBox()
-        self.topic_filter_combo.addItem("All Topics")
+        self.topic_filter_combo.setMinimumWidth(260)
+        self.topic_filter_combo.addItem("All Topics", None)
+        self.topic_filter_combo.setEnabled(False)
         self.topic_filter_combo.currentTextChanged.connect(self.apply_sort_and_filter)
         self.topic_filter_combo.setToolTip("Filter by specific topic")
         controls.addWidget(self.topic_filter_combo)
@@ -1841,6 +1866,13 @@ class InstagramDownloaderGUI(QMainWindow):
         self.last_page_btn.clicked.connect(self.last_page)
         pagination_bottom.addWidget(self.last_page_btn)
         
+        # Add Refresh Page button
+        refresh_page_btn = QPushButton("🔄 Refresh")
+        refresh_page_btn.clicked.connect(self.refresh_current_page)
+        refresh_page_btn.setToolTip("Reload current page from database (fixes missing video controls)")
+        refresh_page_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; font-weight: bold; }")
+        pagination_bottom.addWidget(refresh_page_btn)
+        
         tile_layout.addLayout(pagination_bottom)
         
         # Add both views to stacked widget
@@ -1893,8 +1925,6 @@ class InstagramDownloaderGUI(QMainWindow):
         color_key_label.setStyleSheet("margin-top: 10px; padding: 5px;")  # No hardcoded color
         details_container.addWidget(color_key_label)
         
-        details_container.addStretch()  # Prevent expansion of details section
-        
         # Create vertical color key with solid boxes
         color_key_layout = QVBoxLayout()
         color_key_layout.setSpacing(3)
@@ -1925,6 +1955,8 @@ class InstagramDownloaderGUI(QMainWindow):
             color_key_layout.addLayout(item_layout)
         
         details_container.addLayout(color_key_layout)
+        
+        details_container.addStretch()  # Push color key to top, prevent expansion
         
         # Store current entry for copy button
         self.current_entry = None
@@ -4583,7 +4615,15 @@ class InstagramDownloaderGUI(QMainWindow):
         self.current_sort_by = self.sort_by_combo.currentText()
         self.current_sort_direction = self.sort_direction_combo.currentText()
         self.current_filter = self.filter_combo.currentText()
-        self.current_topic_filter = self.topic_filter_combo.currentText()
+        self.current_topic_filter = self.topic_filter_combo.currentData() or 'All Topics'
+        self.current_topic_filter_display = self.topic_filter_combo.currentText()
+
+        # Refresh the topic dropdown to match the active filter mode.
+        specific_topic_mode = self.current_filter == 'Specific Topic-Undownloaded'
+        self.topic_filter_combo.setEnabled(specific_topic_mode)
+        self.update_topic_filter_dropdown(specific_topic_mode)
+        self.current_topic_filter = self.topic_filter_combo.currentData() or 'All Topics'
+        self.current_topic_filter_display = self.topic_filter_combo.currentText()
         
         logger.info(f"=" * 60)
         logger.info(f"APPLY SORT AND FILTER")
@@ -4607,13 +4647,21 @@ class InstagramDownloaderGUI(QMainWindow):
             if self.content_db and self.content_db.db:
                 # Map filter UI to filter type
                 filter_type = None
-                if self.current_filter == 'Only Ignored':
+                if self.current_filter == 'Only Ignored (Black) Items':
                     filter_type = 'ignored'
                 elif self.current_filter == 'Only Uncategorized':
                     filter_type = 'uncategorized'
+                elif self.current_filter == 'Only Categorized & Undownloaded':
+                    filter_type = 'categorized_undownloaded'
+                elif self.current_filter == 'Only Error Items':
+                    filter_type = 'error'
+                elif self.current_filter == 'Specific Topic-Undownloaded':
+                    filter_type = 'specific_topic_undownloaded'
                 
-                # Use topic name or None
-                topic_name = None if self.current_topic_filter == 'All Topics' else self.current_topic_filter
+                # Only apply topic criteria for the specific-topic filter mode.
+                topic_name = None
+                if self.current_filter == 'Specific Topic-Undownloaded':
+                    topic_name = None if self.current_topic_filter == 'All Topics' else self.current_topic_filter
                 
                 logger.info(f"Getting filtered count (filter_type={filter_type}, topic={topic_name})")
                 
@@ -4654,33 +4702,50 @@ class InstagramDownloaderGUI(QMainWindow):
             QApplication.restoreOverrideCursor()
             logger.info("=" * 60)
     
-    def update_topic_filter_dropdown(self):
+    def update_topic_filter_dropdown(self, specific_undownloaded_only=False):
         """Update the topic filter dropdown with current topics"""
         if not hasattr(self, 'topic_filter_combo'):
             return  # UI not initialized yet
         
-        current_selection = self.topic_filter_combo.currentText()
+        current_selection = self.topic_filter_combo.currentData()
         
         # Block signals while updating
         self.topic_filter_combo.blockSignals(True)
         self.topic_filter_combo.clear()
-        self.topic_filter_combo.addItem("All Topics")
         
-        # Get topics from database
-        if self.content_db and self.content_db.db:
-            try:
-                topics = self.content_db.db.get_all_topics()
-                for topic in topics:
-                    topic_name = topic.get('topic_name', '')
-                    if topic_name:
-                        self.topic_filter_combo.addItem(topic_name)
-            except Exception as e:
-                logger.error(f"Error loading topics for filter: {e}")
-        
-        # Restore previous selection if it still exists
-        index = self.topic_filter_combo.findText(current_selection)
-        if index >= 0:
-            self.topic_filter_combo.setCurrentIndex(index)
+        try:
+            if self.content_db and self.content_db.db:
+                if specific_undownloaded_only:
+                    topics = self.content_db.db.get_topics_with_undownloaded_counts()
+                    for topic in topics:
+                        topic_name = topic.get('topic_name', '')
+                        count = topic.get('undownloaded_count', 0)
+                        if topic_name and count > 0:
+                            self.topic_filter_combo.addItem(f"{topic_name} ({count})", topic_name)
+
+                    if self.topic_filter_combo.count() == 0:
+                        self.topic_filter_combo.addItem("No Topics With Undownloaded Items", '__NO_TOPICS__')
+                    else:
+                        index = self.topic_filter_combo.findData(current_selection)
+                        if index < 0:
+                            index = 0
+                        self.topic_filter_combo.setCurrentIndex(index)
+                else:
+                    self.topic_filter_combo.addItem("All Topics", None)
+                    topics = self.content_db.db.get_all_topics()
+                    for topic in topics:
+                        topic_name = topic.get('topic_name', '')
+                        if topic_name:
+                            self.topic_filter_combo.addItem(topic_name, topic_name)
+
+                    index = self.topic_filter_combo.findData(current_selection)
+                    if index >= 0:
+                        self.topic_filter_combo.setCurrentIndex(index)
+            else:
+                self.topic_filter_combo.addItem("All Topics", None)
+        except Exception as e:
+            logger.error(f"Error loading topics for filter: {e}")
+            self.topic_filter_combo.addItem("All Topics", None)
         
         self.topic_filter_combo.blockSignals(False)
     
@@ -5674,6 +5739,32 @@ class InstagramDownloaderGUI(QMainWindow):
             f"Post: {shortcode}\n\n"
             f"All newer posts have been added to your database."
         )
+
+    def show_auto_close_download_failed_dialog(self, shortcode, error_msg, timeout_ms=5000):
+        """Show a non-blocking download error dialog that closes automatically."""
+        if not hasattr(self, '_transient_dialogs'):
+            self._transient_dialogs = []
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Critical)
+        dialog.setWindowTitle("Download Failed")
+        dialog.setText(f"Download failed for {shortcode}")
+        dialog.setInformativeText(error_msg or "Unknown error")
+        dialog.setStandardButtons(QMessageBox.NoButton)
+        dialog.setModal(False)
+        dialog.show()
+
+        # Keep a reference so the dialog and timer remain alive until closed.
+        self._transient_dialogs.append(dialog)
+
+        def _close_and_cleanup():
+            try:
+                dialog.close()
+            finally:
+                if dialog in self._transient_dialogs:
+                    self._transient_dialogs.remove(dialog)
+
+        QTimer.singleShot(timeout_ms, _close_and_cleanup)
     
     def handle_download_complete(self, shortcode, success, file_path, error_msg, downloaded_files, metadata):
         """Handle individual download completion - update database and table"""
@@ -5684,6 +5775,10 @@ class InstagramDownloaderGUI(QMainWindow):
         
         # CRITICAL: If no files were downloaded, don't mark as completed
         actual_success = success and len(downloaded_files) > 0
+
+        # Show non-blocking error dialog that auto-closes after 5 seconds.
+        if not success:
+            self.show_auto_close_download_failed_dialog(shortcode, error_msg, timeout_ms=5000)
         
         if success and not downloaded_files:
             warning_msg = (
@@ -5952,6 +6047,12 @@ class InstagramDownloaderGUI(QMainWindow):
                 self.process_pending_topic_assignments(shortcode)
             except Exception as e:
                 logger.error(f"Error processing topic assignments for {shortcode}: {e}")
+            
+            # Handle filter recalculation if filter is active (single download)
+            try:
+                self.handle_post_download_filter_update()
+            except Exception as e:
+                logger.error(f"Error handling post-download filter update: {e}")
     
     def open_downloaded_file(self, shortcode, file_path=None):
         """Open downloaded content in file explorer, selecting a concrete file when possible."""
@@ -8365,6 +8466,7 @@ class InstagramDownloaderGUI(QMainWindow):
             process['total'] = len(shortcodes)
         
         download_thread.progress.connect(lambda c, t: self.process_manager.update_process(process_id, current=c, total=t))
+        download_thread.status.connect(lambda msg: self.statusBar().showMessage(msg))
         download_thread.download_complete.connect(self.handle_single_download_complete)
         download_thread.finished.connect(lambda s, f: self.on_download_thread_finished(download_thread, process_id))
         
@@ -8515,6 +8617,7 @@ class InstagramDownloaderGUI(QMainWindow):
             process['total'] = len(shortcodes)
         
         download_thread.progress.connect(lambda c, t: self.process_manager.update_process(process_id, current=c, total=t))
+        download_thread.status.connect(lambda msg: self.statusBar().showMessage(msg))
         download_thread.download_complete.connect(lambda shortcode, success, target_dir, error_msg, files, metadata: 
             self.handle_single_download_complete(shortcode, success, target_dir, error_msg, files, metadata, process_id))
         download_thread.finished.connect(lambda s, f: self.on_download_thread_finished(download_thread, process_id, s, f))
@@ -8599,6 +8702,7 @@ class InstagramDownloaderGUI(QMainWindow):
             process['total'] = len(shortcodes)
         
         download_thread.progress.connect(lambda c, t: self.process_manager.update_process(process_id, current=c, total=t))
+        download_thread.status.connect(lambda msg: self.statusBar().showMessage(msg))
         download_thread.download_complete.connect(lambda shortcode, success, target_dir, error_msg, files, metadata: 
             self.handle_single_download_complete(shortcode, success, target_dir, error_msg, files, metadata, process_id))
         download_thread.finished.connect(lambda s, f: self.on_download_thread_finished(download_thread, process_id, s, f))
@@ -8615,14 +8719,22 @@ class InstagramDownloaderGUI(QMainWindow):
         """Return True if status indicates the content is already downloaded."""
         return download_status in ['downloaded', 'completed', 're-downloaded']
 
+    def _is_error_status(self, download_status):
+        """Return True if status indicates previous download failure/issues."""
+        return download_status in ['error', 'failed', 'success_with_issues']
+
     def _post_is_topic_assigned_and_needs_download(self, post, allow_db_lookup=False):
-        """Return True if post has a topic assignment and is not already downloaded."""
+        """Return True if post has a topic assignment, needs download, and is not an error item."""
         shortcode = (post.get('shortcode') or '').strip()
         if not shortcode:
             return False
 
         download_status = post.get('download_status', 'not_downloaded')
         if self._is_downloaded_status(download_status):
+            return False
+
+        # Skip items that previously failed; do not retry these in bulk topic-assigned downloads.
+        if self._is_error_status(download_status):
             return False
 
         content_info = post.get('ContentInformation', {})
@@ -8904,8 +9016,12 @@ class InstagramDownloaderGUI(QMainWindow):
                 except Exception as e:
                     logger.error(f"Error updating database for failed download {shortcode}: {e}")
             
-            # Show error dialog
-            QMessageBox.critical(self, "Download Failed", f"Failed to download {shortcode}:\n{error_msg}\n\nThe tile should now be RED. You can retry the download.")
+            # Show non-blocking error dialog that auto-closes
+            self.show_auto_close_download_failed_dialog(
+                shortcode,
+                f"{error_msg}\n\nThe tile should now be RED. You can retry the download.",
+                timeout_ms=5000,
+            )
     
     def refresh_single_item(self, shortcode):
         """Refresh display for a single item (avoids race conditions with concurrent downloads)"""
@@ -9130,14 +9246,20 @@ class InstagramDownloaderGUI(QMainWindow):
                 # Map filter UI to filter type
                 filter_type = None
                 if hasattr(self, 'current_filter'):
-                    if self.current_filter == 'Only Ignored':
+                    if self.current_filter == 'Only Ignored (Black) Items':
                         filter_type = 'ignored'
                     elif self.current_filter == 'Only Uncategorized':
                         filter_type = 'uncategorized'
+                    elif self.current_filter == 'Only Categorized & Undownloaded':
+                        filter_type = 'categorized_undownloaded'
+                    elif self.current_filter == 'Only Error Items':
+                        filter_type = 'error'
+                    elif self.current_filter == 'Specific Topic-Undownloaded':
+                        filter_type = 'specific_topic_undownloaded'
                 
                 # Use topic name or None
                 topic_name = None
-                if hasattr(self, 'current_topic_filter') and self.current_topic_filter != 'All Topics':
+                if self.current_filter == 'Specific Topic-Undownloaded' and hasattr(self, 'current_topic_filter') and self.current_topic_filter != 'All Topics':
                     topic_name = self.current_topic_filter
                 
                 # Get filtered count
@@ -9749,6 +9871,136 @@ class InstagramDownloaderGUI(QMainWindow):
         if process_id:
             self.process_manager.update_process(process_id, current=current, total=total)
     
+    def handle_post_download_filter_update(self):
+        """
+        Handle filter recalculation after downloads complete.
+        
+        If a filter is active and items were downloaded:
+        - Recalculate filtered item count
+        - Adjust current page if needed (e.g., last page now empty)
+        - Reset to "All" filter if no items remain
+        """
+        # Check if we're on the Browse tab and a filter is active
+        if not hasattr(self, 'filter_combo') or not hasattr(self, 'content_db'):
+            return
+        
+        current_filter = self.filter_combo.currentText()
+        
+        # If "All (Unfiltered)", no special handling needed
+        if current_filter == 'All (Unfiltered)':
+            return
+        
+        logger.info(f"[FILTER_UPDATE] Active filter: {current_filter}, checking post-download state")
+        
+        try:
+            specific_topic_mode = current_filter == 'Specific Topic-Undownloaded'
+            self.update_topic_filter_dropdown(specific_topic_mode)
+
+            current_topic_name = None
+            if hasattr(self, 'topic_filter_combo'):
+                current_topic_name = self.topic_filter_combo.currentData() or 'All Topics'
+
+            # Map filter UI to filter type
+            filter_type = None
+            if current_filter == 'Only Ignored (Black) Items':
+                filter_type = 'ignored'
+            elif current_filter == 'Only Uncategorized':
+                filter_type = 'uncategorized'
+            elif current_filter == 'Only Categorized & Undownloaded':
+                filter_type = 'categorized_undownloaded'
+            elif current_filter == 'Only Error Items':
+                filter_type = 'error'
+            elif current_filter == 'Specific Topic-Undownloaded':
+                filter_type = 'specific_topic_undownloaded'
+            
+            # Only apply topic criteria for the specific-topic filter mode.
+            topic_name = None
+            if current_filter == 'Specific Topic-Undownloaded':
+                topic_name = None if current_topic_name == 'All Topics' else current_topic_name
+            
+            # Get new filtered count
+            new_filtered_count = self.content_db.db.get_content_count(
+                filter_type=filter_type,
+                topic_filter=topic_name
+            )
+            
+            logger.info(f"[FILTER_UPDATE] New filtered count: {new_filtered_count}")
+            
+            # Case 1: No items remain matching the filter
+            if new_filtered_count == 0:
+                logger.info(f"[FILTER_UPDATE] No items remain for filter '{current_filter}', switching to 'All'")
+                
+                # Switch to "All (Unfiltered)"
+                self.filter_combo.blockSignals(True)  # Prevent triggering apply_sort_and_filter
+                self.filter_combo.setCurrentText('All (Unfiltered)')
+                self.filter_combo.blockSignals(False)
+                
+                # Show dialog to user
+                QMessageBox.information(
+                    self,
+                    "Filter Reset",
+                    f"All items matching the filter '{current_filter}' have been processed.\n\n"
+                    f"Filter has been reset to 'All (Unfiltered)'."
+                )
+                
+                # Apply the new filter
+                self.apply_sort_and_filter()
+                return
+            
+            # Case 2: Items remain, update pagination
+            old_total = self.total_items
+            self.total_items = new_filtered_count
+            old_total_pages = (old_total + self.tiles_per_page - 1) // self.tiles_per_page
+            new_total_pages = (new_filtered_count + self.tiles_per_page - 1) // self.tiles_per_page
+            
+            logger.info(f"[FILTER_UPDATE] Total items: {old_total} -> {new_filtered_count}")
+            logger.info(f"[FILTER_UPDATE] Total pages: {old_total_pages} -> {new_total_pages}")
+            logger.info(f"[FILTER_UPDATE] Current page: {self.current_page + 1}")
+            
+            # Update pagination controls
+            if hasattr(self, 'current_page_spin') and hasattr(self, 'page_label'):
+                self.current_page_spin.setMaximum(max(1, new_total_pages))
+                self.page_label.setText(f"/ {new_total_pages}")
+            
+            # Case 3: Current page is now beyond last page
+            if self.current_page >= new_total_pages:
+                # Move to last valid page
+                new_page = max(0, new_total_pages - 1)
+                logger.info(f"[FILTER_UPDATE] Current page {self.current_page + 1} is beyond last page, moving to page {new_page + 1}")
+                
+                self.current_page = new_page
+                if hasattr(self, 'current_page_spin'):
+                    self.current_page_spin.blockSignals(True)
+                    self.current_page_spin.setValue(new_page + 1)
+                    self.current_page_spin.blockSignals(False)
+                
+                # Clear entire cache and reload the new current page
+                self.page_cache.clear()
+                self.last_displayed_page = -1
+            else:
+                # Current page is still valid, just clear its cache entry to force reload
+                logger.info(f"[FILTER_UPDATE] Current page is still valid, clearing cache for page {self.current_page}")
+                if self.current_page in self.page_cache:
+                    del self.page_cache[self.current_page]
+                self.last_displayed_page = -1
+                if hasattr(self, 'current_page_spin'):
+                    self.current_page_spin.blockSignals(True)
+                    self.current_page_spin.setValue(self.current_page + 1)
+                    self.current_page_spin.blockSignals(False)
+            
+            # Update status message
+            if hasattr(self, 'browse_status'):
+                self.browse_status.setText(f"Showing {new_filtered_count} items (filtered)")
+            
+            # Reload the current page data and repaint tiles
+            self.load_page(self.current_page)
+            self.preload_adjacent_pages(self.current_page)
+            if self.current_view_mode == 'tiles':
+                self.populate_tiles()
+            
+        except Exception as e:
+            logger.error(f"[FILTER_UPDATE] Error handling post-download filter update: {e}", exc_info=True)
+    
     def download_finished(self, success, failed, process_id=None):
         """Handle download completion"""
         # Restore cursor after operation completes
@@ -9806,6 +10058,9 @@ class InstagramDownloaderGUI(QMainWindow):
             self.download_status.setText("Ready to download")
         else:
             self.download_status.setText(f"{failed} download(s) failed - check debug info")
+        
+        # Handle filter recalculation if filter is active
+        self.handle_post_download_filter_update()
         
         # Refresh views to show newly downloaded content
         self.refresh_current_view()
@@ -11551,22 +11806,31 @@ class InstagramDownloaderGUI(QMainWindow):
         """Add media display to tile with interactive controls based on content type"""
         thumb_size = config['thumb']
         
+        logger.debug(f"[MEDIA_DISPLAY] {shortcode}: downloaded_files count={len(downloaded_files) if downloaded_files else 0}")
+        
         if downloaded_files:
             # Content is downloaded - add interactive controls
             file_count = len(downloaded_files)
             is_carousel = file_count > 1
+            has_video = any(f['type'] in ['video', 'mp4'] for f in downloaded_files)
+            
+            logger.info(f"[MEDIA_DISPLAY] {shortcode}: file_count={file_count}, is_carousel={is_carousel}, has_video={has_video}")
             
             if is_carousel:
                 # Carousel with navigation
+                logger.info(f"[MEDIA_DISPLAY] {shortcode}: Creating CAROUSEL display")
                 self._add_carousel_display(layout, tile, thumb_size, shortcode, downloaded_files)
             elif any(f['type'] in ['video', 'mp4'] for f in downloaded_files):
                 # Single video with play button
+                logger.info(f"[MEDIA_DISPLAY] {shortcode}: Creating VIDEO display with PLAY BUTTON")
                 self._add_video_display(layout, thumb_size, shortcode, downloaded_files[0])
             else:
                 # Single image with hover tooltip
+                logger.info(f"[MEDIA_DISPLAY] {shortcode}: Creating IMAGE display")
                 self._add_image_display(layout, thumb_size, downloaded_files[0])
         else:
             # Not downloaded - show regular thumbnail
+            logger.debug(f"[MEDIA_DISPLAY] {shortcode}: No files - creating PLACEHOLDER")
             self._add_placeholder_thumbnail(layout, thumb_size, shortcode)
     
     def _add_carousel_display(self, layout, tile, thumb_size, shortcode, downloaded_files):
@@ -12167,6 +12431,15 @@ class InstagramDownloaderGUI(QMainWindow):
         # Accept 'downloaded', 'completed', and 're-downloaded' status values
         downloaded_files = self.get_downloaded_files(shortcode) if status in ['downloaded', 'completed', 're-downloaded'] else []
         
+        # DEBUG: Log file retrieval for downloaded posts
+        if status in ['downloaded', 'completed', 're-downloaded']:
+            logger.info(f"[TILE] {shortcode}: status={status}, downloaded_files count={len(downloaded_files)}")
+            if downloaded_files:
+                for i, f in enumerate(downloaded_files):
+                    logger.info(f"[TILE] {shortcode}: file {i+1}: type={f.get('type')}, path exists={os.path.exists(f.get('path', ''))}")
+            else:
+                logger.warning(f"[TILE] {shortcode}: status={status} but no downloaded files found!")
+        
         # Add interactive media display based on download status
         self._add_tile_media_display(layout, tile, config, shortcode, downloaded_files)
         
@@ -12343,6 +12616,45 @@ class InstagramDownloaderGUI(QMainWindow):
                 self.load_page(self.current_page)
                 self.preload_adjacent_pages(self.current_page)
                 self.save_ui_setting('current_page', str(self.current_page))
+    
+    def refresh_current_page(self):
+        """Refresh current page by clearing cache and reloading from database"""
+        try:
+            logger.info(f"[REFRESH] Refreshing page {self.current_page + 1}...")
+            
+            # Remove current page from cache
+            if self.current_page in self.page_cache:
+                del self.page_cache[self.current_page]
+                logger.info(f"[REFRESH] Cleared page {self.current_page} from cache")
+            
+            # Cancel any pending load for this page
+            if self.current_page in self.loading_pages:
+                self.loading_pages.discard(self.current_page)
+            
+            if self.current_page in self.page_load_threads:
+                thread = self.page_load_threads[self.current_page]
+                try:
+                    thread.page_loaded.disconnect()
+                    thread.error.disconnect()
+                except:
+                    pass
+                thread.stop()
+                del self.page_load_threads[self.current_page]
+                thread.deleteLater()
+            
+            # Clear tile tracking to force full rebuild
+            self.current_tile_data = {}
+            self.last_displayed_page = -1
+            
+            # Reload from database
+            self.load_page(self.current_page)
+            
+            self.statusBar().showMessage(f"Page {self.current_page + 1} refreshed", 2000)
+            logger.info(f"[REFRESH] Page {self.current_page + 1} refresh complete")
+            
+        except Exception as e:
+            logger.error(f"Error refreshing page: {e}")
+            QMessageBox.warning(self, "Refresh Error", f"Failed to refresh page:\n{e}")
     
     def change_items_per_page(self, value):
         """Change number of items per page"""

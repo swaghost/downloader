@@ -256,7 +256,7 @@ class ContentDatabaseManager:
             offset: Number of entries to skip
             sort_by: Field to sort by ('row_number', 'saved_time', 'posted_time', 'import_time')
             sort_direction: Sort direction ('ASC' or 'DESC')
-            filter_type: Filter type ('ignored', 'uncategorized', or None for all)
+            filter_type: Filter type ('ignored', 'uncategorized', 'categorized_undownloaded', 'error', or None for all)
             topic_filter: Topic name to filter by (or None for all topics)
         
         Returns:

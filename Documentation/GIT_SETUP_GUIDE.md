@@ -23,6 +23,7 @@ git commit -m "Initial commit: Instagram Downloader with PyQt5 GUI"
 ```
 
 **What gets committed:**
+
 - ✅ All Python source files
 - ✅ Documentation
 - ✅ `config_local.example.py` (template)
@@ -35,6 +36,7 @@ git commit -m "Initial commit: Instagram Downloader with PyQt5 GUI"
 ### Step 3: Create GitHub Repository
 
 **Option A: Via GitHub Website**
+
 1. Go to https://github.com/new
 2. Repository name: `instagram-downloader` (or your choice)
 3. Description: "Instagram saved posts downloader with PyQt5 GUI and SQL Server backend"
@@ -43,6 +45,7 @@ git commit -m "Initial commit: Instagram Downloader with PyQt5 GUI"
 6. Click "Create repository"
 
 **Option B: Via GitHub CLI** (if installed)
+
 ```powershell
 gh repo create instagram-downloader --public --source=. --remote=origin
 ```
@@ -123,6 +126,7 @@ git check-ignore config_local.py settings.json
 ```
 
 **If you accidentally commit secrets:**
+
 ```powershell
 # Remove from git but keep local file
 git rm --cached config_local.py
@@ -191,21 +195,65 @@ git remote set-url origin NEW_URL
 
 ## 🐛 Troubleshooting
 
+**"fatal: unable to access... 403 error"**
+
+GitHub no longer accepts passwords for HTTPS authentication. You need a Personal Access Token (PAT):
+
+1. **Create a token:** Go to https://github.com/settings/tokens/new
+   - Token name: "Instagram Downloader"
+   - Expiration: 90 days or your choice
+   - Scopes: Check `repo` (full control) and `workflow`
+   - Click "Generate token" and **COPY IT** (you won't see it again)
+
+2. **Use token when pushing:**
+
+   ```powershell
+   git push -u origin main
+   # Username: your_github_username
+   # Password: [paste your token]
+   ```
+
+3. **Save credentials (optional):**
+   ```powershell
+   git config --global credential.helper store
+   # Token saved after first successful push
+   ```
+
+**Alternative: Use SSH instead of HTTPS:**
+
+```powershell
+# 1. Generate SSH key
+ssh-keygen -t ed25519 -C "your_email@example.com"
+
+# 2. Add public key to GitHub
+# Copy ~/.ssh/id_ed25519.pub to https://github.com/settings/ssh/new
+
+# 3. Change remote to SSH
+git remote set-url origin git@github.com:USERNAME/instagram-downloader.git
+
+# 4. Push
+git push -u origin main
+```
+
 **"Authentication failed"**
+
 - Use Personal Access Token instead of password
 - Create at: https://github.com/settings/tokens
 - Use token as password when prompted
 
 **"Repository not found"**
+
 - Verify remote URL: `git remote -v`
 - Check you created the repo on GitHub
 - Verify repository name matches
 
 **"Permission denied (publickey)"**
+
 - Setup SSH keys: https://docs.github.com/en/authentication/connecting-to-github-with-ssh
 - Or use HTTPS with token
 
 **"Pre-commit hooks failing"**
+
 - Run: `pre-commit run --all-files` to see errors
 - Fix issues or temporarily bypass: `git commit --no-verify`
 

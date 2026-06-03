@@ -393,7 +393,7 @@ class DatabaseManagerSQLServer:
             offset: Number of entries to skip
             sort_by: Field to sort by ('row_number', 'saved_time', 'posted_time', 'import_time')
             sort_direction: Sort direction ('ASC' or 'DESC')
-            filter_type: Filter type ('ignored', 'uncategorized', or None for all)
+            filter_type: Filter type ('ignored', 'uncategorized', 'categorized_undownloaded', 'error', or None for all)
             topic_filter: Topic name to filter by (or None for all topics)
         
         Returns:
@@ -404,6 +404,9 @@ class DatabaseManagerSQLServer:
         
         if account_name is None:
             account_name = self.account_name
+
+        if topic_filter == '__NO_TOPICS__':
+            return {}
         
         # Validate sort_by to prevent SQL injection
         valid_sort_fields = ['row_number', 'saved_time', 'posted_time', 'import_time']
@@ -415,29 +418,49 @@ class DatabaseManagerSQLServer:
             sort_direction = 'DESC'
         
         # Build WHERE clause based on filters
-        where_clauses = ['account_name = ?']
+        where_clauses = ['ce.account_name = ?']
         params = [account_name]
         
         if filter_type == 'ignored':
-            where_clauses.append("download_status = 'ignored'")
+            where_clauses.append("ce.download_status = 'ignored'")
         elif filter_type == 'uncategorized':
             # Content with no topic assignments
             where_clauses.append('''NOT EXISTS (
                 SELECT 1 FROM DL.topic_assignments ta 
-                WHERE ta.content_id = DL.content_entries.id AND ta.account_name = ?
+                WHERE ta.content_id = ce.id AND ta.account_name = ?
             )''')
             params.append(account_name)
+        elif filter_type == 'categorized_undownloaded':
+            # Content with topic assigned but not downloaded (pink items)
+            where_clauses.append('''EXISTS (
+                SELECT 1 FROM DL.topic_assignments ta 
+                WHERE ta.content_id = ce.id AND ta.account_name = ?
+            )''')
+            params.append(account_name)
+            where_clauses.append("ce.download_status NOT IN ('downloaded', 'completed', 're-downloaded', 'ignored')")
+        elif filter_type == 'error':
+            # Items with error or failed status (red items)
+            where_clauses.append("ce.download_status IN ('error', 'failed', 'success_with_issues')")
+        elif filter_type == 'specific_topic_undownloaded':
+            # Topic-assigned items that have not been downloaded yet
+            where_clauses.append('''EXISTS (
+                SELECT 1 FROM DL.topic_assignments ta 
+                WHERE ta.content_id = ce.id AND ta.account_name = ?
+            )''')
+            params.append(account_name)
+            where_clauses.append("ce.download_status NOT IN ('downloaded', 'completed', 're-downloaded', 'ignored')")
         
         if topic_filter:
             # Get topic_id from topic name
-            cursor.execute('SELECT topic_id FROM DL.topics WHERE topic_name = ?', (topic_filter,))
+            cursor.execute('SELECT id FROM DL.topics WHERE topic_name = ?', (topic_filter,))
             topic_row = cursor.fetchone()
             if topic_row:
                 topic_id = topic_row[0]
                 where_clauses.append(f'''EXISTS (
-                    SELECT 1 FROM DL.content_topics ct 
-                    WHERE ct.content_id = DL.content_entries.id 
-                    AND ct.topic_id = {topic_id}
+                    SELECT 1 FROM DL.topic_assignments ta 
+                    WHERE ta.content_id = ce.id 
+                    AND ta.account_name = '{self.account_name}'
+                    AND ta.topic_id = {topic_id}
                 )''')
         
         where_clause = ' AND '.join(where_clauses)
@@ -739,7 +762,7 @@ class DatabaseManagerSQLServer:
         
         Args:
             filters: Legacy dict filters (for backward compatibility)
-            filter_type: Filter type ('ignored', 'uncategorized', or None)
+            filter_type: Filter type ('ignored', 'uncategorized', 'categorized_undownloaded', 'error', or None)
             topic_filter: Topic name to filter by (or None)
         
         Returns:
@@ -747,6 +770,9 @@ class DatabaseManagerSQLServer:
         """
         conn = self._get_connection()
         cursor = conn.cursor()
+
+        if topic_filter == '__NO_TOPICS__':
+            return 0
         
         where_clauses = [f"account_name = '{self.account_name}'"]
         
@@ -765,11 +791,30 @@ class DatabaseManagerSQLServer:
                 WHERE ta.content_id = DL.content_entries.id 
                 AND ta.account_name = ''' + f"'{self.account_name}'" + '''
             )''')
+        elif filter_type == 'categorized_undownloaded':
+            # Content with topic assigned but not downloaded (pink items)
+            where_clauses.append('''EXISTS (
+                SELECT 1 FROM DL.topic_assignments ta 
+                WHERE ta.content_id = DL.content_entries.id 
+                AND ta.account_name = ''' + f"'{self.account_name}'" + '''
+            )''')
+            where_clauses.append("download_status NOT IN ('downloaded', 'completed', 're-downloaded', 'ignored')")
+        elif filter_type == 'error':
+            # Items with error or failed status (red items)
+            where_clauses.append("download_status IN ('error', 'failed', 'success_with_issues')")
+        elif filter_type == 'specific_topic_undownloaded':
+            # Topic-assigned items that have not been downloaded yet
+            where_clauses.append('''EXISTS (
+                SELECT 1 FROM DL.topic_assignments ta 
+                WHERE ta.content_id = DL.content_entries.id 
+                AND ta.account_name = ''' + f"'{self.account_name}'" + '''
+            )''')
+            where_clauses.append("download_status NOT IN ('downloaded', 'completed', 're-downloaded', 'ignored')")
         
         # Topic filter support
         if topic_filter:
             # Get topic_id from topic name
-            cursor.execute('SELECT topic_id FROM DL.topics WHERE topic_name = ?', (topic_filter,))
+            cursor.execute('SELECT id FROM DL.topics WHERE topic_name = ?', (topic_filter,))
             topic_row = cursor.fetchone()
             if topic_row:
                 topic_id = topic_row[0]
@@ -907,6 +952,44 @@ class DatabaseManagerSQLServer:
         ''')
         
         return [self._dict_from_row(cursor, row) for row in cursor.fetchall()]
+
+    def get_topics_with_undownloaded_counts(self, account_name: str = None) -> List[Dict[str, Any]]:
+        """Get topics that have undownloaded items, ordered alphabetically by topic name."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        if account_name is None:
+            account_name = self.account_name
+
+        cursor.execute('''
+            SELECT
+                t.id,
+                t.topic_name,
+                t.parent_topic_id,
+                COUNT(DISTINCT ta.content_id) AS undownloaded_count
+            FROM DL.topics t
+            INNER JOIN DL.topic_assignments ta
+                ON ta.topic_id = t.id
+               AND ta.account_name = ?
+            INNER JOIN DL.content_entries ce
+                ON ce.id = ta.content_id
+               AND ce.account_name = ?
+            WHERE ce.download_status NOT IN ('downloaded', 'completed', 're-downloaded')
+            GROUP BY t.id, t.topic_name, t.parent_topic_id
+            HAVING COUNT(DISTINCT ta.content_id) > 0
+            ORDER BY t.topic_name ASC
+        ''', (account_name, account_name))
+
+        topics = []
+        for row in cursor.fetchall():
+            topics.append({
+                'id': row[0],
+                'topic_name': row[1],
+                'parent_topic_id': row[2],
+                'undownloaded_count': row[3],
+            })
+
+        return topics
     
     def get_default_approval_topic(self) -> Optional[Dict[str, Any]]:
         """
