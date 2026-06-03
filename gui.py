@@ -5750,21 +5750,30 @@ class InstagramDownloaderGUI(QMainWindow):
         dialog.setWindowTitle("Download Failed")
         dialog.setText(f"Download failed for {shortcode}")
         dialog.setInformativeText(error_msg or "Unknown error")
-        dialog.setStandardButtons(QMessageBox.NoButton)
+        dialog.setStandardButtons(QMessageBox.Ok)
+        dialog.setDefaultButton(QMessageBox.Ok)
+        dialog.setWindowModality(Qt.NonModal)
         dialog.setModal(False)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.show()
 
         # Keep a reference so the dialog and timer remain alive until closed.
         self._transient_dialogs.append(dialog)
 
+        # Use a dialog-owned timer for reliable auto-close behavior.
+        timer = QTimer(dialog)
+        timer.setSingleShot(True)
+
         def _close_and_cleanup():
             try:
-                dialog.close()
+                if dialog.isVisible():
+                    dialog.accept()
             finally:
                 if dialog in self._transient_dialogs:
                     self._transient_dialogs.remove(dialog)
 
-        QTimer.singleShot(timeout_ms, _close_and_cleanup)
+        timer.timeout.connect(_close_and_cleanup)
+        timer.start(timeout_ms)
     
     def handle_download_complete(self, shortcode, success, file_path, error_msg, downloaded_files, metadata):
         """Handle individual download completion - update database and table"""
