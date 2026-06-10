@@ -1074,6 +1074,7 @@ class DatabaseManagerSQLServer:
                     id INT IDENTITY(1,1) PRIMARY KEY,
                     account_name NVARCHAR(100) NOT NULL,
                     content_id NVARCHAR(50) NOT NULL,
+                    row_number INT NULL,
                     topic_id INT NOT NULL,
                     assigned_at DATETIME2 DEFAULT GETDATE(),
                     file_movement_status NVARCHAR(20) DEFAULT 'Pending' CHECK (file_movement_status IN ('Pending', 'In Process', 'Complete', 'Error')),
@@ -1087,6 +1088,43 @@ class DatabaseManagerSQLServer:
         conn.commit()
         
         # Add columns to existing table if they don't exist (one at a time to avoid syntax issues)
+        cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sys.columns 
+                          WHERE object_id = OBJECT_ID('DL.topic_assignments') 
+                          AND name = 'row_number')
+            BEGIN
+                ALTER TABLE DL.topic_assignments
+                ADD row_number INT NULL
+            END
+        ''')
+        conn.commit()
+
+        # Backfill row_number from content_entries for existing assignments.
+        cursor.execute('''
+            UPDATE ta
+            SET ta.row_number = ce.row_number
+            FROM DL.topic_assignments ta
+            INNER JOIN DL.content_entries ce
+                ON ce.account_name = ta.account_name
+               AND ce.id = ta.content_id
+            WHERE ta.row_number IS NULL
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            IF NOT EXISTS (
+                SELECT 1
+                FROM sys.indexes
+                WHERE object_id = OBJECT_ID('DL.topic_assignments')
+                  AND name = 'IX_topic_assignments_account_row_topic'
+            )
+            BEGIN
+                CREATE NONCLUSTERED INDEX IX_topic_assignments_account_row_topic
+                ON DL.topic_assignments (account_name, row_number, topic_id)
+            END
+        ''')
+        conn.commit()
+
         cursor.execute('''
             IF NOT EXISTS (SELECT * FROM sys.columns 
                           WHERE object_id = OBJECT_ID('DL.topic_assignments') 
@@ -1138,7 +1176,222 @@ class DatabaseManagerSQLServer:
             END
         ''')
         conn.commit()
+
+        cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sys.columns 
+                          WHERE object_id = OBJECT_ID('DL.topic_assignments') 
+                          AND name = 'TreeUpdated')
+            BEGIN
+                ALTER TABLE DL.topic_assignments 
+                ADD TreeUpdated BIT NOT NULL CONSTRAINT DF_topic_assignments_TreeUpdated DEFAULT 0
+            END
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sys.columns 
+                          WHERE object_id = OBJECT_ID('DL.topic_assignments') 
+                          AND name = 'SiteUpdated')
+            BEGIN
+                ALTER TABLE DL.topic_assignments 
+                ADD SiteUpdated BIT NOT NULL CONSTRAINT DF_topic_assignments_SiteUpdated DEFAULT 0
+            END
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sys.columns 
+                          WHERE object_id = OBJECT_ID('DL.topic_assignments') 
+                          AND name = 'VidPrepUpdated')
+            BEGIN
+                ALTER TABLE DL.topic_assignments 
+                ADD VidPrepUpdated BIT NOT NULL CONSTRAINT DF_topic_assignments_VidPrepUpdated DEFAULT 0
+            END
+        ''')
+        conn.commit()
+
+        # Upgrade flags to 3-state values (0=To-Do, 1=Done, 2=Ignored).
+        cursor.execute('''
+            IF EXISTS (
+                SELECT 1
+                FROM sys.columns c
+                JOIN sys.types t ON c.user_type_id = t.user_type_id
+                WHERE c.object_id = OBJECT_ID('DL.topic_assignments')
+                  AND c.name = 'TreeUpdated'
+                  AND t.name = 'bit'
+            )
+            BEGIN
+                DECLARE @df_name_tree NVARCHAR(128)
+                SELECT @df_name_tree = dc.name
+                FROM sys.default_constraints dc
+                JOIN sys.columns c ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+                WHERE dc.parent_object_id = OBJECT_ID('DL.topic_assignments')
+                  AND c.name = 'TreeUpdated'
+
+                IF @df_name_tree IS NOT NULL
+                    EXEC('ALTER TABLE DL.topic_assignments DROP CONSTRAINT ' + QUOTENAME(@df_name_tree))
+
+                ALTER TABLE DL.topic_assignments ALTER COLUMN TreeUpdated TINYINT NOT NULL
+                ALTER TABLE DL.topic_assignments ADD CONSTRAINT DF_topic_assignments_TreeUpdated DEFAULT 0 FOR TreeUpdated
+            END
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            IF EXISTS (
+                SELECT 1
+                FROM sys.columns c
+                JOIN sys.types t ON c.user_type_id = t.user_type_id
+                WHERE c.object_id = OBJECT_ID('DL.topic_assignments')
+                  AND c.name = 'VidPrepUpdated'
+                  AND t.name = 'bit'
+            )
+            BEGIN
+                DECLARE @df_name_prep NVARCHAR(128)
+                SELECT @df_name_prep = dc.name
+                FROM sys.default_constraints dc
+                JOIN sys.columns c ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+                WHERE dc.parent_object_id = OBJECT_ID('DL.topic_assignments')
+                  AND c.name = 'VidPrepUpdated'
+
+                IF @df_name_prep IS NOT NULL
+                    EXEC('ALTER TABLE DL.topic_assignments DROP CONSTRAINT ' + QUOTENAME(@df_name_prep))
+
+                ALTER TABLE DL.topic_assignments ALTER COLUMN VidPrepUpdated TINYINT NOT NULL
+                ALTER TABLE DL.topic_assignments ADD CONSTRAINT DF_topic_assignments_VidPrepUpdated DEFAULT 0 FOR VidPrepUpdated
+            END
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            IF EXISTS (
+                SELECT 1
+                FROM sys.columns c
+                JOIN sys.types t ON c.user_type_id = t.user_type_id
+                WHERE c.object_id = OBJECT_ID('DL.topic_assignments')
+                  AND c.name = 'SiteUpdated'
+                  AND t.name = 'bit'
+            )
+            BEGIN
+                DECLARE @df_name_site NVARCHAR(128)
+                SELECT @df_name_site = dc.name
+                FROM sys.default_constraints dc
+                JOIN sys.columns c ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+                WHERE dc.parent_object_id = OBJECT_ID('DL.topic_assignments')
+                  AND c.name = 'SiteUpdated'
+
+                IF @df_name_site IS NOT NULL
+                    EXEC('ALTER TABLE DL.topic_assignments DROP CONSTRAINT ' + QUOTENAME(@df_name_site))
+
+                ALTER TABLE DL.topic_assignments ALTER COLUMN SiteUpdated TINYINT NOT NULL
+                ALTER TABLE DL.topic_assignments ADD CONSTRAINT DF_topic_assignments_SiteUpdated DEFAULT 0 FOR SiteUpdated
+            END
+        ''')
+        conn.commit()
+
+        # Ensure values stay in 0/1/2 domain.
+        cursor.execute('''
+            IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CHK_topic_assignments_TreeUpdated')
+            BEGIN
+                ALTER TABLE DL.topic_assignments
+                ADD CONSTRAINT CHK_topic_assignments_TreeUpdated CHECK (TreeUpdated IN (0, 1, 2))
+            END
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CHK_topic_assignments_SiteUpdated')
+            BEGIN
+                ALTER TABLE DL.topic_assignments
+                ADD CONSTRAINT CHK_topic_assignments_SiteUpdated CHECK (SiteUpdated IN (0, 1, 2))
+            END
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CHK_topic_assignments_VidPrepUpdated')
+            BEGIN
+                ALTER TABLE DL.topic_assignments
+                ADD CONSTRAINT CHK_topic_assignments_VidPrepUpdated CHECK (VidPrepUpdated IN (0, 1, 2))
+            END
+        ''')
+        conn.commit()
         logger.info("Ensured DL.topic_assignments table exists with file movement tracking columns")
+
+    def _resolve_content_row_number(self, content_id: Any, account_name: str = None) -> Optional[int]:
+        """Resolve row_number for a content identifier (shortcode/id or row number)."""
+        if account_name is None:
+            account_name = self.account_name
+
+        if content_id is None:
+            return None
+
+        # If caller already passed a row number, use it.
+        if isinstance(content_id, int):
+            return content_id
+
+        content_id_str = str(content_id).strip()
+        if not content_id_str:
+            return None
+
+        # Numeric string may already be a row number.
+        if content_id_str.isdigit():
+            try:
+                return int(content_id_str)
+            except ValueError:
+                pass
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                SELECT row_number
+                FROM DL.content_entries
+                WHERE account_name = ? AND id = ?
+            ''', (account_name, content_id_str))
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+        except Exception as e:
+            logger.debug(f"Failed to resolve row_number for content_id {content_id}: {e}")
+
+        return None
+
+    def _resolve_content_shortcode(self, content_ref: Any, account_name: str = None) -> Optional[str]:
+        """Resolve shortcode/id for a content reference (shortcode/id or row number)."""
+        if account_name is None:
+            account_name = self.account_name
+
+        if content_ref is None:
+            return None
+
+        # If caller passed shortcode/id directly, use it as-is.
+        if not isinstance(content_ref, int):
+            content_ref_str = str(content_ref).strip()
+            if not content_ref_str:
+                return None
+            if not content_ref_str.isdigit():
+                return content_ref_str
+            try:
+                content_ref = int(content_ref_str)
+            except ValueError:
+                return content_ref_str
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                SELECT id
+                FROM DL.content_entries
+                WHERE account_name = ? AND row_number = ?
+            ''', (account_name, int(content_ref)))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return str(row[0]).strip()
+        except Exception as e:
+            logger.debug(f"Failed to resolve shortcode for content_ref {content_ref}: {e}")
+
+        return None
     
     def add_topic_assignment(self, content_id: str, topic_id: int, account_name: str = None) -> bool:
         """
@@ -1154,15 +1407,17 @@ class DatabaseManagerSQLServer:
         """
         if account_name is None:
             account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
         
         conn = self._get_connection()
         cursor = conn.cursor()
         
         try:
             cursor.execute('''
-                INSERT INTO DL.topic_assignments (account_name, content_id, topic_id, file_movement_status)
-                VALUES (?, ?, ?, 'Pending')
-            ''', (account_name, content_id, topic_id))
+                INSERT INTO DL.topic_assignments (account_name, content_id, row_number, topic_id, file_movement_status)
+                VALUES (?, ?, ?, ?, 'Pending')
+            ''', (account_name, content_id, row_number, topic_id))
             conn.commit()
             return True
         except Exception as e:
@@ -1176,6 +1431,9 @@ class DatabaseManagerSQLServer:
         """Remove a topic assignment from content."""
         if account_name is None:
             account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
+        content_shortcode = self._resolve_content_shortcode(content_id, account_name)
         
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -1183,8 +1441,12 @@ class DatabaseManagerSQLServer:
         try:
             cursor.execute('''
                 DELETE FROM DL.topic_assignments
-                WHERE account_name = ? AND content_id = ? AND topic_id = ?
-            ''', (account_name, content_id, topic_id))
+                                WHERE account_name = ? AND topic_id = ?
+                                    AND (
+                                                (row_number IS NOT NULL AND row_number = ?)
+                                         OR (content_id = ?)
+                                    )
+                        ''', (account_name, topic_id, row_number, content_shortcode))
             conn.commit()
             return True
         except Exception as e:
@@ -1195,15 +1457,22 @@ class DatabaseManagerSQLServer:
         """Get all topic IDs assigned to a content item."""
         if account_name is None:
             account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
+        content_shortcode = self._resolve_content_shortcode(content_id, account_name)
         
         conn = self._get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
             SELECT topic_id FROM DL.topic_assignments
-            WHERE account_name = ? AND content_id = ?
+                        WHERE account_name = ?
+                            AND (
+                                        (row_number IS NOT NULL AND row_number = ?)
+                                 OR (content_id = ?)
+                            )
             ORDER BY assigned_at
-        ''', (account_name, content_id))
+                ''', (account_name, row_number, content_shortcode))
         
         return [row[0] for row in cursor.fetchall()]
     
@@ -1211,6 +1480,9 @@ class DatabaseManagerSQLServer:
         """Remove all topic assignments from a content item."""
         if account_name is None:
             account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
+        content_shortcode = self._resolve_content_shortcode(content_id, account_name)
         
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -1218,8 +1490,12 @@ class DatabaseManagerSQLServer:
         try:
             cursor.execute('''
                 DELETE FROM DL.topic_assignments
-                WHERE account_name = ? AND content_id = ?
-            ''', (account_name, content_id))
+                                WHERE account_name = ?
+                                    AND (
+                                                (row_number IS NOT NULL AND row_number = ?)
+                                         OR (content_id = ?)
+                                    )
+                        ''', (account_name, row_number, content_shortcode))
             conn.commit()
             return True
         except Exception as e:
@@ -1243,7 +1519,8 @@ class DatabaseManagerSQLServer:
             account_name = self.account_name
         
         cursor.execute('''
-            SELECT topic_id, COUNT(DISTINCT content_id) as item_count
+            SELECT topic_id,
+                   COUNT(DISTINCT COALESCE(CAST(row_number AS NVARCHAR(50)), content_id)) as item_count
             FROM DL.topic_assignments
             WHERE account_name = ?
             GROUP BY topic_id
@@ -1275,9 +1552,15 @@ class DatabaseManagerSQLServer:
             account_name = self.account_name
         
         cursor.execute('''
-            SELECT ta.topic_id, COUNT(DISTINCT ta.content_id) as pending_count
+            SELECT ta.topic_id,
+                   COUNT(DISTINCT COALESCE(CAST(ta.row_number AS NVARCHAR(50)), ta.content_id)) as pending_count
             FROM DL.topic_assignments ta
-            INNER JOIN DL.content_entries ce ON ta.content_id = ce.id AND ta.account_name = ce.account_name
+            INNER JOIN DL.content_entries ce
+                ON ta.account_name = ce.account_name
+               AND (
+                    (ta.row_number IS NOT NULL AND ta.row_number = ce.row_number)
+                 OR (ta.row_number IS NULL AND ta.content_id = ce.id)
+               )
             WHERE ta.account_name = ?
             AND ce.download_status != 'completed'
             GROUP BY ta.topic_id
@@ -1290,6 +1573,55 @@ class DatabaseManagerSQLServer:
             counts[topic_id] = pending_count
         
         return counts
+
+    def get_topic_update_on_counts(self, account_name: str = None) -> Dict[int, Dict[str, int]]:
+        """
+        Get per-topic assignment counts and ON counts for Tree/Site flags.
+
+        ON means TreeUpdated=1 or SiteUpdated=1.
+
+        Returns:
+            {topic_id: {'total': int, 'on': int}}
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        if account_name is None:
+            account_name = self.account_name
+
+        cursor.execute('''
+            WITH item_flags AS (
+                SELECT
+                    topic_id,
+                    COALESCE(CAST(row_number AS NVARCHAR(50)), content_id) AS item_key,
+                    MAX(CASE WHEN TreeUpdated = 1 OR SiteUpdated = 1 THEN 1 ELSE 0 END) AS is_on,
+                    MAX(CASE WHEN TreeUpdated = 1 AND SiteUpdated = 1 THEN 1 ELSE 0 END) AS is_both_done
+                FROM DL.topic_assignments
+                WHERE account_name = ?
+                GROUP BY topic_id, COALESCE(CAST(row_number AS NVARCHAR(50)), content_id)
+            )
+            SELECT
+                topic_id,
+                COUNT(*) AS total_count,
+                SUM(is_on) AS on_count,
+                SUM(is_both_done) AS both_done_count
+            FROM item_flags
+            GROUP BY topic_id
+        ''', (account_name,))
+
+        stats = {}
+        for row in cursor.fetchall():
+            topic_id = int(row[0])
+            total_count = int(row[1] or 0)
+            on_count = int(row[2] or 0)
+            both_done_count = int(row[3] or 0)
+            stats[topic_id] = {
+                'total': total_count,
+                'on': on_count,
+                'both_done': both_done_count,
+            }
+
+        return stats
     
     def update_file_movement_status(self, content_id: str, topic_id: int, status: str, 
                                     error_message: str = None, account_name: str = None) -> bool:
@@ -1308,6 +1640,9 @@ class DatabaseManagerSQLServer:
         """
         if account_name is None:
             account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
+        content_shortcode = self._resolve_content_shortcode(content_id, account_name)
         
         valid_statuses = ['Pending', 'In Process', 'Complete', 'Error']
         if status not in valid_statuses:
@@ -1323,8 +1658,12 @@ class DatabaseManagerSQLServer:
                 SET file_movement_status = ?,
                     file_movement_error = ?,
                     file_movement_updated_at = GETDATE()
-                WHERE account_name = ? AND content_id = ? AND topic_id = ?
-            ''', (status, error_message, account_name, content_id, topic_id))
+                WHERE account_name = ? AND topic_id = ?
+                  AND (
+                        (row_number IS NOT NULL AND row_number = ?)
+                     OR (content_id = ?)
+                  )
+            ''', (status, error_message, account_name, topic_id, row_number, content_shortcode))
             conn.commit()
             return True
         except Exception as e:
@@ -1344,6 +1683,9 @@ class DatabaseManagerSQLServer:
         """
         if account_name is None:
             account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
+        content_shortcode = self._resolve_content_shortcode(content_id, account_name)
         
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -1351,9 +1693,13 @@ class DatabaseManagerSQLServer:
         cursor.execute('''
             SELECT topic_id, file_movement_status, file_movement_error, file_movement_updated_at
             FROM DL.topic_assignments
-            WHERE account_name = ? AND content_id = ?
+                        WHERE account_name = ?
+                            AND (
+                                        (row_number IS NOT NULL AND row_number = ?)
+                                 OR (content_id = ?)
+                            )
             ORDER BY assigned_at
-        ''', (account_name, content_id))
+                ''', (account_name, row_number, content_shortcode))
         
         assignments = []
         for row in cursor.fetchall():
@@ -1365,6 +1711,84 @@ class DatabaseManagerSQLServer:
             })
         
         return assignments
+
+    def get_topic_assignment_update_flags(self, content_id: str, topic_id: int,
+                                          account_name: str = None) -> Optional[Dict[str, int]]:
+        """Get TreeUpdated, SiteUpdated, and VidPrepUpdated flags for one topic assignment (0/1/2)."""
+        if account_name is None:
+            account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
+        content_shortcode = self._resolve_content_shortcode(content_id, account_name)
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                        SELECT TOP 1 TreeUpdated, SiteUpdated, VidPrepUpdated
+            FROM DL.topic_assignments
+            WHERE account_name = ?
+              AND topic_id = ?
+              AND (
+                    (row_number IS NOT NULL AND row_number = ?)
+                 OR (content_id = ?)
+              )
+            ORDER BY
+                CASE
+                    WHEN row_number IS NOT NULL AND row_number = ? THEN 0
+                    WHEN content_id = ? THEN 1
+                    ELSE 2
+                END,
+                assigned_at DESC
+        ''', (account_name, topic_id, row_number, content_shortcode, row_number, content_shortcode))
+
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        return {
+            'TreeUpdated': int(row[0]),
+            'SiteUpdated': int(row[1]),
+            'VidPrepUpdated': int(row[2])
+        }
+
+    def update_topic_assignment_update_flag(self, content_id: str, topic_id: int,
+                                            field_name: str, state_value: int,
+                                            account_name: str = None) -> bool:
+        """Update one topic assignment tri-state flag: TreeUpdated, SiteUpdated, or VidPrepUpdated (0/1/2)."""
+        if account_name is None:
+            account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
+        content_shortcode = self._resolve_content_shortcode(content_id, account_name)
+
+        if field_name not in ('TreeUpdated', 'SiteUpdated', 'VidPrepUpdated'):
+            logger.error(f"Invalid topic assignment flag field: {field_name}")
+            return False
+
+        if state_value not in (0, 1, 2):
+            logger.error(f"Invalid topic assignment flag value for {field_name}: {state_value}")
+            return False
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            query = f'''
+                UPDATE DL.topic_assignments
+                SET {field_name} = ?
+                WHERE account_name = ? AND topic_id = ?
+                  AND (
+                        (row_number IS NOT NULL AND row_number = ?)
+                   OR (content_id = ?)
+                  )
+            '''
+            cursor.execute(query, (state_value, account_name, topic_id, row_number, content_shortcode))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error updating {field_name} for topic assignment: {e}")
+            return False
     
     def has_pending_topic_movements(self, content_id: str, account_name: str = None) -> bool:
         """
@@ -1379,15 +1803,22 @@ class DatabaseManagerSQLServer:
         """
         if account_name is None:
             account_name = self.account_name
+
+        row_number = self._resolve_content_row_number(content_id, account_name)
+        content_shortcode = self._resolve_content_shortcode(content_id, account_name)
         
         conn = self._get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
             SELECT COUNT(*) FROM DL.topic_assignments
-            WHERE account_name = ? AND content_id = ? 
+                        WHERE account_name = ?
+                            AND (
+                                        (row_number IS NOT NULL AND row_number = ?)
+                                 OR (content_id = ?)
+                            )
             AND file_movement_status = 'Pending'
-        ''', (account_name, content_id))
+                ''', (account_name, row_number, content_shortcode))
         
         count = cursor.fetchone()[0]
         return count > 0

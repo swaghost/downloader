@@ -746,7 +746,7 @@ class VideoCropPreview(QLabel):
         if not self._base_pixmap:
             return
 
-        scaled = self._base_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = self._base_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
         x = (self.width() - scaled.width()) // 2
         y = (self.height() - scaled.height()) // 2
         self._image_rect = QRect(x, y, scaled.width(), scaled.height())
@@ -1067,6 +1067,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_duration_s = 0.0
         self.vid_prep_last_output_path = None
         self.content_selected_topic = ''
+        self.content_selected_topic_id = None
         self.content_current_page = 0
         self.content_tiles_per_page = 20
         self.content_filtered_posts = []
@@ -1074,6 +1075,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_selected_topic_name = self.account_manager.get_setting('vid_prep_selected_topic', '')
         self.vid_prep_output_folder_mode = self.account_manager.get_setting('vid_prep_output_folder_mode', 'same_as_input')
         self.vid_prep_output_folder_path = self.account_manager.get_setting('vid_prep_output_folder_path', '')
+        self.vid_prep_audio_library = self._load_vid_prep_audio_library_setting()
         
         # Load settings BEFORE init_ui (which creates the checkboxes)
         self.auto_load_at_startup = self.account_manager.get_setting('auto_load_at_startup', 'true') == 'true'
@@ -1797,7 +1799,22 @@ class InstagramDownloaderGUI(QMainWindow):
     def create_browse_tab(self):
         """Create the Browse Saved Posts tab"""
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        browse_scroll = QScrollArea()
+        browse_scroll.setWidgetResizable(True)
+        browse_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        browse_scroll.setFrameShape(QFrame.NoFrame)
+
+        browse_content = QWidget()
+        layout = QVBoxLayout(browse_content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        browse_scroll.setWidget(browse_content)
+        outer_layout.addWidget(browse_scroll)
         
         # View Mode Selector (at the very top)
         view_selector = QHBoxLayout()
@@ -2446,8 +2463,12 @@ class InstagramDownloaderGUI(QMainWindow):
 
         left_layout.addWidget(QLabel("Topics"))
         self.content_topics_tree = QTreeWidget()
-        self.content_topics_tree.setHeaderLabels(["Topic Name", "Items"])
+        self.content_topics_tree.setHeaderLabels(["Topic Name", "Items", "Folder", "DB Flags", "Open"])
         self.content_topics_tree.setColumnWidth(0, 260)
+        self.content_topics_tree.setColumnWidth(1, 60)
+        self.content_topics_tree.setColumnWidth(2, 260)
+        self.content_topics_tree.setColumnWidth(3, 120)
+        self.content_topics_tree.setColumnWidth(4, 60)
         self.content_topics_tree.itemSelectionChanged.connect(self.on_content_topic_selection_changed)
         left_layout.addWidget(self.content_topics_tree)
 
@@ -2472,6 +2493,27 @@ class InstagramDownloaderGUI(QMainWindow):
         self.content_items_per_page_spin.setValue(self.content_tiles_per_page)
         self.content_items_per_page_spin.valueChanged.connect(self.change_content_items_per_page)
         content_controls.addWidget(self.content_items_per_page_spin)
+
+        content_controls.addSpacing(12)
+        content_controls.addWidget(QLabel("Folder:"))
+        self.content_folder_path_input = QLineEdit()
+        self.content_folder_path_input.setReadOnly(True)
+        self.content_folder_path_input.setMinimumWidth(260)
+        self.content_folder_path_input.setPlaceholderText("Select a topic to see its folder")
+        content_controls.addWidget(self.content_folder_path_input, 1)
+
+        self.content_select_folder_btn = QPushButton("Select Folder")
+        self.content_select_folder_btn.clicked.connect(self.select_content_folder)
+        content_controls.addWidget(self.content_select_folder_btn)
+
+        self.content_copy_folder_btn = QPushButton("Copy")
+        self.content_copy_folder_btn.clicked.connect(self.copy_content_folder_path)
+        content_controls.addWidget(self.content_copy_folder_btn)
+
+        self.content_open_folder_btn = QPushButton("Open in Explorer")
+        self.content_open_folder_btn.clicked.connect(self.open_content_folder_in_explorer)
+        content_controls.addWidget(self.content_open_folder_btn)
+
         content_controls.addStretch()
         right_layout.addLayout(content_controls)
 
@@ -2516,6 +2558,9 @@ class InstagramDownloaderGUI(QMainWindow):
         self.content_page_label.setText("Page 0 of 0")
         self.content_prev_btn.setEnabled(False)
         self.content_next_btn.setEnabled(False)
+        self.content_select_folder_btn.setEnabled(False)
+        self.content_copy_folder_btn.setEnabled(False)
+        self.content_open_folder_btn.setEnabled(False)
 
         self.tabs.addTab(tab, "Content")
 
@@ -2531,6 +2576,7 @@ class InstagramDownloaderGUI(QMainWindow):
         try:
             topics = self.content_db.db.get_all_topics() or []
             item_counts = self.content_db.db.get_topic_item_counts_v2() if hasattr(self.content_db.db, 'get_topic_item_counts_v2') else {}
+            topic_update_stats = self.content_db.db.get_topic_update_on_counts() if hasattr(self.content_db.db, 'get_topic_update_on_counts') else {}
         except Exception as e:
             logger.error(f"Error loading Content topics tree: {e}")
             self.content_status_label.setText(f"Error loading topics: {e}")
@@ -2542,7 +2588,10 @@ class InstagramDownloaderGUI(QMainWindow):
         all_item = QTreeWidgetItem()
         all_item.setText(0, 'All Topics')
         all_item.setText(1, '')
+        all_item.setText(2, '')
+        all_item.setText(3, self._get_content_topic_update_indicator_text(None, topic_update_stats))
         all_item.setData(0, Qt.UserRole, {'id': None, 'topic_name': 'All Topics'})
+        self._apply_content_topic_item_color(all_item, None, topic_update_stats)
         self.content_topics_tree.addTopLevelItem(all_item)
 
         children_map = {}
@@ -2560,11 +2609,20 @@ class InstagramDownloaderGUI(QMainWindow):
             topic_id = topic.get('id')
             count = item_counts.get(topic_id, 0) if isinstance(item_counts, dict) else 0
             item.setText(1, str(count) if count else '')
+            folder_path = self._get_content_topic_folder_path(topic)
+            item.setText(2, str(folder_path) if folder_path else '')
+            item.setText(3, self._get_content_topic_update_indicator_text(topic_id, topic_update_stats))
             item.setData(0, Qt.UserRole, topic)
+            self._apply_content_topic_item_color(item, topic_id, topic_update_stats)
             if parent_item is None:
                 self.content_topics_tree.addTopLevelItem(item)
             else:
                 parent_item.addChild(item)
+            folder_btn = QPushButton("📁")
+            folder_btn.setMaximumWidth(40)
+            folder_btn.setToolTip("Open topic folder")
+            folder_btn.clicked.connect(lambda checked=False, t=topic: self.open_content_topic_folder(t))
+            self.content_topics_tree.setItemWidget(item, 4, folder_btn)
             for child in children_map.get(topic_id, []):
                 add_topic_item(child, item)
 
@@ -2574,8 +2632,27 @@ class InstagramDownloaderGUI(QMainWindow):
         self.content_topics_tree.expandAll()
 
         target_topic = (self.content_selected_topic or '').strip()
+        target_topic_id = self.content_selected_topic_id
         selected_item = None
-        if target_topic:
+
+        # Prefer restoring by topic ID (stable even if duplicate names exist).
+        if target_topic_id is not None:
+            for i in range(self.content_topics_tree.topLevelItemCount()):
+                root_item = self.content_topics_tree.topLevelItem(i)
+                stack = [root_item]
+                while stack:
+                    node = stack.pop()
+                    topic_data = node.data(0, Qt.UserRole) or {}
+                    if topic_data.get('id') == target_topic_id:
+                        selected_item = node
+                        break
+                    for c in range(node.childCount()):
+                        stack.append(node.child(c))
+                if selected_item:
+                    break
+
+        # Fallback to restoring by topic name.
+        if selected_item is None and target_topic:
             for i in range(self.content_topics_tree.topLevelItemCount()):
                 root_item = self.content_topics_tree.topLevelItem(i)
                 stack = [root_item]
@@ -2594,6 +2671,7 @@ class InstagramDownloaderGUI(QMainWindow):
             self.content_topics_tree.setCurrentItem(selected_item)
         else:
             self.content_topics_tree.clearSelection()
+            self.content_selected_topic_id = None
             self.clear_content_tiles_grid()
             self.content_filtered_posts = []
             self.content_current_page = 0
@@ -2601,8 +2679,88 @@ class InstagramDownloaderGUI(QMainWindow):
             self.content_page_label.setText("Page 0 of 0")
             self.content_prev_btn.setEnabled(False)
             self.content_next_btn.setEnabled(False)
+            self.content_folder_path_input.setText('')
+            self.content_select_folder_btn.setEnabled(False)
+            self.content_copy_folder_btn.setEnabled(False)
+            self.content_open_folder_btn.setEnabled(False)
             self.content_status_label.setText("Select a topic to load content")
         self._content_restoring_selection = False
+
+    def _get_content_topic_update_indicator_text(self, topic_id, topic_update_stats):
+        """Return DB indicator text for Tree/Site coverage in a topic: None, Any, or All."""
+        total_count = 0
+        on_count = 0
+
+        if topic_id is None:
+            for stats in (topic_update_stats or {}).values():
+                total_count += int(stats.get('total', 0) or 0)
+                on_count += int(stats.get('on', 0) or 0)
+        else:
+            stats = (topic_update_stats or {}).get(topic_id, {})
+            total_count = int(stats.get('total', 0) or 0)
+            on_count = int(stats.get('on', 0) or 0)
+
+        if total_count <= 0:
+            return ''
+        if on_count <= 0:
+            return 'None (0/{})'.format(total_count)
+        if on_count >= total_count:
+            return 'All ({}/{})'.format(on_count, total_count)
+        return 'Any ({}/{})'.format(on_count, total_count)
+
+    def _apply_content_topic_item_color(self, item, topic_id, topic_update_stats):
+        """Apply Content tree row text color from Tree/Site completion coverage for this topic."""
+        total_count = 0
+        on_count = 0
+
+        if topic_id is None:
+            # "All Topics" summary row uses aggregate of all topic assignments.
+            for stats in (topic_update_stats or {}).values():
+                total_count += int(stats.get('total', 0) or 0)
+                on_count += int(stats.get('on', 0) or 0)
+        else:
+            stats = (topic_update_stats or {}).get(topic_id, {})
+            total_count = int(stats.get('total', 0) or 0)
+            on_count = int(stats.get('on', 0) or 0)
+
+        bg_brush = QBrush()
+        fg_brush = QBrush()
+
+        if total_count > 0 and on_count == total_count:
+            # All topic items have Tree=1 or Site=1.
+            fg_brush = QBrush(QColor("#009E00"))
+        elif on_count > 0:
+            # Some (but not all) topic items have Tree=1 or Site=1.
+            fg_brush = QBrush(QColor("#FFD800"))
+
+        for col in range(4):
+            # Keep default background; apply highlight only to text color.
+            item.setBackground(col, bg_brush)
+            item.setForeground(col, fg_brush)
+
+    def refresh_content_topic_tree_colors(self):
+        """Recompute and apply Content tree topic colors after tile Tree/Site status changes."""
+        if not hasattr(self, 'content_topics_tree') or not self.content_db or not self.content_db.db:
+            return
+
+        if not hasattr(self.content_db.db, 'get_topic_update_on_counts'):
+            return
+
+        try:
+            topic_update_stats = self.content_db.db.get_topic_update_on_counts()
+
+            def apply_recursive(item):
+                topic_data = item.data(0, Qt.UserRole) or {}
+                topic_id = topic_data.get('id') if isinstance(topic_data, dict) else None
+                item.setText(3, self._get_content_topic_update_indicator_text(topic_id, topic_update_stats))
+                self._apply_content_topic_item_color(item, topic_id, topic_update_stats)
+                for i in range(item.childCount()):
+                    apply_recursive(item.child(i))
+
+            for i in range(self.content_topics_tree.topLevelItemCount()):
+                apply_recursive(self.content_topics_tree.topLevelItem(i))
+        except Exception as e:
+            logger.debug(f"Failed to refresh Content topic tree colors: {e}")
 
     def on_content_topic_selection_changed(self):
         """Reload content tiles when selected topic changes and sync Vid Prep selected topic."""
@@ -2613,6 +2771,7 @@ class InstagramDownloaderGUI(QMainWindow):
             if getattr(self, '_content_restoring_selection', False):
                 return
             self.content_selected_topic = ''
+            self.content_selected_topic_id = None
             self.content_filtered_posts = []
             self.content_current_page = 0
             self.clear_content_tiles_grid()
@@ -2620,18 +2779,33 @@ class InstagramDownloaderGUI(QMainWindow):
             self.content_page_label.setText("Page 0 of 0")
             self.content_prev_btn.setEnabled(False)
             self.content_next_btn.setEnabled(False)
+            self.content_folder_path_input.setText('')
+            self.content_select_folder_btn.setEnabled(False)
+            self.content_copy_folder_btn.setEnabled(False)
+            self.content_open_folder_btn.setEnabled(False)
             self.content_status_label.setText("Select a topic to load content")
             self.save_ui_setting('content_selected_topic', '')
+            self.save_ui_setting('content_selected_topic_id', '')
             self.save_ui_setting('content_current_page', '0')
             return
 
         topic_data = selected[0].data(0, Qt.UserRole) or {}
         topic_name = topic_data.get('topic_name') or 'All Topics'
+        topic_id = topic_data.get('id')
         self.content_selected_topic = topic_name
+        self.content_selected_topic_id = topic_id if topic_id is not None else None
         if not getattr(self, '_content_restoring_selection', False):
             self.content_current_page = 0
 
+        folder_path = self._get_content_topic_folder_path(topic_data)
+        self.content_folder_path_input.setText(str(folder_path) if folder_path else '')
+        has_folder = bool(folder_path)
+        self.content_select_folder_btn.setEnabled(has_folder)
+        self.content_copy_folder_btn.setEnabled(has_folder)
+        self.content_open_folder_btn.setEnabled(has_folder)
+
         self.save_ui_setting('content_selected_topic', topic_name)
+        self.save_ui_setting('content_selected_topic_id', str(topic_id) if topic_id is not None else '')
         self.save_ui_setting('content_current_page', str(self.content_current_page))
 
         vid_topic = '' if topic_name == 'All Topics' else topic_name
@@ -2712,7 +2886,10 @@ class InstagramDownloaderGUI(QMainWindow):
             for idx, post in enumerate(page_posts):
                 row = idx // columns
                 col = idx % columns
-                tile = self.create_tile_widget(post, row_number=(start + idx + 1))
+                db_row_number = post.get('row_number')
+                if db_row_number is None:
+                    db_row_number = start + idx + 1
+                tile = self.create_tile_widget(post, row_number=db_row_number, open_explorer_target='topic')
                 self.content_tiles_grid.addWidget(tile, row, col)
 
         self.content_header_label.setText(f"Content: {self.content_selected_topic} ({total_items} items)")
@@ -2736,6 +2913,31 @@ class InstagramDownloaderGUI(QMainWindow):
             self.content_current_page += 1
             self.save_ui_setting('content_current_page', str(self.content_current_page))
             self.populate_content_tiles()
+
+    def select_content_folder(self):
+        """Choose a folder to show in the Content tab controls."""
+        current_path = self.content_folder_path_input.text().strip() if hasattr(self, 'content_folder_path_input') else ''
+        folder = QFileDialog.getExistingDirectory(self, "Select Topic Folder", current_path)
+        if folder and hasattr(self, 'content_folder_path_input'):
+            self.content_folder_path_input.setText(folder)
+
+    def copy_content_folder_path(self):
+        """Copy the current Content tab folder path to clipboard."""
+        folder = self.content_folder_path_input.text().strip() if hasattr(self, 'content_folder_path_input') else ''
+        if folder and self._copy_text_to_clipboard(folder):
+            self.statusBar().showMessage("Topic folder path copied to clipboard", 3000)
+
+    def open_content_folder_in_explorer(self):
+        """Open the current Content tab folder in the system file explorer."""
+        folder = self.content_folder_path_input.text().strip() if hasattr(self, 'content_folder_path_input') else ''
+        if folder and self._open_folder_in_explorer(folder):
+            self.statusBar().showMessage("Opened topic folder in explorer", 3000)
+
+    def open_content_topic_folder(self, topic_data):
+        """Open a specific topic folder from the Content tab tree."""
+        folder_path = self._get_content_topic_folder_path(topic_data)
+        if folder_path and self._open_folder_in_explorer(folder_path):
+            self.statusBar().showMessage(f"Opened folder for {topic_data.get('topic_name', 'topic')}", 3000)
 
     def change_content_items_per_page(self, value):
         """Update Content tab items-per-page at runtime and refresh current topic page."""
@@ -2768,6 +2970,154 @@ class InstagramDownloaderGUI(QMainWindow):
         columns = max(1, int((available_width + spacing) / (tile_width + spacing)))
         # Keep wrapping stable even when transient viewport values are unusually large.
         return min(columns, 8)
+
+    def _get_selected_content_topic_id(self):
+        """Return currently selected Content topic ID, or None for All Topics/none."""
+        if not hasattr(self, 'content_topics_tree'):
+            return None
+
+        selected = self.content_topics_tree.selectedItems()
+        if not selected:
+            return None
+
+        topic_data = selected[0].data(0, Qt.UserRole) or {}
+        topic_id = topic_data.get('id')
+        return topic_id if topic_id is not None else None
+
+    def _resolve_topic_assignment_id_for_tile(self, post, open_explorer_target='download'):
+        """Resolve the topic_id used for per-tile topic assignment updates."""
+        shortcode = (post.get('shortcode') or '').strip()
+        row_number = post.get('row_number') if isinstance(post, dict) else None
+
+        content_ref = row_number if row_number is not None else shortcode
+        if content_ref in (None, ''):
+            return None
+
+        if not self.content_db or not self.content_db.db:
+            return None
+
+        candidate_ids = []
+        assigned_topic_ids = []
+
+        if open_explorer_target == 'topic':
+            selected_topic_id = self._get_selected_content_topic_id()
+            if selected_topic_id is not None:
+                candidate_ids.append(selected_topic_id)
+
+        content_info = post.get('ContentInformation', {})
+        topic_id = content_info.get('topicID')
+        if topic_id is not None:
+            candidate_ids.append(topic_id)
+
+        try:
+            assigned_topic_ids = self.content_db.db.get_content_topics(content_ref) or []
+            if row_number is not None and shortcode:
+                assigned_topic_ids.extend(self.content_db.db.get_content_topics(shortcode) or [])
+            candidate_ids.extend(assigned_topic_ids)
+        except Exception as e:
+            logger.debug(f"Failed loading assigned topic IDs for content_ref={content_ref}: {e}")
+
+        # Keep first occurrence order while removing duplicates.
+        deduped = []
+        seen = set()
+        for raw_id in candidate_ids:
+            try:
+                norm_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if norm_id in seen:
+                continue
+            seen.add(norm_id)
+            deduped.append(norm_id)
+
+        # Return first topic_id that has a real assignment row (try row_number first, then shortcode).
+        for topic_id in deduped:
+            try:
+                flags = self.content_db.db.get_topic_assignment_update_flags(content_ref, topic_id)
+                if flags is None and row_number is not None and shortcode:
+                    flags = self.content_db.db.get_topic_assignment_update_flags(shortcode, topic_id)
+                if flags is not None:
+                    return topic_id
+            except Exception as e:
+                logger.debug(f"Failed checking assignment flags for content_ref={content_ref}/{topic_id}: {e}")
+
+        # Final fallback for partially populated metadata.
+        if deduped:
+            return deduped[0]
+
+        return None
+
+    def _style_assignment_toggle_button(self, button, label, state_value):
+        """Apply visual style to assignment toggle button (0=todo, 1=done, 2=ignored)."""
+        state = 0
+        try:
+            state = int(state_value)
+        except (TypeError, ValueError):
+            state = 0
+
+        if state not in (0, 1, 2):
+            state = 0
+
+        # Keep label text fixed; color alone communicates state.
+        button.setText(str(label))
+
+        if state == 1:
+            button.setStyleSheet("QPushButton { background-color: #009E00; color: #ffffff; font-weight: bold; padding: 2px 6px; }")
+        elif state == 2:
+            button.setStyleSheet("QPushButton { background-color: #000000; color: #ffffff; font-weight: bold; padding: 2px 6px; }")
+        else:
+            button.setStyleSheet("QPushButton { background-color: #b0bec5; color: #102027; font-weight: bold; padding: 2px 6px; }")
+
+    def _toggle_topic_assignment_flag(self, content_ref, topic_id, field_name, button, label, display_shortcode=''):
+        """Cycle TreeUpdated/SiteUpdated state 0 -> 1 -> 2 -> 0 and refresh button state."""
+        if not self.content_db or not self.content_db.db:
+            QMessageBox.warning(self, "No Database", "No database is loaded.")
+            return
+
+        display_id = display_shortcode or str(content_ref)
+
+        if topic_id is None:
+            topic_id = self._get_selected_content_topic_id()
+            if topic_id is None:
+                self.statusBar().showMessage(f"No topic assignment found for {display_id}", 3000)
+                return
+
+        try:
+            current_value = int(getattr(button, '_assignment_flag_value', 0))
+        except (TypeError, ValueError):
+            current_value = 0
+
+        if current_value not in (0, 1, 2):
+            current_value = 0
+
+        new_value = (current_value + 1) % 3
+
+        try:
+            success = self.content_db.db.update_topic_assignment_update_flag(content_ref, int(topic_id), field_name, new_value)
+            if not success and display_shortcode and str(display_shortcode).strip() and str(display_shortcode).strip() != str(content_ref):
+                success = self.content_db.db.update_topic_assignment_update_flag(str(display_shortcode).strip(), int(topic_id), field_name, new_value)
+            if not success and hasattr(self.content_db.db, 'add_topic_assignment'):
+                # If legacy/missing assignment row exists for this tile, create it and retry update once.
+                assignment_ref = display_shortcode or str(content_ref)
+                try:
+                    created = self.content_db.db.add_topic_assignment(assignment_ref, int(topic_id))
+                except Exception:
+                    created = False
+                if created:
+                    success = self.content_db.db.update_topic_assignment_update_flag(content_ref, int(topic_id), field_name, new_value)
+
+            if not success:
+                self.statusBar().showMessage(f"Failed to update {field_name} for {display_id}", 3000)
+                return
+
+            button._assignment_flag_value = new_value
+            self._style_assignment_toggle_button(button, label, new_value)
+            state_text = {0: 'To-Do (0)', 1: 'Complete (1)', 2: 'Ignore (2)'}
+            self.statusBar().showMessage(f"{label} set to {state_text.get(new_value, str(new_value))} for {display_id}", 2500)
+            self.refresh_content_topic_tree_colors()
+        except Exception as e:
+            logger.error(f"Error toggling {field_name} for {display_id}: {e}")
+            self.statusBar().showMessage(f"Error updating {label} for {display_id}", 3000)
 
     def create_vid_prep_tab(self):
         """Create the Vid Prep tab for cropping and audio prep."""
@@ -2814,6 +3164,52 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_time_label = QLabel("00:00.000 / 00:00.000")
         source_panel.addWidget(self.vid_prep_time_label)
 
+        info_row = QHBoxLayout()
+        self.vid_prep_file_label = QLabel("File: (none)")
+        self.vid_prep_crop_label = QLabel("Crop: (none)")
+        info_row.addWidget(self.vid_prep_file_label)
+        info_row.addStretch()
+        info_row.addWidget(self.vid_prep_crop_label)
+
+        source_controls = QHBoxLayout()
+        source_controls.setContentsMargins(0, 0, 0, 0)
+        source_controls.setSpacing(4)
+        self.vid_prep_source_play_btn = QPushButton("▶ Play")
+        self.vid_prep_source_play_btn.setToolTip("Play input preview")
+        self.vid_prep_source_play_btn.setFixedHeight(24)
+        self.vid_prep_source_play_btn.setFixedWidth(62)
+        self.vid_prep_source_play_btn.clicked.connect(self.play_vid_prep_source)
+        source_controls.addWidget(self.vid_prep_source_play_btn)
+
+        self.vid_prep_source_pause_btn = QPushButton("⏸ Pause")
+        self.vid_prep_source_pause_btn.setFixedHeight(24)
+        self.vid_prep_source_pause_btn.setFixedWidth(62)
+        self.vid_prep_source_pause_btn.clicked.connect(self.pause_vid_prep_source)
+        source_controls.addWidget(self.vid_prep_source_pause_btn)
+
+        self.vid_prep_source_stop_btn = QPushButton("⏹ Stop")
+        self.vid_prep_source_stop_btn.setFixedHeight(24)
+        self.vid_prep_source_stop_btn.setFixedWidth(58)
+        self.vid_prep_source_stop_btn.clicked.connect(self.stop_vid_prep_source)
+        source_controls.addWidget(self.vid_prep_source_stop_btn)
+
+        source_controls.addWidget(QLabel("Input Vol:"))
+        self.vid_prep_input_volume_slider = QSlider(Qt.Horizontal)
+        self.vid_prep_input_volume_slider.setRange(0, 100)
+        self.vid_prep_input_volume_slider.setValue(80)
+        self.vid_prep_input_volume_slider.setFixedWidth(90)
+        self.vid_prep_input_volume_slider.valueChanged.connect(self.on_vid_prep_input_volume_changed)
+        source_controls.addWidget(self.vid_prep_input_volume_slider)
+
+        self.vid_prep_input_mute_btn = QPushButton("🔇 Mute")
+        self.vid_prep_input_mute_btn.setFixedHeight(24)
+        self.vid_prep_input_mute_btn.setFixedWidth(72)
+        self.vid_prep_input_mute_btn.setCheckable(True)
+        self.vid_prep_input_mute_btn.toggled.connect(self.on_vid_prep_input_mute_toggled)
+        source_controls.addWidget(self.vid_prep_input_mute_btn)
+        source_controls.addStretch()
+        source_panel.addLayout(source_controls)
+
         source_panel.addWidget(QLabel("Trim Start / End"))
         trim_row = QHBoxLayout()
         trim_row.setContentsMargins(0, 0, 0, 0)
@@ -2828,71 +3224,14 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_trim_label.setWordWrap(True)
         source_panel.addWidget(self.vid_prep_trim_label)
 
-        info_row = QHBoxLayout()
-        self.vid_prep_file_label = QLabel("File: (none)")
-        self.vid_prep_crop_label = QLabel("Crop: (none)")
-        info_row.addWidget(self.vid_prep_file_label)
-        info_row.addStretch()
-        info_row.addWidget(self.vid_prep_crop_label)
         source_panel.addLayout(info_row)
-
         source_panel.addStretch()
-
-        source_controls = QHBoxLayout()
-        self.vid_prep_source_play_btn = QPushButton("▶ Play Input")
-        self.vid_prep_source_play_btn.clicked.connect(self.play_vid_prep_source)
-        source_controls.addWidget(self.vid_prep_source_play_btn)
-
-        self.vid_prep_source_pause_btn = QPushButton("⏸ Pause")
-        self.vid_prep_source_pause_btn.clicked.connect(self.pause_vid_prep_source)
-        source_controls.addWidget(self.vid_prep_source_pause_btn)
-
-        self.vid_prep_source_stop_btn = QPushButton("⏹ Stop")
-        self.vid_prep_source_stop_btn.clicked.connect(self.stop_vid_prep_source)
-        source_controls.addWidget(self.vid_prep_source_stop_btn)
-
-        source_controls.addWidget(QLabel("Input Vol:"))
-        self.vid_prep_input_volume_slider = QSlider(Qt.Horizontal)
-        self.vid_prep_input_volume_slider.setRange(0, 100)
-        self.vid_prep_input_volume_slider.setValue(80)
-        self.vid_prep_input_volume_slider.setMaximumWidth(120)
-        self.vid_prep_input_volume_slider.valueChanged.connect(self.on_vid_prep_input_volume_changed)
-        source_controls.addWidget(self.vid_prep_input_volume_slider)
-
-        self.vid_prep_input_mute_btn = QPushButton("🔇 Mute")
-        self.vid_prep_input_mute_btn.setCheckable(True)
-        self.vid_prep_input_mute_btn.toggled.connect(self.on_vid_prep_input_mute_toggled)
-        source_controls.addWidget(self.vid_prep_input_mute_btn)
-
-        source_controls.addStretch()
-        source_panel.addLayout(source_controls)
-
-        codec_row = QHBoxLayout()
-        codec_row.addWidget(QLabel("Output Codec:"))
-        self.vid_prep_codec_preset = QComboBox()
-        self.vid_prep_codec_preset.addItems(["fast", "medium", "slow"])
-        self.vid_prep_codec_preset.setCurrentText("medium")
-        self.vid_prep_codec_preset.setMaximumWidth(120)
-        self.vid_prep_codec_preset.currentTextChanged.connect(self.update_vid_prep_output_filename_preview)
-        self.vid_prep_codec_preset.currentTextChanged.connect(self.on_vid_prep_format_setting_changed)
-        codec_row.addWidget(self.vid_prep_codec_preset)
-
-        codec_row.addWidget(QLabel("CRF:"))
-        self.vid_prep_crf = QSpinBox()
-        self.vid_prep_crf.setRange(0, 51)
-        self.vid_prep_crf.setValue(23)
-        self.vid_prep_crf.setMaximumWidth(80)
-        self.vid_prep_crf.setToolTip("Lower CRF = better quality / larger file. Typical range: 18-28")
-        self.vid_prep_crf.valueChanged.connect(self.update_vid_prep_output_filename_preview)
-        self.vid_prep_crf.valueChanged.connect(self.on_vid_prep_format_setting_changed)
-        codec_row.addWidget(self.vid_prep_crf)
-        codec_row.addStretch()
-        source_panel.addLayout(codec_row)
 
         output_panel_widget = QWidget()
         output_panel = QVBoxLayout(output_panel_widget)
         output_panel.setContentsMargins(0, 0, 0, 0)
-        output_panel.addWidget(QLabel("Output (Last Export)"))
+        output_panel.setAlignment(Qt.AlignTop)
+        output_panel.addWidget(QLabel("Output (Last Export)"), 0, Qt.AlignTop)
         self.vid_prep_output_display_stack = QStackedWidget()
         self.vid_prep_output_display_stack.setMinimumHeight(620)
         self.vid_prep_output_display_stack.setMaximumHeight(620)
@@ -2906,9 +3245,9 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_display_stack.addWidget(self.vid_prep_output_placeholder)
         self.vid_prep_output_display_stack.addWidget(self.vid_prep_output_video_widget)
         self.vid_prep_output_display_stack.setCurrentWidget(self.vid_prep_output_placeholder)
-        output_panel.addWidget(self.vid_prep_output_display_stack, 1)
+        output_panel.addWidget(self.vid_prep_output_display_stack, 0, Qt.AlignTop)
 
-        output_panel.addWidget(QLabel("Output Timeline"))
+        output_panel.addWidget(QLabel("Output Timeline"), 0, Qt.AlignTop)
         output_timeline_row = QHBoxLayout()
         self.vid_prep_output_scrubber = QSlider(Qt.Horizontal)
         self.vid_prep_output_scrubber.setRange(0, 0)
@@ -2917,26 +3256,45 @@ class InstagramDownloaderGUI(QMainWindow):
         output_timeline_row.addWidget(self.vid_prep_output_scrubber)
         output_panel.addLayout(output_timeline_row)
         self.vid_prep_output_time_label = QLabel("00:00.000 / 00:00.000")
-        output_panel.addWidget(self.vid_prep_output_time_label)
-
-        output_panel.addStretch()
+        output_panel.addWidget(self.vid_prep_output_time_label, 0, Qt.AlignTop)
 
         output_controls = QHBoxLayout()
-        self.vid_prep_output_load_btn = QPushButton("Load Output")
-        self.vid_prep_output_load_btn.clicked.connect(self.show_vid_prep_output_preview)
-        output_controls.addWidget(self.vid_prep_output_load_btn)
-
-        self.vid_prep_output_play_btn = QPushButton("▶ Play Output")
-        self.vid_prep_output_play_btn.clicked.connect(lambda: self.vid_prep_output_player.play())
+        output_controls.setContentsMargins(0, 0, 0, 0)
+        output_controls.setSpacing(4)
+        self.vid_prep_output_play_btn = QPushButton("▶ Play")
+        self.vid_prep_output_play_btn.setToolTip("Play output preview")
+        self.vid_prep_output_play_btn.setFixedHeight(24)
+        self.vid_prep_output_play_btn.setFixedWidth(62)
+        self.vid_prep_output_play_btn.clicked.connect(self.show_vid_prep_output_preview)
         output_controls.addWidget(self.vid_prep_output_play_btn)
 
         self.vid_prep_output_pause_btn = QPushButton("⏸ Pause")
+        self.vid_prep_output_pause_btn.setFixedHeight(24)
+        self.vid_prep_output_pause_btn.setFixedWidth(62)
         self.vid_prep_output_pause_btn.clicked.connect(lambda: self.vid_prep_output_player.pause())
         output_controls.addWidget(self.vid_prep_output_pause_btn)
 
         self.vid_prep_output_stop_btn = QPushButton("⏹ Stop")
+        self.vid_prep_output_stop_btn.setFixedHeight(24)
+        self.vid_prep_output_stop_btn.setFixedWidth(58)
         self.vid_prep_output_stop_btn.clicked.connect(lambda: self.vid_prep_output_player.stop())
         output_controls.addWidget(self.vid_prep_output_stop_btn)
+
+        output_controls.addWidget(QLabel("Output Vol:"))
+        self.vid_prep_output_volume_slider = QSlider(Qt.Horizontal)
+        self.vid_prep_output_volume_slider.setRange(0, 100)
+        self.vid_prep_output_volume_slider.setValue(80)
+        self.vid_prep_output_volume_slider.setFixedWidth(90)
+        self.vid_prep_output_volume_slider.valueChanged.connect(self.on_vid_prep_output_volume_changed)
+        output_controls.addWidget(self.vid_prep_output_volume_slider)
+
+        self.vid_prep_output_mute_btn = QPushButton("🔇 Mute")
+        self.vid_prep_output_mute_btn.setFixedHeight(24)
+        self.vid_prep_output_mute_btn.setFixedWidth(72)
+        self.vid_prep_output_mute_btn.setCheckable(True)
+        self.vid_prep_output_mute_btn.toggled.connect(self.on_vid_prep_output_mute_toggled)
+        output_controls.addWidget(self.vid_prep_output_mute_btn)
+        output_controls.addStretch()
         output_panel.addLayout(output_controls)
 
         self.vid_prep_preview_stale_label = QLabel("Preview out of date")
@@ -2947,18 +3305,18 @@ class InstagramDownloaderGUI(QMainWindow):
         preview_splitter.setStretchFactor(0, 1)
         preview_splitter.setStretchFactor(1, 1)
         preview_splitter.splitterMoved.connect(self._enforce_vid_prep_equal_panel_widths)
-        current_window_width = max(600, self.width())
-        panel_width = max(300, int(current_window_width / 2))
-        preview_splitter.setSizes([panel_width, panel_width])
+        preview_splitter.setSizes([1, 1])
         preview_splitter.setChildrenCollapsible(False)
         preview_layout.addWidget(preview_splitter)
-        layout.addWidget(preview_group, 10)
 
         audio_group = QGroupBox("Audio")
+        audio_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         audio_layout = QVBoxLayout(audio_group)
+        audio_layout.setContentsMargins(8, 8, 8, 8)
+        audio_layout.setSpacing(6)
 
         self.vid_prep_audio_remove_radio = QRadioButton("(A) Remove/Silence Audio")
-        self.vid_prep_audio_replace_radio = QRadioButton("(B) Replace Audio with MP3 Section")
+        self.vid_prep_audio_replace_radio = QRadioButton("(B) Music")
         self.vid_prep_audio_maintain_radio = QRadioButton("(C) Maintain Source Audio")
         self.vid_prep_audio_remove_radio.setChecked(True)
 
@@ -2979,14 +3337,36 @@ class InstagramDownloaderGUI(QMainWindow):
         audio_layout.addLayout(audio_mode_row)
 
         mp3_row = QHBoxLayout()
-        mp3_row.addWidget(QLabel("MP3 File:"))
+        mp3_row.addWidget(QLabel("Audio File:"))
         self.vid_prep_mp3_path = QLineEdit()
-        self.vid_prep_mp3_path.setPlaceholderText("Choose MP3 file...")
+        self.vid_prep_mp3_path.setPlaceholderText("Choose audio file...")
+        self.vid_prep_mp3_path.textChanged.connect(self.on_vid_prep_audio_setting_changed)
         mp3_row.addWidget(self.vid_prep_mp3_path)
         mp3_browse = QPushButton("Browse...")
         mp3_browse.clicked.connect(self.browse_vid_prep_mp3)
         mp3_row.addWidget(mp3_browse)
         audio_layout.addLayout(mp3_row)
+
+        library_header_row = QHBoxLayout()
+        library_header_row.addWidget(QLabel("Saved Music:"))
+        self.vid_prep_audio_library_add_btn = QPushButton("Add Files...")
+        self.vid_prep_audio_library_add_btn.clicked.connect(self.add_vid_prep_audio_files)
+        library_header_row.addWidget(self.vid_prep_audio_library_add_btn)
+        self.vid_prep_audio_library_use_btn = QPushButton("Use Selected")
+        self.vid_prep_audio_library_use_btn.clicked.connect(self.use_selected_vid_prep_audio)
+        library_header_row.addWidget(self.vid_prep_audio_library_use_btn)
+        self.vid_prep_audio_library_remove_btn = QPushButton("Remove Selected")
+        self.vid_prep_audio_library_remove_btn.clicked.connect(self.remove_selected_vid_prep_audio)
+        library_header_row.addWidget(self.vid_prep_audio_library_remove_btn)
+        library_header_row.addStretch()
+        audio_layout.addLayout(library_header_row)
+
+        self.vid_prep_audio_library_list = QListWidget()
+        self.vid_prep_audio_library_list.setMinimumHeight(110)
+        self.vid_prep_audio_library_list.setMaximumHeight(220)
+        self.vid_prep_audio_library_list.currentItemChanged.connect(self.on_vid_prep_audio_library_selection_changed)
+        self.vid_prep_audio_library_list.itemDoubleClicked.connect(lambda _item: self.use_selected_vid_prep_audio())
+        audio_layout.addWidget(self.vid_prep_audio_library_list)
 
         segment_row = QHBoxLayout()
         segment_row.addWidget(QLabel("Start (s.ms):"))
@@ -2994,6 +3374,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_mp3_start.setRange(0.0, 86400.0)
         self.vid_prep_mp3_start.setDecimals(3)
         self.vid_prep_mp3_start.setSingleStep(0.1)
+        self.vid_prep_mp3_start.valueChanged.connect(self.on_vid_prep_audio_setting_changed)
         segment_row.addWidget(self.vid_prep_mp3_start)
 
         segment_row.addWidget(QLabel("End (s.ms):"))
@@ -3002,6 +3383,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_mp3_end.setDecimals(3)
         self.vid_prep_mp3_end.setSingleStep(0.1)
         self.vid_prep_mp3_end.setValue(30.0)
+        self.vid_prep_mp3_end.valueChanged.connect(self.on_vid_prep_audio_setting_changed)
         segment_row.addWidget(self.vid_prep_mp3_end)
         segment_row.addStretch()
         audio_layout.addLayout(segment_row)
@@ -3009,31 +3391,34 @@ class InstagramDownloaderGUI(QMainWindow):
         output_group = QGroupBox("Output Filename")
         output_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         output_layout = QVBoxLayout(output_group)
+        output_layout.setContentsMargins(8, 8, 8, 8)
         output_layout.setSpacing(4)
 
         filename_row = QHBoxLayout()
         filename_row.addWidget(QLabel("Filename:"))
         self.vid_prep_output_filename_input = QLineEdit()
-        self.vid_prep_output_filename_input.setMinimumWidth(620)
-        self.vid_prep_output_filename_input.setMaximumWidth(900)
+        self.vid_prep_output_filename_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.vid_prep_output_filename_input.setPlaceholderText("Generated after source video is loaded")
         self.vid_prep_output_filename_input.textChanged.connect(self.update_vid_prep_output_filename_preview)
         filename_row.addWidget(self.vid_prep_output_filename_input)
         self.vid_prep_regenerate_filename_btn = QPushButton("Regenerate Filename")
         self.vid_prep_regenerate_filename_btn.clicked.connect(self.regenerate_vid_prep_output_filename)
         filename_row.addWidget(self.vid_prep_regenerate_filename_btn)
+        filename_row.addStretch()
+        output_layout.addLayout(filename_row)
+
+        prepend_topic_row = QHBoxLayout()
         self.vid_prep_prepend_topic_checkbox = QCheckBox("Prepend Topic In Generated Filename")
         self.vid_prep_prepend_topic_checkbox.setChecked(self.vid_prep_prepend_topic_enabled)
         self.vid_prep_prepend_topic_checkbox.toggled.connect(self.on_vid_prep_prepend_topic_toggled)
-        filename_row.addWidget(self.vid_prep_prepend_topic_checkbox)
-        filename_row.addStretch()
-        output_layout.addLayout(filename_row)
+        prepend_topic_row.addWidget(self.vid_prep_prepend_topic_checkbox)
+        prepend_topic_row.addStretch()
+        output_layout.addLayout(prepend_topic_row)
 
         selected_topic_row = QHBoxLayout()
         selected_topic_row.addWidget(QLabel("Selected Topic:"))
         self.vid_prep_selected_topic_input = QLineEdit()
-        self.vid_prep_selected_topic_input.setMinimumWidth(320)
-        self.vid_prep_selected_topic_input.setMaximumWidth(520)
+        self.vid_prep_selected_topic_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.vid_prep_selected_topic_input.setPlaceholderText("None selected")
         self.vid_prep_selected_topic_input.setText(self.vid_prep_selected_topic_name)
         self.vid_prep_selected_topic_input.textChanged.connect(self.on_vid_prep_selected_topic_changed)
@@ -3044,113 +3429,182 @@ class InstagramDownloaderGUI(QMainWindow):
         selected_topic_row.addStretch()
         output_layout.addLayout(selected_topic_row)
 
-        folder_row = QHBoxLayout()
-        folder_row.addWidget(QLabel("Output Folder:"))
+        folder_mode_row = QHBoxLayout()
+        folder_mode_row.addWidget(QLabel("Output Folder:"))
         self.vid_prep_output_folder_mode_combo = QComboBox()
-        self.vid_prep_output_folder_mode_combo.addItems(["Same as input", "User specified"])
+        self.vid_prep_output_folder_mode_combo.addItems(["Same as input", "User specified", "Default Video Output", "DVO/Topic"])
+        self.vid_prep_output_folder_mode_combo.setMinimumWidth(240)
         if self.vid_prep_output_folder_mode == 'user_specified':
             self.vid_prep_output_folder_mode_combo.setCurrentText("User specified")
+        elif self.vid_prep_output_folder_mode == 'default_video_output':
+            self.vid_prep_output_folder_mode_combo.setCurrentText("Default Video Output")
+        elif self.vid_prep_output_folder_mode == 'dvo_topic':
+            self.vid_prep_output_folder_mode_combo.setCurrentText("DVO/Topic")
         else:
             self.vid_prep_output_folder_mode_combo.setCurrentText("Same as input")
         self.vid_prep_output_folder_mode_combo.currentTextChanged.connect(self.on_vid_prep_output_folder_mode_changed)
-        folder_row.addWidget(self.vid_prep_output_folder_mode_combo)
+        folder_mode_row.addWidget(self.vid_prep_output_folder_mode_combo)
+        folder_mode_row.addStretch()
+        output_layout.addLayout(folder_mode_row)
+
+        folder_path_row = QHBoxLayout()
         self.vid_prep_output_folder_path_input = QLineEdit()
-        self.vid_prep_output_folder_path_input.setMinimumWidth(620)
-        self.vid_prep_output_folder_path_input.setMaximumWidth(900)
+        self.vid_prep_output_folder_path_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.vid_prep_output_folder_path_input.setText(self.vid_prep_output_folder_path)
         self.vid_prep_output_folder_path_input.textChanged.connect(self.on_vid_prep_output_folder_path_changed)
-        folder_row.addWidget(self.vid_prep_output_folder_path_input)
+        folder_path_row.addWidget(self.vid_prep_output_folder_path_input)
         self.vid_prep_output_folder_browse_btn = QPushButton("Browse...")
         self.vid_prep_output_folder_browse_btn.clicked.connect(self.browse_vid_prep_output_folder)
-        folder_row.addWidget(self.vid_prep_output_folder_browse_btn)
-        folder_row.addStretch()
-        output_layout.addLayout(folder_row)
+        folder_path_row.addWidget(self.vid_prep_output_folder_browse_btn)
+        output_layout.addLayout(folder_path_row)
 
         self.vid_prep_output_preview_label = QLabel("Output path: (drop a source video first)")
         self.vid_prep_output_preview_label.setWordWrap(True)
         self.vid_prep_output_preview_label.setMaximumWidth(700)
         output_layout.addWidget(self.vid_prep_output_preview_label)
 
-        format_group = QGroupBox("Output Formatting / Resolution / Background")
-        format_group.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        format_group = QGroupBox("Output Formatting / Codec / Resolution")
+        format_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         format_layout = QGridLayout(format_group)
+        format_layout.setContentsMargins(8, 8, 8, 8)
+        format_layout.setHorizontalSpacing(3)
+        format_layout.setVerticalSpacing(3)
+        format_layout.setColumnStretch(0, 0)
+        format_layout.setColumnStretch(1, 0)
+        format_layout.setColumnStretch(2, 0)
+        format_layout.setColumnStretch(3, 0)
+        format_layout.setColumnStretch(4, 1)
 
-        format_layout.addWidget(QLabel("Resolution:"), 0, 0)
+        format_layout.addWidget(QLabel("Codec:"), 0, 0)
+        self.vid_prep_codec_preset = QComboBox()
+        self.vid_prep_codec_preset.addItems(["fast", "medium", "slow"])
+        self.vid_prep_codec_preset.setCurrentText("medium")
+        self.vid_prep_codec_preset.setFixedWidth(110)
+        self.vid_prep_codec_preset.currentTextChanged.connect(self.update_vid_prep_output_filename_preview)
+        self.vid_prep_codec_preset.currentTextChanged.connect(self.on_vid_prep_format_setting_changed)
+        format_layout.addWidget(self.vid_prep_codec_preset, 0, 1)
+
+        format_layout.addWidget(QLabel("CRF:"), 0, 2)
+        self.vid_prep_crf = QSpinBox()
+        self.vid_prep_crf.setRange(0, 51)
+        self.vid_prep_crf.setValue(23)
+        self.vid_prep_crf.setFixedWidth(74)
+        self.vid_prep_crf.setToolTip("Lower CRF = better quality / larger file. Typical range: 18-28")
+        self.vid_prep_crf.valueChanged.connect(self.update_vid_prep_output_filename_preview)
+        self.vid_prep_crf.valueChanged.connect(self.on_vid_prep_format_setting_changed)
+        format_layout.addWidget(self.vid_prep_crf, 0, 3)
+
+        format_layout.addWidget(QLabel("Resolution:"), 1, 0)
         self.vid_prep_output_resolution_combo = QComboBox()
         self.vid_prep_output_resolution_combo.addItems(["Match Crop", "Original", "1080x1920", "720x1280", "1080x1080", "Custom"])
-        self.vid_prep_output_resolution_combo.setMaximumWidth(150)
+        self.vid_prep_output_resolution_combo.setFixedWidth(140)
         self.vid_prep_output_resolution_combo.currentTextChanged.connect(self.update_vid_prep_resolution_ui)
         self.vid_prep_output_resolution_combo.currentTextChanged.connect(self.on_vid_prep_format_setting_changed)
-        format_layout.addWidget(self.vid_prep_output_resolution_combo, 0, 1)
+        format_layout.addWidget(self.vid_prep_output_resolution_combo, 1, 1, 1, 3)
 
         self.vid_prep_output_width = QSpinBox()
         self.vid_prep_output_width.setRange(2, 7680)
         self.vid_prep_output_width.setValue(1080)
         self.vid_prep_output_width.setEnabled(False)
-        self.vid_prep_output_width.setMaximumWidth(90)
+        self.vid_prep_output_width.setFixedWidth(86)
         self.vid_prep_output_width.valueChanged.connect(self.on_vid_prep_format_setting_changed)
-        format_layout.addWidget(QLabel("Width:"), 0, 2)
-        format_layout.addWidget(self.vid_prep_output_width, 0, 3)
+        format_layout.addWidget(QLabel("Width:"), 2, 0)
+        format_layout.addWidget(self.vid_prep_output_width, 2, 1)
 
         self.vid_prep_output_height = QSpinBox()
         self.vid_prep_output_height.setRange(2, 7680)
         self.vid_prep_output_height.setValue(1920)
         self.vid_prep_output_height.setEnabled(False)
-        self.vid_prep_output_height.setMaximumWidth(90)
+        self.vid_prep_output_height.setFixedWidth(86)
         self.vid_prep_output_height.valueChanged.connect(self.on_vid_prep_format_setting_changed)
-        format_layout.addWidget(QLabel("Height:"), 0, 4)
-        format_layout.addWidget(self.vid_prep_output_height, 0, 5)
+        format_layout.addWidget(QLabel("Height:"), 2, 2)
+        format_layout.addWidget(self.vid_prep_output_height, 2, 3)
 
-        format_layout.addWidget(QLabel("Background Mode:"), 1, 0)
+        background_group = QGroupBox("Background Options")
+        background_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        background_layout = QGridLayout(background_group)
+        background_layout.setContentsMargins(8, 8, 8, 8)
+        background_layout.setHorizontalSpacing(6)
+        background_layout.setVerticalSpacing(4)
+
+        background_layout.addWidget(QLabel("Background Mode:"), 0, 0)
         self.vid_prep_bg_mode = QComboBox()
         self.vid_prep_bg_mode.addItems(["Black", "White", "Custom Color", "Image File", "Zoom Source"])
         self.vid_prep_bg_mode.setMaximumWidth(150)
         self.vid_prep_bg_mode.currentTextChanged.connect(self.update_vid_prep_background_mode_ui)
         self.vid_prep_bg_mode.currentTextChanged.connect(self.on_vid_prep_format_setting_changed)
-        format_layout.addWidget(self.vid_prep_bg_mode, 1, 1)
+        background_layout.addWidget(self.vid_prep_bg_mode, 0, 1)
 
         self.vid_prep_bg_color_button = QPushButton("Choose Color")
         self.vid_prep_bg_color = QColor("#000000")
         self.vid_prep_bg_color_button.clicked.connect(self.pick_vid_prep_bg_color)
-        format_layout.addWidget(self.vid_prep_bg_color_button, 1, 2)
+        background_layout.addWidget(self.vid_prep_bg_color_button, 0, 2)
 
         self.vid_prep_bg_image_path = QLineEdit()
         self.vid_prep_bg_image_path.setPlaceholderText("Background image file (used for Image File mode)")
-        self.vid_prep_bg_image_path.setMaximumWidth(320)
+        self.vid_prep_bg_image_path.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.vid_prep_bg_image_path.textChanged.connect(self.on_vid_prep_format_setting_changed)
-        format_layout.addWidget(self.vid_prep_bg_image_path, 1, 3, 1, 2)
+        background_layout.addWidget(QLabel("Image:"), 1, 0)
+        background_layout.addWidget(self.vid_prep_bg_image_path, 1, 1, 1, 4)
         self.vid_prep_bg_image_browse_btn = QPushButton("Browse...")
         self.vid_prep_bg_image_browse_btn.clicked.connect(self.browse_vid_prep_bg_image)
-        format_layout.addWidget(self.vid_prep_bg_image_browse_btn, 1, 5)
+        background_layout.addWidget(self.vid_prep_bg_image_browse_btn, 1, 5)
 
-        self.vid_prep_preview_params_btn = QPushButton("👁 Preview with Output Settings")
+        self.vid_prep_preview_params_btn = QPushButton("Preview")
         self.vid_prep_preview_params_btn.setStyleSheet("QPushButton { background-color: #6c757d; color: white; font-weight: bold; padding: 6px 12px; }")
         self.vid_prep_preview_params_btn.clicked.connect(self.preview_vid_prep_output)
-        self.vid_prep_save_btn = QPushButton("💾 Save Cropped Revision")
+        self.vid_prep_save_btn = QPushButton("Save Cropped")
         self.vid_prep_save_btn.setStyleSheet("QPushButton { background-color: #0078d4; color: white; font-weight: bold; padding: 8px 16px; }")
         self.vid_prep_save_btn.clicked.connect(self.save_vid_prep_output)
-        self.vid_prep_open_saved_btn = QPushButton("📁 Open in File Explorer")
+        self.vid_prep_open_saved_btn = QPushButton("File Explorer")
         self.vid_prep_open_saved_btn.setEnabled(False)
         self.vid_prep_open_saved_btn.setToolTip("Enabled after a successful save")
         self.vid_prep_open_saved_btn.clicked.connect(self.open_vid_prep_saved_file_in_explorer)
+        self.vid_prep_preview_params_btn.setMinimumHeight(34)
+        self.vid_prep_save_btn.setMinimumHeight(34)
+        self.vid_prep_open_saved_btn.setMinimumHeight(34)
+        self.vid_prep_preview_params_btn.setMinimumWidth(120)
+        self.vid_prep_save_btn.setMinimumWidth(120)
+        self.vid_prep_open_saved_btn.setMinimumWidth(120)
+        self.vid_prep_preview_params_btn.setMaximumWidth(160)
+        self.vid_prep_save_btn.setMaximumWidth(160)
+        self.vid_prep_open_saved_btn.setMaximumWidth(170)
+        self.vid_prep_preview_params_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.vid_prep_save_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.vid_prep_open_saved_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-        output_controls.addStretch()
-        output_controls.addWidget(self.vid_prep_preview_params_btn)
-        output_controls.addWidget(self.vid_prep_save_btn)
-        output_controls.addWidget(self.vid_prep_open_saved_btn)
+        right_actions_row = QHBoxLayout()
+        right_actions_row.setContentsMargins(0, 0, 0, 0)
+        right_actions_row.addWidget(self.vid_prep_preview_params_btn)
+        right_actions_row.addWidget(self.vid_prep_save_btn)
+        right_actions_row.addWidget(self.vid_prep_open_saved_btn)
 
-        right_options_layout = QVBoxLayout()
-        right_options_layout.setContentsMargins(0, 0, 0, 0)
-        right_options_layout.setSpacing(6)
-        right_options_layout.addWidget(audio_group)
-        right_options_layout.addWidget(output_group)
-        right_options_layout.addWidget(format_group)
+        right_sidebar_widget = QWidget()
+        right_sidebar_widget.setFixedWidth(680)
+        right_sidebar = QVBoxLayout(right_sidebar_widget)
+        right_sidebar.setContentsMargins(0, 0, 0, 0)
+        right_sidebar.setSpacing(10)
+        right_sidebar.setAlignment(Qt.AlignTop)
+        right_sidebar.addWidget(output_group)
+        right_sidebar.addWidget(format_group)
+        right_sidebar.addWidget(background_group)
+        right_sidebar.addWidget(audio_group)
+        right_sidebar.addLayout(right_actions_row)
+        right_sidebar.addStretch()
 
-        options_row = QHBoxLayout()
-        options_row.setContentsMargins(0, 0, 0, 0)
-        options_row.addStretch()
-        options_row.addLayout(right_options_layout)
-        layout.addLayout(options_row)
+        right_sidebar_scroll = QScrollArea()
+        right_sidebar_scroll.setWidgetResizable(True)
+        right_sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_sidebar_scroll.setFrameShape(QFrame.NoFrame)
+        right_sidebar_scroll.setFixedWidth(700)
+        right_sidebar_scroll.setWidget(right_sidebar_widget)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
+        top_row.addWidget(preview_group, 1)
+        top_row.addWidget(right_sidebar_scroll, 0)
+        layout.addLayout(top_row, 10)
 
         layout.addWidget(self.vid_prep_preview_stale_label)
 
@@ -3161,10 +3615,15 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_player.setVideoOutput(self.vid_prep_output_video_widget)
         self.vid_prep_output_player.positionChanged.connect(self.on_vid_prep_output_position_changed)
         self.vid_prep_output_player.durationChanged.connect(self.on_vid_prep_output_duration_changed)
+        self.vid_prep_output_player.setVolume(self.vid_prep_output_volume_slider.value())
+        self.vid_prep_output_player.setMuted(self.vid_prep_output_mute_btn.isChecked())
         self.vid_prep_input_audio_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
         self.vid_prep_input_audio_player.setVolume(self.vid_prep_input_volume_slider.value())
         self.vid_prep_play_timer = QTimer(self)
+        self.vid_prep_play_timer.setTimerType(Qt.PreciseTimer)
         self.vid_prep_play_timer.timeout.connect(self._advance_vid_prep_source_frame)
+        self.vid_prep_play_start_time = None
+        self.vid_prep_play_start_frame = 0
 
         self.vid_prep_source_w = 0
         self.vid_prep_source_h = 0
@@ -3179,8 +3638,10 @@ class InstagramDownloaderGUI(QMainWindow):
         self.update_vid_prep_resolution_ui()
         self.update_vid_prep_background_mode_ui()
         self.update_vid_prep_audio_mode_ui()
+        self.refresh_vid_prep_audio_library_list()
         self._load_vid_prep_ui_settings()
         self._enforce_vid_prep_equal_panel_widths()
+        QTimer.singleShot(0, self._enforce_vid_prep_equal_panel_widths)
         self.on_vid_prep_output_folder_mode_changed(self.vid_prep_output_folder_mode_combo.currentText())
         self.update_vid_prep_output_filename_preview()
         self.tabs.addTab(tab, "Vid Prep")
@@ -3189,10 +3650,159 @@ class InstagramDownloaderGUI(QMainWindow):
         """Enable/disable MP3 controls based on selected audio mode."""
         use_mp3 = self.vid_prep_audio_replace_radio.isChecked()
         self.vid_prep_mp3_path.setEnabled(use_mp3)
+        self.vid_prep_audio_library_list.setEnabled(use_mp3)
+        self.vid_prep_audio_library_add_btn.setEnabled(use_mp3)
         self.vid_prep_mp3_start.setEnabled(use_mp3)
         self.vid_prep_mp3_end.setEnabled(use_mp3)
+        self._update_vid_prep_audio_library_buttons()
         self._save_vid_prep_ui_settings()
         self._set_vid_prep_output_preview_dirty(True)
+
+    def on_vid_prep_audio_setting_changed(self, *args):
+        """Persist audio replacement inputs and mark the preview stale."""
+        self._save_vid_prep_ui_settings()
+        self._set_vid_prep_output_preview_dirty(True)
+
+    def _load_vid_prep_audio_library_setting(self):
+        """Load the saved music list from global settings."""
+        raw_value = self.account_manager.get_setting('vid_prep_audio_library', '[]')
+        try:
+            parsed = json.loads(raw_value)
+        except Exception:
+            logger.warning("Failed to parse vid_prep_audio_library setting; resetting to empty list")
+            return []
+
+        if not isinstance(parsed, list):
+            return []
+
+        normalized_paths = []
+        seen_paths = set()
+        for value in parsed:
+            normalized = self._normalize_vid_prep_audio_path(value)
+            if not normalized:
+                continue
+            compare_value = os.path.normcase(normalized)
+            if compare_value in seen_paths:
+                continue
+            seen_paths.add(compare_value)
+            normalized_paths.append(normalized)
+        return normalized_paths
+
+    def _save_vid_prep_audio_library_setting(self):
+        """Persist the saved music list in global settings."""
+        self.account_manager.set_setting('vid_prep_audio_library', json.dumps(self.vid_prep_audio_library))
+
+    def _normalize_vid_prep_audio_path(self, file_path):
+        """Normalize saved music paths for stable storage and comparison."""
+        if not file_path:
+            return ''
+        return os.path.normpath(str(file_path).strip())
+
+    def refresh_vid_prep_audio_library_list(self, selected_path=None):
+        """Rebuild the saved music list widget from persisted state."""
+        if not hasattr(self, 'vid_prep_audio_library_list'):
+            return
+
+        normalized_selected = self._normalize_vid_prep_audio_path(selected_path or self.vid_prep_mp3_path.text())
+        selected_row = -1
+        self.vid_prep_audio_library_list.clear()
+
+        for index, file_path in enumerate(self.vid_prep_audio_library):
+            display_name = os.path.basename(file_path) or file_path
+            if not os.path.exists(file_path):
+                display_name = f"{display_name} (missing)"
+            item = QListWidgetItem(display_name)
+            item.setData(Qt.UserRole, file_path)
+            item.setToolTip(file_path)
+            self.vid_prep_audio_library_list.addItem(item)
+            if os.path.normcase(file_path) == os.path.normcase(normalized_selected):
+                selected_row = index
+
+        if selected_row >= 0:
+            self.vid_prep_audio_library_list.setCurrentRow(selected_row)
+
+        self._update_vid_prep_audio_library_buttons()
+
+    def _get_selected_vid_prep_audio_path(self):
+        """Return the currently selected saved music path."""
+        if not hasattr(self, 'vid_prep_audio_library_list'):
+            return ''
+        current_item = self.vid_prep_audio_library_list.currentItem()
+        if not current_item:
+            return ''
+        return self._normalize_vid_prep_audio_path(current_item.data(Qt.UserRole))
+
+    def _update_vid_prep_audio_library_buttons(self):
+        """Keep saved music actions in sync with the current selection and mode."""
+        use_mp3 = self.vid_prep_audio_replace_radio.isChecked()
+        has_selection = bool(self._get_selected_vid_prep_audio_path())
+        self.vid_prep_audio_library_use_btn.setEnabled(use_mp3 and has_selection)
+        self.vid_prep_audio_library_remove_btn.setEnabled(use_mp3 and has_selection)
+
+    def on_vid_prep_audio_library_selection_changed(self, current, previous):
+        """Refresh button state when the saved music selection changes."""
+        self._update_vid_prep_audio_library_buttons()
+
+    def add_vid_prep_audio_to_library(self, file_path, select_added=False):
+        """Add a music file to the persistent saved list if it is not already present."""
+        normalized = self._normalize_vid_prep_audio_path(file_path)
+        if not normalized:
+            return False
+
+        compare_value = os.path.normcase(normalized)
+        if any(os.path.normcase(existing_path) == compare_value for existing_path in self.vid_prep_audio_library):
+            if select_added:
+                self.refresh_vid_prep_audio_library_list(normalized)
+            return False
+
+        self.vid_prep_audio_library.append(normalized)
+        self._save_vid_prep_audio_library_setting()
+        self.refresh_vid_prep_audio_library_list(normalized if select_added else None)
+        return True
+
+    def add_vid_prep_audio_files(self):
+        """Browse for one or more music files to save for reuse."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add Saved Music",
+            "",
+            "Audio Files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg);;All Files (*)"
+        )
+        last_added = ''
+        for file_path in file_paths:
+            normalized = self._normalize_vid_prep_audio_path(file_path)
+            if not normalized:
+                continue
+            self.add_vid_prep_audio_to_library(normalized)
+            last_added = normalized
+
+        if last_added:
+            self.refresh_vid_prep_audio_library_list(last_added)
+
+    def use_selected_vid_prep_audio(self):
+        """Apply the selected saved music item to the current export."""
+        selected_path = self._get_selected_vid_prep_audio_path()
+        if not selected_path:
+            return
+
+        self.vid_prep_mp3_path.setText(selected_path)
+        self.vid_prep_audio_replace_radio.setChecked(True)
+        self.refresh_vid_prep_audio_library_list(selected_path)
+        self.on_vid_prep_audio_setting_changed()
+
+    def remove_selected_vid_prep_audio(self):
+        """Remove the selected saved music item from persistent storage."""
+        selected_path = self._get_selected_vid_prep_audio_path()
+        if not selected_path:
+            return
+
+        compare_value = os.path.normcase(selected_path)
+        self.vid_prep_audio_library = [
+            existing_path for existing_path in self.vid_prep_audio_library
+            if os.path.normcase(existing_path) != compare_value
+        ]
+        self._save_vid_prep_audio_library_setting()
+        self.refresh_vid_prep_audio_library_list()
 
     def _enforce_vid_prep_equal_panel_widths(self, *args):
         """Keep source/output preview panes equal width."""
@@ -3279,15 +3889,25 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_mp3_end.setValue(float(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_mp3_end', f"{self.vid_prep_mp3_end.value():.3f}")))
         except Exception:
             pass
+        self.refresh_vid_prep_audio_library_list(self.vid_prep_mp3_path.text())
 
         self.vid_prep_selected_topic_input.setText(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_selected_topic', self.vid_prep_selected_topic_input.text()))
         prepend_topic = self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_prepend_topic_filename', 'true' if self.vid_prep_prepend_topic_checkbox.isChecked() else 'false') == 'true'
         self.vid_prep_prepend_topic_checkbox.setChecked(prepend_topic)
 
         saved_folder_mode = self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_output_folder_mode', self.vid_prep_output_folder_mode)
-        self.vid_prep_output_folder_mode = saved_folder_mode if saved_folder_mode in ('same_as_input', 'user_specified') else 'same_as_input'
-        self.vid_prep_output_folder_mode_combo.setCurrentText('User specified' if self.vid_prep_output_folder_mode == 'user_specified' else 'Same as input')
+        valid_modes = ('same_as_input', 'user_specified', 'default_video_output', 'dvo_topic')
+        self.vid_prep_output_folder_mode = saved_folder_mode if saved_folder_mode in valid_modes else 'same_as_input'
+        mode_text_map = {
+            'same_as_input': 'Same as input',
+            'user_specified': 'User specified',
+            'default_video_output': 'Default Video Output',
+            'dvo_topic': 'DVO/Topic',
+        }
+        self.vid_prep_output_folder_mode_combo.setCurrentText(mode_text_map.get(self.vid_prep_output_folder_mode, 'Same as input'))
         self.vid_prep_output_folder_path_input.setText(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_output_folder_path', self.vid_prep_output_folder_path_input.text()))
+        if hasattr(self, 'settings_video_output_path_input'):
+            self.settings_video_output_path_input.setText(self.vid_prep_output_folder_path_input.text())
 
     def on_vid_prep_format_setting_changed(self, *args):
         """Persist format/background controls and mark preview stale."""
@@ -3346,6 +3966,17 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_width.setEnabled(custom_enabled)
         self.vid_prep_output_height.setEnabled(custom_enabled)
 
+        if preset == "Match Crop":
+            crop = self.vid_prep_crop_rect or self.vid_prep_preview.get_crop_rect_source()
+            if crop:
+                _, _, crop_w, crop_h = crop
+                if crop_w % 2 != 0:
+                    crop_w += 1
+                if crop_h % 2 != 0:
+                    crop_h += 1
+                self.vid_prep_output_width.setValue(max(2, int(crop_w)))
+                self.vid_prep_output_height.setValue(max(2, int(crop_h)))
+
         if preset in preset_map and preset_map[preset]:
             width, height = preset_map[preset]
             self.vid_prep_output_width.setValue(width)
@@ -3401,11 +4032,20 @@ class InstagramDownloaderGUI(QMainWindow):
             self._set_vid_prep_output_preview_dirty(True)
 
     def browse_vid_prep_mp3(self):
-        """Browse for MP3 replacement audio."""
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select MP3 File", "", "MP3 Files (*.mp3)")
+        """Browse for replacement audio."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Music File",
+            "",
+            "Audio Files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg);;MP3 Files (*.mp3);;All Files (*)"
+        )
         if file_path:
-            self.vid_prep_mp3_path.setText(file_path)
-            self._set_vid_prep_output_preview_dirty(True)
+            normalized = self._normalize_vid_prep_audio_path(file_path)
+            self.vid_prep_mp3_path.setText(normalized)
+            self.add_vid_prep_audio_to_library(normalized, select_added=True)
+            self.vid_prep_audio_replace_radio.setChecked(True)
+            self.refresh_vid_prep_audio_library_list(normalized)
+            self.on_vid_prep_audio_setting_changed()
 
     def _sanitize_vid_prep_filename_component(self, value):
         """Return a filesystem-safe filename component."""
@@ -3429,6 +4069,34 @@ class InstagramDownloaderGUI(QMainWindow):
     def _get_vid_prep_output_directory(self, source_path):
         """Resolve output directory from UI mode settings."""
         src = Path(source_path)
+        if self.vid_prep_output_folder_mode == 'default_video_output':
+            default_root = self._get_vid_prep_default_video_output_root()
+            if default_root:
+                return default_root
+            raise ValueError("Default Video Output is selected, but the Default Video Output setting is blank.")
+
+        if self.vid_prep_output_folder_mode == 'dvo_topic':
+            default_root = self._get_vid_prep_default_video_output_root()
+            if not default_root:
+                raise ValueError("DVO/Topic is selected, but the Default Video Output setting is blank.")
+
+            topic_rel = self._get_vid_prep_topic_relative_path()
+            if not topic_rel:
+                raise ValueError("DVO/Topic is selected, but no topic path is available to append. Select a topic first.")
+
+            # Normalize both sides so we never produce .../topics/topics/...
+            topic_parts = list(topic_rel.parts)
+            while topic_parts and topic_parts[0].lower() == 'topics':
+                topic_parts = topic_parts[1:]
+            normalized_topic_rel = Path(*topic_parts) if topic_parts else Path('.')
+
+            if default_root.parts and default_root.parts[-1].lower() == 'topics':
+                base_root = default_root
+            else:
+                base_root = default_root / 'topics'
+
+            return base_root if str(normalized_topic_rel) == '.' else (base_root / normalized_topic_rel)
+
         if self.vid_prep_output_folder_mode == 'user_specified':
             folder = (self.vid_prep_output_folder_path_input.text() or '').strip()
             if folder:
@@ -3518,10 +4186,16 @@ class InstagramDownloaderGUI(QMainWindow):
 
     def on_vid_prep_output_folder_mode_changed(self, mode_text):
         """Persist output folder mode and update path field availability."""
-        user_specified = mode_text == "User specified"
-        self.vid_prep_output_folder_mode = 'user_specified' if user_specified else 'same_as_input'
+        mode_map = {
+            "Same as input": 'same_as_input',
+            "User specified": 'user_specified',
+            "Default Video Output": 'default_video_output',
+            "DVO/Topic": 'dvo_topic',
+        }
+        self.vid_prep_output_folder_mode = mode_map.get(mode_text, 'same_as_input')
         self.account_manager.set_setting('vid_prep_output_folder_mode', self.vid_prep_output_folder_mode)
         self.save_ui_setting('vid_prep_output_folder_mode', self.vid_prep_output_folder_mode)
+        user_specified = self.vid_prep_output_folder_mode == 'user_specified'
         self.vid_prep_output_folder_path_input.setEnabled(user_specified)
         self.vid_prep_output_folder_browse_btn.setEnabled(user_specified)
         self.regenerate_vid_prep_output_filename()
@@ -3622,6 +4296,17 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_input_mute_btn.setText("🔈 Unmute" if muted else "🔇 Mute")
         self.save_ui_setting('vid_prep_input_muted', 'true' if muted else 'false')
 
+    def on_vid_prep_output_volume_changed(self, value):
+        """Adjust output preview audio volume."""
+        if self.vid_prep_output_player is not None:
+            self.vid_prep_output_player.setVolume(int(value))
+
+    def on_vid_prep_output_mute_toggled(self, muted):
+        """Mute/unmute output preview audio."""
+        if self.vid_prep_output_player is not None:
+            self.vid_prep_output_player.setMuted(bool(muted))
+        self.vid_prep_output_mute_btn.setText("🔈 Unmute" if muted else "🔇 Mute")
+
     def on_vid_prep_scrubber_changed(self, frame_idx):
         """Seek to the requested frame and update crop preview."""
         cv2 = self._get_cv2_for_vid_prep()
@@ -3671,6 +4356,8 @@ class InstagramDownloaderGUI(QMainWindow):
             return
 
         interval_ms = max(15, int(1000 / max(1.0, self.vid_prep_fps)))
+        self.vid_prep_play_start_time = time.monotonic()
+        self.vid_prep_play_start_frame = int(self.vid_prep_scrubber.value())
         if self.vid_prep_input_audio_player is not None:
             self.vid_prep_input_audio_player.setPosition(int(self._vid_prep_frame_to_seconds(self.vid_prep_scrubber.value()) * 1000))
             self.vid_prep_input_audio_player.play()
@@ -3683,6 +4370,7 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_play_timer.stop()
             if self.vid_prep_input_audio_player is not None:
                 self.vid_prep_input_audio_player.pause()
+            self.vid_prep_play_start_time = None
             self.vid_prep_status.setText("Source playback paused.")
 
     def stop_vid_prep_source(self):
@@ -3691,6 +4379,8 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_play_timer.stop()
         if self.vid_prep_input_audio_player is not None:
             self.vid_prep_input_audio_player.stop()
+        self.vid_prep_play_start_time = None
+        self.vid_prep_play_start_frame = 0
         if self.vid_prep_cap is not None:
             self.vid_prep_scrubber.blockSignals(True)
             self.vid_prep_scrubber.setValue(0)
@@ -3704,7 +4394,13 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_play_timer.stop()
             return
 
-        next_frame = self.vid_prep_scrubber.value() + 1
+        if self.vid_prep_play_start_time is None:
+            self.vid_prep_play_start_time = time.monotonic()
+            self.vid_prep_play_start_frame = int(self.vid_prep_scrubber.value())
+
+        elapsed_s = max(0.0, time.monotonic() - self.vid_prep_play_start_time)
+        next_frame = int(round(self.vid_prep_play_start_frame + (elapsed_s * max(1.0, self.vid_prep_fps))))
+        next_frame = max(self.vid_prep_scrubber.value() + 1, next_frame)
         source_end = max(0, self.vid_prep_frame_count - 1)
         if next_frame > source_end:
             self.vid_prep_play_timer.stop()
@@ -3811,6 +4507,8 @@ class InstagramDownloaderGUI(QMainWindow):
         """Update crop state when user adjusts crop selection."""
         self.vid_prep_crop_rect = (x, y, w, h)
         self.vid_prep_crop_label.setText(f"Crop: x={x}, y={y}, w={w}, h={h}")
+        if self.vid_prep_output_resolution_combo.currentText() == "Match Crop":
+            self.update_vid_prep_resolution_ui()
         self._set_vid_prep_output_preview_dirty(True)
 
     def _build_vid_prep_output_path(self, source_path):
@@ -3915,12 +4613,12 @@ class InstagramDownloaderGUI(QMainWindow):
         if audio_replace:
             mp3_path = self.vid_prep_mp3_path.text().strip()
             if not mp3_path or not os.path.exists(mp3_path):
-                raise ValueError("Choose a valid MP3 file for replacement audio.")
+                raise ValueError("Choose a valid audio file for replacement audio.")
 
             mp3_start_s = float(self.vid_prep_mp3_start.value())
             mp3_end_s = float(self.vid_prep_mp3_end.value())
             if mp3_end_s <= mp3_start_s:
-                raise ValueError("MP3 end time must be greater than start time.")
+                raise ValueError("Replacement audio end time must be greater than start time.")
 
         cmd = [ffmpeg_bin, "-y", "-ss", f"{trim_start_s:.3f}", "-to", f"{trim_end_s:.3f}", "-i", self.vid_prep_source_path]
 
@@ -4367,6 +5065,30 @@ class InstagramDownloaderGUI(QMainWindow):
         
         paths_group.setLayout(paths_layout)
         settings_layout.addWidget(paths_group)
+
+        # === Video Output Settings ===
+        video_output_group = QGroupBox("Video Output")
+        video_output_layout = QVBoxLayout()
+
+        video_output_row = QHBoxLayout()
+        video_output_row.addWidget(QLabel("Folder:"))
+        self.settings_video_output_path_input = QLineEdit()
+        self.settings_video_output_path_input.setPlaceholderText("Choose the default video output folder")
+        self.settings_video_output_path_input.setText(self.vid_prep_output_folder_path or '')
+        self.settings_video_output_path_input.textChanged.connect(self.on_video_output_folder_path_changed)
+        video_output_row.addWidget(self.settings_video_output_path_input)
+
+        video_output_browse_btn = QPushButton("Browse...")
+        video_output_browse_btn.clicked.connect(self.browse_video_output_folder_from_settings)
+        video_output_row.addWidget(video_output_browse_btn)
+        video_output_layout.addLayout(video_output_row)
+
+        video_output_note = QLabel("Used by Vid Prep output modes: Default Video Output and DVO/Topic.")
+        video_output_note.setWordWrap(True)
+        video_output_layout.addWidget(video_output_note)
+
+        video_output_group.setLayout(video_output_layout)
+        settings_layout.addWidget(video_output_group)
         
         # === Account Info ===
         account_group = QGroupBox("Account Information")
@@ -4473,6 +5195,24 @@ class InstagramDownloaderGUI(QMainWindow):
             if self.current_username:
                 self.account_manager.update_account_download_path(self.current_username, path)
                 logger.info(f"Updated download path: {path}")
+
+    def on_video_output_folder_path_changed(self, folder_path):
+        """Persist the shared video output folder path from Settings."""
+        self.vid_prep_output_folder_path = folder_path.strip()
+        if hasattr(self, 'vid_prep_output_folder_path_input') and self.vid_prep_output_folder_path_input.text() != self.vid_prep_output_folder_path:
+            self.vid_prep_output_folder_path_input.blockSignals(True)
+            self.vid_prep_output_folder_path_input.setText(self.vid_prep_output_folder_path)
+            self.vid_prep_output_folder_path_input.blockSignals(False)
+        self.save_ui_setting('vid_prep_output_folder_path', self.vid_prep_output_folder_path)
+        if self.current_username:
+            self.account_manager.set_setting('vid_prep_output_folder_path', self.vid_prep_output_folder_path)
+
+    def browse_video_output_folder_from_settings(self):
+        """Browse for the shared video output folder from Settings."""
+        folder = QFileDialog.getExistingDirectory(self, "Select Video Output Folder", self.vid_prep_output_folder_path or "")
+        if folder:
+            self.settings_video_output_path_input.setText(folder)
+            self.on_video_output_folder_path_changed(folder)
     
     def refresh_settings_paths(self):
         """Refresh the path fields in Settings tab with current account data"""
@@ -4486,6 +5226,10 @@ class InstagramDownloaderGUI(QMainWindow):
                 self.settings_download_path.setText('Not logged in')
                 self.settings_thumbnails_path.setText('Not logged in')
                 self.settings_topics_root_path.setText('Not logged in')
+                if hasattr(self, 'settings_video_output_path_input'):
+                    self.settings_video_output_path_input.blockSignals(True)
+                    self.settings_video_output_path_input.setText(self.vid_prep_output_folder_path or '')
+                    self.settings_video_output_path_input.blockSignals(False)
                 logger.info("No user logged in - set all fields to 'Not logged in'")
             else:
                 logger.warning("Settings fields not yet created")
@@ -4531,6 +5275,10 @@ class InstagramDownloaderGUI(QMainWindow):
             self.settings_download_path.setText(download)
             self.settings_thumbnails_path.setText(thumbnails)
             self.settings_topics_root_path.setText(topics)
+            if hasattr(self, 'settings_video_output_path_input'):
+                self.settings_video_output_path_input.blockSignals(True)
+                self.settings_video_output_path_input.setText(self.vid_prep_output_folder_path or '')
+                self.settings_video_output_path_input.blockSignals(False)
             
             logger.info(f"Updated Settings tab paths:")
             logger.info(f"  root_folder: {root}")
@@ -7959,8 +8707,8 @@ class InstagramDownloaderGUI(QMainWindow):
                         # Update queue status in database
                         if self.content_db and self.content_db.db:
                             try:
-                                error_msg = error if error else "Download failed"
-                                self.content_db.db.update_queue_status(shortcode, 'failed', error_msg)
+                                queue_error_msg = error_msg if error_msg else "Download failed"
+                                self.content_db.db.update_queue_status(shortcode, 'failed', queue_error_msg)
                                 logger.info(f"Updated queue status to 'failed' for {shortcode}")
                             except Exception as e:
                                 logger.error(f"Failed to update queue status in database: {e}")
@@ -8080,6 +8828,160 @@ class InstagramDownloaderGUI(QMainWindow):
                 "Error",
                 f"Failed to open directory:\n{str(e)}"
             )
+
+    def _open_folder_in_explorer(self, folder_path):
+        """Open a folder path in the platform file explorer."""
+        if not folder_path:
+            return False
+
+        try:
+            folder = Path(folder_path)
+            if not folder.exists():
+                return False
+
+            if platform.system() == "Windows":
+                os.startfile(str(folder))
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+            return True
+        except Exception as e:
+            logger.error(f"Error opening folder in explorer: {e}")
+            return False
+
+    def _copy_text_to_clipboard(self, text):
+        """Copy text to the system clipboard."""
+        if not text:
+            return False
+
+        try:
+            QApplication.clipboard().setText(str(text))
+            return True
+        except Exception as e:
+            logger.error(f"Error copying text to clipboard: {e}")
+            return False
+
+    def _get_all_topics_list(self):
+        """Return all topics from the database as a list."""
+        if not self.content_db or not self.content_db.db:
+            return []
+        try:
+            return self.content_db.db.get_all_topics() or []
+        except Exception as e:
+            logger.error(f"Error getting topics list: {e}")
+            return []
+
+    def _find_topic_by_name(self, topic_name):
+        """Find a topic record by name."""
+        clean_name = (topic_name or '').strip()
+        if not clean_name:
+            return None
+
+        for topic in self._get_all_topics_list():
+            if (topic.get('topic_name') or '').strip() == clean_name:
+                return topic
+        return None
+
+    def _resolve_topic_path(self, topic_data, base_root=None, use_download_root=False):
+        """Resolve a topic's folder path from its content path and a base root."""
+        if not topic_data:
+            return None
+
+        topic_path = topic_data.get('content_path') or topic_data.get('topic_name') or ''
+        sanitized_path, is_absolute = self.sanitize_topic_path(topic_path)
+        if not sanitized_path:
+            return None
+
+        topic_path_obj = Path(sanitized_path)
+        if is_absolute:
+            return topic_path_obj
+
+        root_value = base_root or ''
+        if not root_value and use_download_root:
+            root_value = self.download_path_input.text().strip() if hasattr(self, 'download_path_input') else ''
+        elif not root_value:
+            root_value = self.topics_root_path or (self.download_path_input.text().strip() if hasattr(self, 'download_path_input') else '')
+
+        if not root_value:
+            return topic_path_obj
+
+        return Path(root_value) / topic_path_obj
+
+    def _get_content_topic_folder_path(self, topic_data):
+        """Resolve the folder path used by the Content tab for a topic."""
+        return self._resolve_topic_path(topic_data, use_download_root=True)
+
+    def _get_post_topic_folder_path(self, post):
+        """Resolve the folder path for a post's assigned topic, if any."""
+        if not post:
+            return None
+
+        content_info = post.get('ContentInformation', {}) if isinstance(post, dict) else {}
+        topic_data = None
+        topic_id = content_info.get('topicID')
+        if topic_id and self.content_db and self.content_db.db:
+            try:
+                topic_data = self.content_db.db.get_topic(topic_id)
+            except Exception as e:
+                logger.debug(f"Failed to resolve topic folder for topicID {topic_id}: {e}")
+
+        if not topic_data:
+            selected_topic_name = (self.content_selected_topic or '').strip()
+            if selected_topic_name and selected_topic_name != 'All Topics':
+                topic_data = self._find_topic_by_name(selected_topic_name)
+
+        return self._get_content_topic_folder_path(topic_data)
+
+    def _get_vid_prep_selected_topic_data(self):
+        """Resolve the currently selected Vid Prep topic record."""
+        topic_name = ''
+        if hasattr(self, 'vid_prep_selected_topic_input'):
+            topic_name = (self.vid_prep_selected_topic_input.text() or '').strip()
+        if not topic_name:
+            topic_name = (getattr(self, 'content_selected_topic', '') or '').strip()
+        if not topic_name:
+            topic_name = (getattr(self, 'current_topic_filter', '') or '').strip()
+        if not topic_name or topic_name == 'All Topics':
+            return None
+        return self._find_topic_by_name(topic_name)
+
+    def _get_vid_prep_topic_relative_path(self):
+        """Get the selected topic path relative to the topics root."""
+        topic_data = self._get_vid_prep_selected_topic_data()
+        if not topic_data:
+            return None
+
+        topic_path = topic_data.get('content_path') or topic_data.get('topic_name') or ''
+        sanitized_path, is_absolute = self.sanitize_topic_path(topic_path)
+        if not sanitized_path:
+            return None
+
+        topic_path_obj = Path(sanitized_path)
+        if not is_absolute:
+            return topic_path_obj
+
+        root_path = self.topics_root_path or ''
+        if root_path:
+            try:
+                return topic_path_obj.relative_to(Path(root_path))
+            except Exception:
+                pass
+
+        return Path(topic_path_obj.name)
+
+    def _get_vid_prep_default_video_output_root(self):
+        """Return the base folder for default video output exports."""
+        folder = ''
+        if hasattr(self, 'settings_video_output_path_input'):
+            folder = (self.settings_video_output_path_input.text() or '').strip()
+        if hasattr(self, 'vid_prep_video_output_folder_input'):
+            folder = folder or (self.vid_prep_video_output_folder_input.text() or '').strip()
+        if not folder and hasattr(self, 'vid_prep_output_folder_path_input'):
+            folder = (self.vid_prep_output_folder_path_input.text() or '').strip()
+        if not folder:
+            folder = self.vid_prep_output_folder_path or ''
+        return Path(folder) if folder else None
     
     def copy_url_to_clipboard(self, url):
         """Copy Instagram URL to clipboard"""
@@ -9433,7 +10335,7 @@ class InstagramDownloaderGUI(QMainWindow):
             logger.error(f"Error in recopy_to_topics: {e}")
             QMessageBox.critical(self, "Error", f"Failed to re-copy files:\n{str(e)}")
             # Update all topics to Error
-            for topic in topics:
+            for topic in topics_to_copy:
                 self.content_db.db.update_file_movement_status(
                     shortcode, topic['id'], 'Error', str(e)[:500]
                 )
@@ -10847,6 +11749,9 @@ class InstagramDownloaderGUI(QMainWindow):
                 if post.get('shortcode') == shortcode:
                     post['download_status'] = final_status
                     break
+
+            # Keep Content tab dataset in sync so its tiles can refresh immediately.
+            self._update_content_filtered_post_status(shortcode, final_status)
             
             # Also update in page cache if present
             cache_snapshot = list(self.page_cache.items())
@@ -10929,6 +11834,7 @@ class InstagramDownloaderGUI(QMainWindow):
             
             # Refresh only the specific tile/row for this shortcode
             self.refresh_single_item(shortcode)
+            self.refresh_single_content_item(shortcode)
             
             # Show appropriate message
             if len(files) > 0:
@@ -10968,6 +11874,9 @@ class InstagramDownloaderGUI(QMainWindow):
                                 self.update_tile_appearance(tile_widget, post, shortcode)
                                 logger.info(f"[SINGLE_DOWNLOAD] Updated tile appearance for {shortcode} at ({row}, {col}) - should be RED")
                         break
+
+                        # Keep Content tab dataset in sync so its tiles can refresh immediately.
+                        self._update_content_filtered_post_status(shortcode, 'error')
             
             # Update database
             if self.content_db:
@@ -10985,6 +11894,38 @@ class InstagramDownloaderGUI(QMainWindow):
                 f"{error_msg}\n\nThe tile should now be RED. You can retry the download.",
                 timeout_ms=5000,
             )
+
+            # Refresh only the specific tile/row where visible.
+            self.refresh_single_item(shortcode)
+            self.refresh_single_content_item(shortcode)
+
+    def _update_content_filtered_post_status(self, shortcode, download_status):
+        """Update in-memory Content tab posts so visible tile refresh uses current status."""
+        if not hasattr(self, 'content_filtered_posts'):
+            return
+
+        for post in self.content_filtered_posts:
+            if post.get('shortcode') == shortcode:
+                post['download_status'] = download_status
+                break
+
+    def refresh_single_content_item(self, shortcode):
+        """Refresh one Content tab tile if that shortcode is visible on the current content page."""
+        if not hasattr(self, 'content_tiles_grid') or not hasattr(self, 'content_filtered_posts'):
+            return
+
+        total_items = len(self.content_filtered_posts)
+        if total_items == 0:
+            return
+
+        start = self.content_current_page * self.content_tiles_per_page
+        end = min(start + self.content_tiles_per_page, total_items)
+        page_posts = self.content_filtered_posts[start:end]
+
+        if any(post.get('shortcode') == shortcode for post in page_posts):
+            # Re-render current Content page so tile buttons/media reflect updated download status.
+            self.populate_content_tiles()
+            logger.debug(f"[CONTENT_REFRESH] Refreshed content tile for {shortcode} on page {self.content_current_page}")
     
     def refresh_single_item(self, shortcode):
         """Refresh display for a single item (avoids race conditions with concurrent downloads)"""
@@ -12203,12 +13144,8 @@ class InstagramDownloaderGUI(QMainWindow):
                     border: 1px solid #444444;
                     outline: 0;
                 }}
-                QTreeWidget::item {{
-                    color: #e0e0e0;
-                }}
                 QTreeWidget::item:selected {{
                     background-color: #0078d4;
-                    color: white;
                 }}
                 QTreeWidget::branch:has-children:!has-siblings:closed,
                 QTreeWidget::branch:closed:has-children:has-siblings {{
@@ -12332,6 +13269,27 @@ class InstagramDownloaderGUI(QMainWindow):
         """Load UI settings for current account"""
         if not self.current_username:
             return
+
+        # Restore Content tab state early so tab restore (which can trigger content tree load)
+        # has the correct selection context available.
+        self.content_selected_topic = self.account_manager.get_account_setting(self.current_username, 'ui_content_selected_topic', '') or ''
+        saved_content_topic_id = self.account_manager.get_account_setting(self.current_username, 'ui_content_selected_topic_id', '')
+        try:
+            self.content_selected_topic_id = int(saved_content_topic_id) if str(saved_content_topic_id).strip() else None
+        except (ValueError, TypeError):
+            self.content_selected_topic_id = None
+        try:
+            self.content_current_page = max(0, int(self.account_manager.get_account_setting(self.current_username, 'ui_content_current_page', '0')))
+        except (ValueError, TypeError):
+            self.content_current_page = 0
+        try:
+            self.content_tiles_per_page = max(10, min(100, int(self.account_manager.get_account_setting(self.current_username, 'ui_content_tiles_per_page', str(self.content_tiles_per_page)))))
+        except (ValueError, TypeError):
+            pass
+        if hasattr(self, 'content_items_per_page_spin'):
+            self.content_items_per_page_spin.blockSignals(True)
+            self.content_items_per_page_spin.setValue(self.content_tiles_per_page)
+            self.content_items_per_page_spin.blockSignals(False)
         
         # Load theme
         saved_theme = self.account_manager.get_account_setting(self.current_username, 'ui_theme', 'light')
@@ -12414,21 +13372,6 @@ class InstagramDownloaderGUI(QMainWindow):
         except (ValueError, AttributeError) as e:
             logger.warning(f"[PAGE RESTORE] Failed to parse saved page: '{saved_page}' - Error: {e}")
             pass  # Invalid page number, ignore
-
-        # Restore Content tab state
-        self.content_selected_topic = self.account_manager.get_account_setting(self.current_username, 'ui_content_selected_topic', '') or ''
-        try:
-            self.content_current_page = max(0, int(self.account_manager.get_account_setting(self.current_username, 'ui_content_current_page', '0')))
-        except (ValueError, TypeError):
-            self.content_current_page = 0
-        try:
-            self.content_tiles_per_page = max(10, min(100, int(self.account_manager.get_account_setting(self.current_username, 'ui_content_tiles_per_page', str(self.content_tiles_per_page)))))
-        except (ValueError, TypeError):
-            pass
-        if hasattr(self, 'content_items_per_page_spin'):
-            self.content_items_per_page_spin.blockSignals(True)
-            self.content_items_per_page_spin.setValue(self.content_tiles_per_page)
-            self.content_items_per_page_spin.blockSignals(False)
 
         # Restore Vid Prep tab state
         if hasattr(self, '_load_vid_prep_ui_settings'):
@@ -12580,11 +13523,11 @@ class InstagramDownloaderGUI(QMainWindow):
             self.load_topics_tree()
 
         if tab_name == "Content":
-            self.load_content_topics_tree()
+            QTimer.singleShot(0, self.load_content_topics_tree)
 
         if tab_name == "Settings":
             logger.info("Refreshing Settings tab paths")
-            self.refresh_settings_paths()
+            QTimer.singleShot(0, self.refresh_settings_paths)
     
     def populate_tiles(self):
         """Populate the tile view with current page from cache - lazy loaded"""
@@ -13784,8 +14727,9 @@ class InstagramDownloaderGUI(QMainWindow):
             logger.error(f"Error extracting video thumbnail from {video_path}: {e}")
             return None
     
-    def _add_tile_media_display(self, layout, tile, config, shortcode, downloaded_files):
-        """Add media display to tile with interactive controls based on content type"""
+    def _add_tile_media_display(self, layout, tile, config, shortcode, downloaded_files,
+                                inline_examine=False, examine_callback=None):
+        """Add media display to tile with interactive controls based on content type."""
         thumb_size = config['thumb']
         
         logger.debug(f"[MEDIA_DISPLAY] {shortcode}: downloaded_files count={len(downloaded_files) if downloaded_files else 0}")
@@ -13805,7 +14749,14 @@ class InstagramDownloaderGUI(QMainWindow):
             elif any(f['type'] in ['video', 'mp4'] for f in downloaded_files):
                 # Single video with play button
                 logger.info(f"[MEDIA_DISPLAY] {shortcode}: Creating VIDEO display with PLAY BUTTON")
-                self._add_video_display(layout, thumb_size, shortcode, downloaded_files[0])
+                self._add_video_display(
+                    layout,
+                    thumb_size,
+                    shortcode,
+                    downloaded_files[0],
+                    inline_examine=inline_examine,
+                    examine_callback=examine_callback,
+                )
             else:
                 # Single image with hover tooltip
                 logger.info(f"[MEDIA_DISPLAY] {shortcode}: Creating IMAGE display")
@@ -13987,8 +14938,9 @@ class InstagramDownloaderGUI(QMainWindow):
         carousel_layout.addLayout(nav_row)
         layout.addWidget(carousel_container, 0, Qt.AlignLeft)
     
-    def _add_video_display(self, layout, thumb_size, shortcode, video_file):
-        """Add video display with play button"""
+    def _add_video_display(self, layout, thumb_size, shortcode, video_file,
+                           inline_examine=False, examine_callback=None):
+        """Add video display with compact play controls."""
         video_container = QWidget()
         video_layout = QVBoxLayout(video_container)
         video_layout.setSpacing(2)
@@ -13997,8 +14949,8 @@ class InstagramDownloaderGUI(QMainWindow):
         # Use square aspect ratio to ensure play button fits within tile max height
         video_height = thumb_size
         
-        # Set fixed size on container to ensure it has enough space for video playback
-        video_container.setFixedSize(thumb_size, video_height + 32)  # +32 for play button
+        # Set fixed size on container to ensure it has enough space for controls.
+        video_container.setFixedSize(thumb_size, video_height + 22)
         
         # Video thumbnail
         thumb_label = QLabel()
@@ -14040,15 +14992,20 @@ class InstagramDownloaderGUI(QMainWindow):
         
         video_layout.addWidget(thumb_label)
         
-        # Play button
-        play_btn = QPushButton("▶ Play Video")
-        play_btn.setMaximumHeight(28)
+        controls_row = QHBoxLayout()
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setSpacing(2)
+
+        # Requested: make Play Video button roughly half-height.
+        play_btn = QPushButton("▶ Play")
+        play_btn.setFixedHeight(14)
         play_btn.setStyleSheet("""
             QPushButton {
                 background-color: #28a745;
                 color: white;
                 font-weight: bold;
-                padding: 4px;
+                font-size: 8pt;
+                padding: 1px 4px;
                 border-radius: 3px;
             }
             QPushButton:hover {
@@ -14057,7 +15014,21 @@ class InstagramDownloaderGUI(QMainWindow):
         """)
         # Pass video_layout as inline container for inline playback
         play_btn.clicked.connect(lambda: self.play_video(video_file['path'], video_layout))
-        video_layout.addWidget(play_btn)
+        controls_row.addWidget(play_btn)
+
+        # Optional inline Examine button on the same control row as Play.
+        if inline_examine and callable(examine_callback):
+            examine_btn = QPushButton("Examine")
+            examine_btn.setFixedHeight(14)
+            examine_btn.setStyleSheet(
+                "QPushButton { background-color: #495057; color: white; font-weight: bold; font-size: 8pt; padding: 1px 4px; border-radius: 3px; }"
+            )
+            examine_btn.setToolTip("Open Single Tile Viewer")
+            examine_btn.clicked.connect(examine_callback)
+            controls_row.addWidget(examine_btn)
+
+        controls_row.addStretch()
+        video_layout.addLayout(controls_row)
         
         layout.addWidget(video_container, 0, Qt.AlignLeft)
     
@@ -14226,7 +15197,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if vid_prep_index >= 0:
             self.tabs.setCurrentIndex(vid_prep_index)
     
-    def create_tile_widget(self, post, row_number=None, include_examine_button=True, tile_config_override=None):
+    def create_tile_widget(self, post, row_number=None, include_examine_button=True, tile_config_override=None, open_explorer_target='download'):
         """Create a tile widget for a single post
         
         Args:
@@ -14390,7 +15361,14 @@ class InstagramDownloaderGUI(QMainWindow):
                 explorer_btn.setMaximumHeight(24)
                 explorer_btn.setToolTip("Open In Explorer")
                 explorer_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; font-weight: bold; }")
-                explorer_btn.clicked.connect(lambda checked=False, sc=shortcode: self.open_downloaded_file(sc))
+                if open_explorer_target == 'topic':
+                    topic_folder = self._get_post_topic_folder_path(post)
+                    if topic_folder:
+                        explorer_btn.clicked.connect(lambda checked=False, p=topic_folder: self._open_folder_in_explorer(p))
+                    else:
+                        explorer_btn.clicked.connect(lambda checked=False, sc=shortcode: self.open_downloaded_file(sc))
+                else:
+                    explorer_btn.clicked.connect(lambda checked=False, sc=shortcode: self.open_downloaded_file(sc))
                 button_row.addWidget(explorer_btn)
         
         # Re-copy to Topics button (only show if content has topic assignments)
@@ -14490,19 +15468,126 @@ class InstagramDownloaderGUI(QMainWindow):
             else:
                 logger.warning(f"[TILE] {shortcode}: status={status} but no downloaded files found!")
         
-        # Add interactive media display based on download status
-        self._add_tile_media_display(layout, tile, config, shortcode, downloaded_files)
+        # Shared Examine handler for footer and inline video controls.
+        open_examine_handler = (
+            lambda checked=False, p=post, rn=row_number, explorer_target=open_explorer_target:
+            self.open_single_tile_viewer(p, rn, explorer_target)
+        )
 
-        if include_examine_button:
+        is_single_video = (
+            len(downloaded_files) == 1 and
+            downloaded_files[0].get('type') in ['video', 'mp4']
+        )
+        inline_examine = (
+            include_examine_button and
+            status not in ['failed', 'error', 'completed_with_errors'] and
+            open_explorer_target == 'topic' and
+            is_single_video
+        )
+
+        # Add interactive media display based on download status.
+        self._add_tile_media_display(
+            layout,
+            tile,
+            config,
+            shortcode,
+            downloaded_files,
+            inline_examine=inline_examine,
+            examine_callback=open_examine_handler,
+        )
+
+        needs_footer_controls = include_examine_button and status not in ['failed', 'error', 'completed_with_errors']
+        if needs_footer_controls:
             examine_row = QHBoxLayout()
             examine_row.setContentsMargins(0, 2, 0, 0)
             examine_row.setSpacing(2)
-            examine_btn = QPushButton("Examine")
-            examine_btn.setMaximumHeight(28)
-            examine_btn.setToolTip("Open Single Tile Viewer")
-            examine_btn.setStyleSheet("QPushButton { background-color: #495057; color: white; font-weight: bold; }")
-            examine_btn.clicked.connect(lambda checked=False, p=post, rn=row_number: self.open_single_tile_viewer(p, rn))
-            examine_row.addWidget(examine_btn)
+
+            # If we already placed Examine next to Play for content-topic video tiles, skip duplicate footer button.
+            if not inline_examine:
+                examine_btn = QPushButton("Examine")
+                if open_explorer_target == 'topic':
+                    examine_btn.setMaximumHeight(24)
+                    examine_btn.setMaximumWidth(78)
+                else:
+                    examine_btn.setMaximumHeight(28)
+                examine_btn.setToolTip("Open Single Tile Viewer")
+                examine_btn.setStyleSheet("QPushButton { background-color: #495057; color: white; font-weight: bold; }")
+                examine_btn.clicked.connect(open_examine_handler)
+                examine_row.addWidget(examine_btn)
+
+            # Content tab only: add Tree/Site completion toggles for current topic assignment.
+            if open_explorer_target == 'topic' and self.content_db and self.content_db.db:
+                shortcode_clean = (shortcode or '').strip()
+                content_ref_for_toggle = post.get('row_number') if post.get('row_number') is not None else shortcode_clean
+                topic_id_for_toggle = self._get_selected_content_topic_id()
+                if topic_id_for_toggle is None:
+                    topic_id_for_toggle = self._resolve_topic_assignment_id_for_tile(post, open_explorer_target)
+                flags = None
+                if topic_id_for_toggle is not None and content_ref_for_toggle not in (None, ''):
+                    try:
+                        flags = self.content_db.db.get_topic_assignment_update_flags(content_ref_for_toggle, int(topic_id_for_toggle))
+                        if flags is None and str(content_ref_for_toggle) != shortcode_clean:
+                            flags = self.content_db.db.get_topic_assignment_update_flags(shortcode_clean, int(topic_id_for_toggle))
+                    except Exception as e:
+                        logger.debug(f"Failed loading assignment flags for {shortcode_clean}: {e}")
+
+                tree_btn = QPushButton()
+                tree_btn.setMaximumHeight(24)
+                tree_btn.setToolTip("Cycle DL.topic_assignments.TreeUpdated: 0 (To-Do) -> 1 (Done) -> 2 (Ignored)")
+                tree_current = int(flags.get('TreeUpdated', 0)) if flags else 0
+                tree_btn._assignment_flag_value = tree_current
+                self._style_assignment_toggle_button(tree_btn, 'Tree', tree_current)
+                tree_btn.clicked.connect(
+                    lambda checked=False, cr=content_ref_for_toggle, sc=shortcode_clean, p=post, b=tree_btn:
+                    self._toggle_topic_assignment_flag(
+                        cr,
+                        self._resolve_topic_assignment_id_for_tile(p, 'topic') or self._get_selected_content_topic_id(),
+                        'TreeUpdated',
+                        b,
+                        'Tree Complete',
+                        sc,
+                    )
+                )
+                examine_row.addWidget(tree_btn)
+
+                site_btn = QPushButton()
+                site_btn.setMaximumHeight(24)
+                site_btn.setToolTip("Cycle DL.topic_assignments.SiteUpdated: 0 (To-Do) -> 1 (Done) -> 2 (Ignored)")
+                site_current = int(flags.get('SiteUpdated', 0)) if flags else 0
+                site_btn._assignment_flag_value = site_current
+                self._style_assignment_toggle_button(site_btn, 'Site', site_current)
+                site_btn.clicked.connect(
+                    lambda checked=False, cr=content_ref_for_toggle, sc=shortcode_clean, p=post, b=site_btn:
+                    self._toggle_topic_assignment_flag(
+                        cr,
+                        self._resolve_topic_assignment_id_for_tile(p, 'topic') or self._get_selected_content_topic_id(),
+                        'SiteUpdated',
+                        b,
+                        'Site Complete',
+                        sc,
+                    )
+                )
+                examine_row.addWidget(site_btn)
+
+                prep_btn = QPushButton()
+                prep_btn.setMaximumHeight(24)
+                prep_btn.setToolTip("Cycle DL.topic_assignments.VidPrepUpdated: 0 (To-Do) -> 1 (Done) -> 2 (Ignored)")
+                prep_current = int(flags.get('VidPrepUpdated', 0)) if flags else 0
+                prep_btn._assignment_flag_value = prep_current
+                self._style_assignment_toggle_button(prep_btn, 'Video Prep', prep_current)
+                prep_btn.clicked.connect(
+                    lambda checked=False, cr=content_ref_for_toggle, sc=shortcode_clean, p=post, b=prep_btn:
+                    self._toggle_topic_assignment_flag(
+                        cr,
+                        self._resolve_topic_assignment_id_for_tile(p, 'topic') or self._get_selected_content_topic_id(),
+                        'VidPrepUpdated',
+                        b,
+                        'Prep Complete',
+                        sc,
+                    )
+                )
+                examine_row.addWidget(prep_btn)
+
             layout.addLayout(examine_row)
         
         # Make tile clickable to show details - but don't interfere with button clicks
@@ -14525,7 +15610,7 @@ class InstagramDownloaderGUI(QMainWindow):
         
         return tile
 
-    def open_single_tile_viewer(self, post, row_number=None):
+    def open_single_tile_viewer(self, post, row_number=None, open_explorer_target='download'):
         """Open one tile in a dedicated viewer dialog."""
         dialog = QDialog(self)
         shortcode = post.get('shortcode', 'Unknown')
@@ -14551,6 +15636,7 @@ class InstagramDownloaderGUI(QMainWindow):
             row_number=row_number,
             include_examine_button=False,
             tile_config_override=viewer_config,
+            open_explorer_target=open_explorer_target,
         )
         container_layout.addWidget(viewer_tile, 0, Qt.AlignTop | Qt.AlignHCenter)
         outer.addWidget(container, 1)
