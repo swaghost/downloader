@@ -604,6 +604,174 @@ class DatabaseManagerSQLServer:
                 entry['shortcode'] = entry['id']
         
         return entries
+
+    def get_content_entries_for_topic_with_flags(self, topic_id: int, account_name: str = None,
+                                                 limit: int = None, offset: int = 0,
+                                                 sort_by: str = 'row_number', sort_direction: str = 'DESC') -> Dict[str, Dict[str, Any]]:
+        """
+        Get content entries assigned to a topic or any of its descendants, including tri-state assignment flags.
+
+        Returns:
+            Dictionary of {entry_id: entry_dict} with extra fields:
+            - assignment_topic_id
+            - TreeUpdated
+            - SiteUpdated
+            - VidPrepUpdated
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        if account_name is None:
+            account_name = self.account_name
+
+        valid_sort_fields = ['row_number', 'saved_time', 'posted_time', 'import_time']
+        if sort_by not in valid_sort_fields:
+            sort_by = 'row_number'
+
+        if sort_direction.upper() not in ['ASC', 'DESC']:
+            sort_direction = 'DESC'
+
+        base_query = f'''
+            WITH topic_scope AS (
+                SELECT id
+                FROM DL.topics
+                WHERE id = ?
+
+                UNION ALL
+
+                SELECT child.id
+                FROM DL.topics child
+                INNER JOIN topic_scope parent_scope ON child.parent_topic_id = parent_scope.id
+            ),
+            topic_rows AS (
+                SELECT
+                    ta.account_name,
+                    ta.topic_id,
+                    ta.content_id,
+                    ta.row_number,
+                    ta.TreeUpdated,
+                    ta.SiteUpdated,
+                    ta.VidPrepUpdated,
+                    ta.assigned_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ta.account_name, COALESCE(CAST(ta.row_number AS NVARCHAR(50)), ta.content_id)
+                        ORDER BY
+                            CASE WHEN ta.topic_id = ? THEN 0 ELSE 1 END,
+                            ta.assigned_at DESC
+                    ) AS rn
+                FROM DL.topic_assignments ta
+                WHERE ta.account_name = ?
+                  AND ta.topic_id IN (SELECT id FROM topic_scope)
+            )
+            SELECT
+                ce.*,
+                tr.topic_id AS assignment_topic_id,
+                tr.TreeUpdated,
+                tr.SiteUpdated,
+                tr.VidPrepUpdated
+            FROM topic_rows tr
+            INNER JOIN DL.content_entries ce
+                ON ce.account_name = tr.account_name
+               AND (
+                    (tr.row_number IS NOT NULL AND ce.row_number = tr.row_number)
+                 OR (tr.row_number IS NULL AND ce.id = tr.content_id)
+               )
+            WHERE tr.rn = 1
+            ORDER BY ce.{sort_by} {sort_direction}
+        '''
+
+        if limit is not None:
+            query = base_query + '\nOFFSET ? ROWS FETCH NEXT ? ROWS ONLY'
+            cursor.execute(query, (int(topic_id), int(topic_id), account_name, offset, limit))
+        else:
+            cursor.execute(base_query, (int(topic_id), int(topic_id), account_name))
+
+        entries = {}
+        entry_ids = []
+
+        for row in cursor.fetchall():
+            entry_dict = self._dict_from_row(cursor, row)
+            entry_id = entry_dict.get('id')
+            if not entry_id:
+                continue
+
+            entry_dict['ContentInformation'] = {
+                'rowNumber': entry_dict.get('row_number'),
+                'date_added': entry_dict.get('date_added'),
+                'ContentType': entry_dict.get('content_type'),
+                'cdnAcquisitionStatus': entry_dict.get('cdn_acquisition_status'),
+                'downloadStatus': entry_dict.get('download_status'),
+                'reviewState': entry_dict.get('review_state'),
+                'purgeStatus': bool(entry_dict.get('purge_status')),
+                'isDuplicate': bool(entry_dict.get('is_duplicate')),
+                'topicID': entry_dict.get('assignment_topic_id'),
+            }
+            entry_dict['FilesInformation'] = {'FileList': []}
+            if 'shortcode' not in entry_dict and 'id' in entry_dict:
+                entry_dict['shortcode'] = entry_dict['id']
+
+            entries[entry_id] = entry_dict
+            entry_ids.append(entry_id)
+
+        if not entry_ids:
+            return entries
+
+        files_by_entry = {}
+        all_file_ids = []
+
+        for entry_id in entry_ids:
+            cursor.execute('''
+                SELECT * FROM DL.files
+                WHERE content_id = ?
+                ORDER BY file_number
+            ''', (entry_id,))
+
+            for row in cursor.fetchall():
+                file_dict = self._dict_from_row(cursor, row)
+                file_id = file_dict['id']
+
+                if entry_id not in files_by_entry:
+                    files_by_entry[entry_id] = []
+
+                file_dict['segments'] = []
+                file_dict['cdn_discovery_attempts'] = []
+                files_by_entry[entry_id].append(file_dict)
+                all_file_ids.append(file_id)
+
+        for file_id in all_file_ids:
+            cursor.execute('''
+                SELECT * FROM DL.segments
+                WHERE file_id = ?
+                ORDER BY segment_order
+            ''', (file_id,))
+            segments = [self._dict_from_row(cursor, row) for row in cursor.fetchall()]
+
+            for content_id, file_list in files_by_entry.items():
+                for file_entry in file_list:
+                    if file_entry['id'] == file_id:
+                        file_entry['segments'] = segments
+                        break
+
+        for file_id in all_file_ids:
+            cursor.execute('''
+                SELECT * FROM DL.cdn_discovery_attempts
+                WHERE file_id = ?
+                ORDER BY attempt_order
+            ''', (file_id,))
+            attempts = [self._dict_from_row(cursor, row) for row in cursor.fetchall()]
+
+            for content_id, file_list in files_by_entry.items():
+                for file_entry in file_list:
+                    if file_entry['id'] == file_id:
+                        file_entry['cdn_discovery_attempts'] = attempts
+                        break
+
+        for entry_id, file_list in files_by_entry.items():
+            if entry_id in entries:
+                mapped_files = [self._map_file_to_ui_format(f) for f in file_list]
+                entries[entry_id]['FilesInformation']['FileList'] = mapped_files
+
+        return entries
     
     def delete_content_entry(self, entry_id: str) -> bool:
         """Delete a content entry (CASCADE will handle files, segments, etc.)."""
@@ -1576,9 +1744,9 @@ class DatabaseManagerSQLServer:
 
     def get_topic_update_on_counts(self, account_name: str = None) -> Dict[int, Dict[str, int]]:
         """
-        Get per-topic assignment counts and ON counts for Tree/Site flags.
+        Get per-topic assignment counts and ON counts for Tree/Site/Video Prep flags.
 
-        ON means TreeUpdated=1 or SiteUpdated=1.
+        ON means TreeUpdated=1 or SiteUpdated=1 or VidPrepUpdated=1.
 
         Returns:
             {topic_id: {'total': int, 'on': int}}
@@ -1594,8 +1762,8 @@ class DatabaseManagerSQLServer:
                 SELECT
                     topic_id,
                     COALESCE(CAST(row_number AS NVARCHAR(50)), content_id) AS item_key,
-                    MAX(CASE WHEN TreeUpdated = 1 OR SiteUpdated = 1 THEN 1 ELSE 0 END) AS is_on,
-                    MAX(CASE WHEN TreeUpdated = 1 AND SiteUpdated = 1 THEN 1 ELSE 0 END) AS is_both_done
+                    MAX(CASE WHEN TreeUpdated = 1 OR SiteUpdated = 1 OR VidPrepUpdated = 1 THEN 1 ELSE 0 END) AS is_on,
+                    MAX(CASE WHEN TreeUpdated = 1 AND SiteUpdated = 1 AND VidPrepUpdated = 1 THEN 1 ELSE 0 END) AS is_both_done
                 FROM DL.topic_assignments
                 WHERE account_name = ?
                 GROUP BY topic_id, COALESCE(CAST(row_number AS NVARCHAR(50)), content_id)
@@ -1750,6 +1918,54 @@ class DatabaseManagerSQLServer:
             'TreeUpdated': int(row[0]),
             'SiteUpdated': int(row[1]),
             'VidPrepUpdated': int(row[2])
+        }
+
+    def get_topic_assignment_flags_for_topic(self, topic_id: int,
+                                             account_name: str = None) -> Dict[str, Dict[Any, Dict[str, int]]]:
+        """
+        Get all tri-state assignment flags for a topic in one query.
+
+        Returns:
+            {
+                'by_row_number': {row_number: {'TreeUpdated': int, 'SiteUpdated': int, 'VidPrepUpdated': int}},
+                'by_content_id': {content_id: {'TreeUpdated': int, 'SiteUpdated': int, 'VidPrepUpdated': int}}
+            }
+        """
+        if account_name is None:
+            account_name = self.account_name
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT row_number, content_id, TreeUpdated, SiteUpdated, VidPrepUpdated
+            FROM DL.topic_assignments
+            WHERE account_name = ? AND topic_id = ?
+            ORDER BY assigned_at DESC
+        ''', (account_name, int(topic_id)))
+
+        by_row_number: Dict[int, Dict[str, int]] = {}
+        by_content_id: Dict[str, Dict[str, int]] = {}
+
+        for row in cursor.fetchall():
+            row_number = row[0]
+            content_id = str(row[1]).strip() if row[1] is not None else ''
+
+            flags = {
+                'TreeUpdated': int(row[2]),
+                'SiteUpdated': int(row[3]),
+                'VidPrepUpdated': int(row[4]),
+            }
+
+            # Keep first row for each key (latest because query is DESC).
+            if row_number is not None and int(row_number) not in by_row_number:
+                by_row_number[int(row_number)] = flags
+            if content_id and content_id not in by_content_id:
+                by_content_id[content_id] = flags
+
+        return {
+            'by_row_number': by_row_number,
+            'by_content_id': by_content_id,
         }
 
     def update_topic_assignment_update_flag(self, content_id: str, topic_id: int,
