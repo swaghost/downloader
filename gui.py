@@ -3187,11 +3187,11 @@ class InstagramDownloaderGUI(QMainWindow):
         button.setText(str(label))
 
         if state == 1:
-            button.setStyleSheet("QPushButton { background-color: #009E00; color: #ffffff; font-weight: bold; padding: 2px 6px; }")
+            button.setStyleSheet("QPushButton { background-color: #009E00; color: #ffffff; font-weight: bold; font-size: 7pt; padding: 0px 2px; }")
         elif state == 2:
-            button.setStyleSheet("QPushButton { background-color: #000000; color: #ffffff; font-weight: bold; padding: 2px 6px; }")
+            button.setStyleSheet("QPushButton { background-color: #000000; color: #ffffff; font-weight: bold; font-size: 7pt; padding: 0px 2px; }")
         else:
-            button.setStyleSheet("QPushButton { background-color: #b0bec5; color: #102027; font-weight: bold; padding: 2px 6px; }")
+            button.setStyleSheet("QPushButton { background-color: #b0bec5; color: #102027; font-weight: bold; font-size: 7pt; padding: 0px 2px; }")
 
     def _toggle_topic_assignment_flag(self, content_ref, topic_id, field_name, button, label, display_shortcode=''):
         """Cycle TreeUpdated/SiteUpdated state 0 -> 1 -> 2 -> 0 and refresh button state."""
@@ -3360,8 +3360,65 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_input_mute_btn.setCheckable(True)
         self.vid_prep_input_mute_btn.toggled.connect(self.on_vid_prep_input_mute_toggled)
         source_controls.addWidget(self.vid_prep_input_mute_btn)
+
         source_controls.addStretch()
         source_panel.addLayout(source_controls)
+
+        source_jump_row = QHBoxLayout()
+        source_jump_row.setContentsMargins(0, 0, 0, 0)
+        source_jump_row.setSpacing(4)
+
+        self.vid_prep_source_jump_minus_1s_btn = QPushButton("-1 Sec")
+        self.vid_prep_source_jump_minus_1s_btn.setFixedHeight(24)
+        self.vid_prep_source_jump_minus_1s_btn.setFixedWidth(60)
+        self.vid_prep_source_jump_minus_1s_btn.setToolTip("Jump source timeline backward 1 second")
+        self.vid_prep_source_jump_minus_1s_btn.clicked.connect(lambda: self.step_vid_prep_source_seconds(-1.0))
+        source_jump_row.addWidget(self.vid_prep_source_jump_minus_1s_btn)
+
+        self.vid_prep_source_jump_minus_5f_btn = QPushButton("-5 Frame")
+        self.vid_prep_source_jump_minus_5f_btn.setFixedHeight(24)
+        self.vid_prep_source_jump_minus_5f_btn.setFixedWidth(72)
+        self.vid_prep_source_jump_minus_5f_btn.setToolTip("Jump source timeline backward 5 frames")
+        self.vid_prep_source_jump_minus_5f_btn.clicked.connect(lambda: self.step_vid_prep_source_frames(-5))
+        source_jump_row.addWidget(self.vid_prep_source_jump_minus_5f_btn)
+
+        self.vid_prep_source_jump_minus_1f_btn = QPushButton("- Frame")
+        self.vid_prep_source_jump_minus_1f_btn.setFixedHeight(24)
+        self.vid_prep_source_jump_minus_1f_btn.setFixedWidth(64)
+        self.vid_prep_source_jump_minus_1f_btn.setToolTip("Jump source timeline backward 1 frame")
+        self.vid_prep_source_jump_minus_1f_btn.clicked.connect(lambda: self.step_vid_prep_source_frames(-1))
+        source_jump_row.addWidget(self.vid_prep_source_jump_minus_1f_btn)
+
+        self.vid_prep_source_jump_reset_btn = QPushButton("Reset")
+        self.vid_prep_source_jump_reset_btn.setFixedHeight(24)
+        self.vid_prep_source_jump_reset_btn.setFixedWidth(60)
+        self.vid_prep_source_jump_reset_btn.setToolTip("Go to first source frame")
+        self.vid_prep_source_jump_reset_btn.clicked.connect(self.reset_vid_prep_source_to_first_frame)
+        source_jump_row.addWidget(self.vid_prep_source_jump_reset_btn)
+
+        self.vid_prep_source_jump_plus_1f_btn = QPushButton("+Frame")
+        self.vid_prep_source_jump_plus_1f_btn.setFixedHeight(24)
+        self.vid_prep_source_jump_plus_1f_btn.setFixedWidth(62)
+        self.vid_prep_source_jump_plus_1f_btn.setToolTip("Jump source timeline forward 1 frame")
+        self.vid_prep_source_jump_plus_1f_btn.clicked.connect(lambda: self.step_vid_prep_source_frames(1))
+        source_jump_row.addWidget(self.vid_prep_source_jump_plus_1f_btn)
+
+        self.vid_prep_source_jump_plus_5f_btn = QPushButton("+5 Frame")
+        self.vid_prep_source_jump_plus_5f_btn.setFixedHeight(24)
+        self.vid_prep_source_jump_plus_5f_btn.setFixedWidth(72)
+        self.vid_prep_source_jump_plus_5f_btn.setToolTip("Jump source timeline forward 5 frames")
+        self.vid_prep_source_jump_plus_5f_btn.clicked.connect(lambda: self.step_vid_prep_source_frames(5))
+        source_jump_row.addWidget(self.vid_prep_source_jump_plus_5f_btn)
+
+        self.vid_prep_source_jump_plus_1s_btn = QPushButton("+1 Sec")
+        self.vid_prep_source_jump_plus_1s_btn.setFixedHeight(24)
+        self.vid_prep_source_jump_plus_1s_btn.setFixedWidth(60)
+        self.vid_prep_source_jump_plus_1s_btn.setToolTip("Jump source timeline forward 1 second")
+        self.vid_prep_source_jump_plus_1s_btn.clicked.connect(lambda: self.step_vid_prep_source_seconds(1.0))
+        source_jump_row.addWidget(self.vid_prep_source_jump_plus_1s_btn)
+
+        source_jump_row.addStretch()
+        source_panel.addLayout(source_jump_row)
 
         source_panel.addWidget(QLabel("Trim Start / End"))
         trim_row = QHBoxLayout()
@@ -3447,8 +3504,65 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_mute_btn.setCheckable(True)
         self.vid_prep_output_mute_btn.toggled.connect(self.on_vid_prep_output_mute_toggled)
         output_controls.addWidget(self.vid_prep_output_mute_btn)
+
         output_controls.addStretch()
         output_panel.addLayout(output_controls)
+
+        output_jump_row = QHBoxLayout()
+        output_jump_row.setContentsMargins(0, 0, 0, 0)
+        output_jump_row.setSpacing(4)
+
+        self.vid_prep_output_jump_minus_1s_btn = QPushButton("-1 Sec")
+        self.vid_prep_output_jump_minus_1s_btn.setFixedHeight(24)
+        self.vid_prep_output_jump_minus_1s_btn.setFixedWidth(60)
+        self.vid_prep_output_jump_minus_1s_btn.setToolTip("Jump output timeline backward 1 second")
+        self.vid_prep_output_jump_minus_1s_btn.clicked.connect(lambda: self.step_vid_prep_output_seconds(-1.0))
+        output_jump_row.addWidget(self.vid_prep_output_jump_minus_1s_btn)
+
+        self.vid_prep_output_jump_minus_5f_btn = QPushButton("-5 Frame")
+        self.vid_prep_output_jump_minus_5f_btn.setFixedHeight(24)
+        self.vid_prep_output_jump_minus_5f_btn.setFixedWidth(72)
+        self.vid_prep_output_jump_minus_5f_btn.setToolTip("Jump output timeline backward 5 frames")
+        self.vid_prep_output_jump_minus_5f_btn.clicked.connect(lambda: self.step_vid_prep_output_frames(-5))
+        output_jump_row.addWidget(self.vid_prep_output_jump_minus_5f_btn)
+
+        self.vid_prep_output_jump_minus_1f_btn = QPushButton("- Frame")
+        self.vid_prep_output_jump_minus_1f_btn.setFixedHeight(24)
+        self.vid_prep_output_jump_minus_1f_btn.setFixedWidth(64)
+        self.vid_prep_output_jump_minus_1f_btn.setToolTip("Jump output timeline backward 1 frame")
+        self.vid_prep_output_jump_minus_1f_btn.clicked.connect(lambda: self.step_vid_prep_output_frames(-1))
+        output_jump_row.addWidget(self.vid_prep_output_jump_minus_1f_btn)
+
+        self.vid_prep_output_jump_reset_btn = QPushButton("Reset")
+        self.vid_prep_output_jump_reset_btn.setFixedHeight(24)
+        self.vid_prep_output_jump_reset_btn.setFixedWidth(60)
+        self.vid_prep_output_jump_reset_btn.setToolTip("Go to first output frame")
+        self.vid_prep_output_jump_reset_btn.clicked.connect(self.reset_vid_prep_output_to_first_frame)
+        output_jump_row.addWidget(self.vid_prep_output_jump_reset_btn)
+
+        self.vid_prep_output_jump_plus_1f_btn = QPushButton("+Frame")
+        self.vid_prep_output_jump_plus_1f_btn.setFixedHeight(24)
+        self.vid_prep_output_jump_plus_1f_btn.setFixedWidth(62)
+        self.vid_prep_output_jump_plus_1f_btn.setToolTip("Jump output timeline forward 1 frame")
+        self.vid_prep_output_jump_plus_1f_btn.clicked.connect(lambda: self.step_vid_prep_output_frames(1))
+        output_jump_row.addWidget(self.vid_prep_output_jump_plus_1f_btn)
+
+        self.vid_prep_output_jump_plus_5f_btn = QPushButton("+5 Frame")
+        self.vid_prep_output_jump_plus_5f_btn.setFixedHeight(24)
+        self.vid_prep_output_jump_plus_5f_btn.setFixedWidth(72)
+        self.vid_prep_output_jump_plus_5f_btn.setToolTip("Jump output timeline forward 5 frames")
+        self.vid_prep_output_jump_plus_5f_btn.clicked.connect(lambda: self.step_vid_prep_output_frames(5))
+        output_jump_row.addWidget(self.vid_prep_output_jump_plus_5f_btn)
+
+        self.vid_prep_output_jump_plus_1s_btn = QPushButton("+1 Sec")
+        self.vid_prep_output_jump_plus_1s_btn.setFixedHeight(24)
+        self.vid_prep_output_jump_plus_1s_btn.setFixedWidth(60)
+        self.vid_prep_output_jump_plus_1s_btn.setToolTip("Jump output timeline forward 1 second")
+        self.vid_prep_output_jump_plus_1s_btn.clicked.connect(lambda: self.step_vid_prep_output_seconds(1.0))
+        output_jump_row.addWidget(self.vid_prep_output_jump_plus_1s_btn)
+
+        output_jump_row.addStretch()
+        output_panel.addLayout(output_jump_row)
 
         self.vid_prep_preview_stale_label = QLabel("Preview out of date")
         self.vid_prep_preview_stale_label.setStyleSheet("font-size: 8pt; color: #d97706; font-weight: bold;")
@@ -4523,6 +4637,80 @@ class InstagramDownloaderGUI(QMainWindow):
         """Seek the output preview player to a new position."""
         if self.vid_prep_output_player is not None:
             self.vid_prep_output_player.setPosition(int(position_ms))
+
+    def step_vid_prep_source_frames(self, frame_delta):
+        """Step source timeline by a signed number of frames."""
+        if not hasattr(self, 'vid_prep_scrubber'):
+            return
+        if self.vid_prep_cap is None or self.vid_prep_frame_count <= 0:
+            return
+
+        try:
+            delta = int(frame_delta)
+        except (TypeError, ValueError):
+            return
+
+        current = int(self.vid_prep_scrubber.value())
+        target = max(0, min(self.vid_prep_frame_count - 1, current + delta))
+        if target == current:
+            return
+
+        self.vid_prep_scrubber.setValue(target)
+
+        # If playback is active, re-anchor timing to current frame after jump.
+        if self.vid_prep_play_timer.isActive():
+            self.vid_prep_play_start_time = time.monotonic()
+            self.vid_prep_play_start_frame = int(self.vid_prep_scrubber.value())
+
+    def step_vid_prep_source_seconds(self, seconds_delta):
+        """Step source timeline by a signed number of seconds."""
+        fps = max(1.0, float(self.vid_prep_fps or 30.0))
+        frames = int(round(float(seconds_delta) * fps))
+        if frames == 0 and seconds_delta != 0:
+            frames = 1 if seconds_delta > 0 else -1
+        self.step_vid_prep_source_frames(frames)
+
+    def reset_vid_prep_source_to_first_frame(self):
+        """Reset source timeline to frame 0."""
+        if not hasattr(self, 'vid_prep_scrubber'):
+            return
+        self.vid_prep_scrubber.setValue(0)
+        if self.vid_prep_play_timer.isActive():
+            self.vid_prep_play_start_time = time.monotonic()
+            self.vid_prep_play_start_frame = 0
+
+    def step_vid_prep_output_frames(self, frame_delta):
+        """Step output timeline by a signed number of frames."""
+        fps = max(1.0, float(self.vid_prep_fps or 30.0))
+        step_ms = int(round((1000.0 / fps) * int(frame_delta)))
+        self.step_vid_prep_output_ms(step_ms)
+
+    def step_vid_prep_output_seconds(self, seconds_delta):
+        """Step output timeline by a signed number of seconds."""
+        self.step_vid_prep_output_ms(int(round(float(seconds_delta) * 1000.0)))
+
+    def reset_vid_prep_output_to_first_frame(self):
+        """Reset output timeline to the beginning."""
+        self.step_vid_prep_output_ms(-10**9)
+
+    def step_vid_prep_output_ms(self, ms_delta):
+        """Step output timeline by a signed number of milliseconds."""
+        if not hasattr(self, 'vid_prep_output_scrubber'):
+            return
+
+        duration_ms = int(self.vid_prep_output_scrubber.maximum())
+        if duration_ms <= 0 and self.vid_prep_output_player is not None:
+            duration_ms = max(0, int(self.vid_prep_output_player.duration()))
+
+        current_ms = int(self.vid_prep_output_scrubber.value())
+        target_ms = max(0, min(duration_ms, current_ms + int(ms_delta)))
+        if target_ms == current_ms:
+            return
+
+        self.vid_prep_output_scrubber.blockSignals(True)
+        self.vid_prep_output_scrubber.setValue(target_ms)
+        self.vid_prep_output_scrubber.blockSignals(False)
+        self.seek_vid_prep_output(target_ms)
 
     def on_vid_prep_input_volume_changed(self, value):
         """Adjust input preview audio volume."""
@@ -14618,9 +14806,17 @@ class InstagramDownloaderGUI(QMainWindow):
                     thumb_size = parent_widget.width()
 
                 if parent_widget.height() > 0:
-                    # Single-video tiles reserve space for transport controls under the video frame.
-                    reserve_controls = 0 if hasattr(parent_widget, 'is_carousel_media_container') else 34
-                    video_height = max(120, parent_widget.height() - reserve_controls)
+                    # Reserve explicit space for inline controls so they remain visible.
+                    if hasattr(parent_widget, 'is_carousel_media_container'):
+                        reserve_controls = 0
+                        min_video_height = 120
+                    elif hasattr(parent_widget, 'is_content_video_container'):
+                        reserve_controls = 56
+                        min_video_height = 72
+                    else:
+                        reserve_controls = 72
+                        min_video_height = 120
+                    video_height = max(min_video_height, parent_widget.height() - reserve_controls)
                 else:
                     video_height = thumb_size
             else:
@@ -15055,7 +15251,7 @@ class InstagramDownloaderGUI(QMainWindow):
             return None
     
     def _add_tile_media_display(self, layout, tile, config, shortcode, downloaded_files,
-                                inline_examine=False, examine_callback=None):
+                                inline_examine=False, examine_callback=None, inline_play=True):
         """Add media display to tile with interactive controls based on content type."""
         thumb_size = config['thumb']
         
@@ -15081,8 +15277,10 @@ class InstagramDownloaderGUI(QMainWindow):
                     thumb_size,
                     shortcode,
                     downloaded_files[0],
+                    tile=tile,
                     inline_examine=inline_examine,
                     examine_callback=examine_callback,
+                    inline_play=inline_play,
                 )
             else:
                 # Single image with hover tooltip
@@ -15266,18 +15464,31 @@ class InstagramDownloaderGUI(QMainWindow):
         layout.addWidget(carousel_container, 0, Qt.AlignLeft)
     
     def _add_video_display(self, layout, thumb_size, shortcode, video_file,
-                           inline_examine=False, examine_callback=None):
+                           tile=None, inline_examine=False, examine_callback=None, inline_play=True):
         """Add video display with compact play controls."""
         video_container = QWidget()
         video_layout = QVBoxLayout(video_container)
-        video_layout.setSpacing(2)
+        video_layout.setSpacing(0)
         video_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Use square aspect ratio to ensure play button fits within tile max height
+        # Use bounded media area so video + inline controls always fit between static button rows.
         video_height = thumb_size
-        
-        # Set fixed size on container to ensure it has enough space for controls.
-        video_container.setFixedSize(thumb_size, video_height + 22)
+        container_height = video_height + 96
+
+        is_content_tile = bool(tile is not None and getattr(tile, '_is_content_tile', False))
+        if is_content_tile:
+            max_tile_height = tile.maximumHeight() if tile is not None else 0
+            # Static overhead in content tiles:
+            # checkbox row + top button band + bottom button band + margins/spacings.
+            static_overhead = 98
+            if max_tile_height and max_tile_height > static_overhead:
+                container_height = min(container_height, max_tile_height - static_overhead)
+            container_height = max(130, container_height)
+            video_height = max(74, container_height - 56)
+
+        video_container.setFixedSize(thumb_size, container_height)
+        if is_content_tile:
+            video_container.is_content_video_container = True
         
         # Video thumbnail
         thumb_label = QLabel()
@@ -15318,30 +15529,38 @@ class InstagramDownloaderGUI(QMainWindow):
                 thumb_label.setStyleSheet("border: 1px solid #ccc; font-size: 24pt; color: #666;")
         
         video_layout.addWidget(thumb_label)
+
+        # Expose a stable handler so callers can place Play on another row.
+        play_handler = lambda: self.play_video(video_file['path'], video_layout)
+        if tile is not None:
+            tile._single_video_play_handler = play_handler
+
+        # Keep transport controls visually lower in the reserved media area.
+        video_layout.addStretch(1)
         
         controls_row = QHBoxLayout()
-        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setContentsMargins(0, 0, 0, 4)
         controls_row.setSpacing(2)
 
-        # Requested: make Play Video button roughly half-height.
-        play_btn = QPushButton("▶ Play")
-        play_btn.setFixedHeight(14)
-        play_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #28a745;
-                color: white;
-                font-weight: bold;
-                font-size: 8pt;
-                padding: 1px 4px;
-                border-radius: 3px;
-            }
-            QPushButton:hover {
-                background-color: #218838;
-            }
-        """)
-        # Pass video_layout as inline container for inline playback
-        play_btn.clicked.connect(lambda: self.play_video(video_file['path'], video_layout))
-        controls_row.addWidget(play_btn)
+        if inline_play:
+            # Requested: make Play Video button roughly half-height.
+            play_btn = QPushButton("▶ Play")
+            play_btn.setFixedHeight(14)
+            play_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    font-weight: bold;
+                    font-size: 8pt;
+                    padding: 1px 4px;
+                    border-radius: 3px;
+                }
+                QPushButton:hover {
+                    background-color: #218838;
+                }
+            """)
+            play_btn.clicked.connect(play_handler)
+            controls_row.addWidget(play_btn)
 
         # Optional inline Examine button on the same control row as Play.
         if inline_examine and callable(examine_callback):
@@ -15591,6 +15810,7 @@ class InstagramDownloaderGUI(QMainWindow):
         """)
         tile.setMinimumHeight(config['min_height'])
         tile.setMaximumHeight(config['max_height'])
+        tile._is_content_tile = (open_explorer_target == 'topic')
         # Set fixed width to match thumbnail + padding (left-aligned, no extra space)
         tile.setFixedWidth(config['thumb'] + 10)  # thumb + margins
         tile.setCursor(Qt.PointingHandCursor)
@@ -15599,6 +15819,17 @@ class InstagramDownloaderGUI(QMainWindow):
         layout.setSpacing(2)
         layout.setContentsMargins(3, 3, 3, 3)
         layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        is_content_tile = (open_explorer_target == 'topic')
+
+        def _style_content_tile_action_button(button):
+            """Expand content-tile action buttons so rows fill available horizontal space."""
+            if not is_content_tile or button is None:
+                return
+            button.setMinimumHeight(22)
+            button.setMaximumHeight(22)
+            button.setMinimumWidth(0)
+            button.setMaximumWidth(16777215)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         
         # Checkbox at the top-left with ID and type
         checkbox_row = QHBoxLayout()
@@ -15636,7 +15867,9 @@ class InstagramDownloaderGUI(QMainWindow):
         layout.addLayout(checkbox_row)
         
         # Buttons at the top
-        button_row = QHBoxLayout()
+        button_row_widget = QWidget()
+        button_row = QHBoxLayout(button_row_widget)
+        button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(2)
         
         # Open button
@@ -15646,6 +15879,7 @@ class InstagramDownloaderGUI(QMainWindow):
         open_btn.setToolTip("Open in Instagram")
         open_btn.clicked.connect(lambda: self.open_post(shortcode))
         button_row.addWidget(open_btn)
+        _style_content_tile_action_button(open_btn)
         
         # Copy URL button
         copy_btn = QPushButton("📋")
@@ -15654,6 +15888,7 @@ class InstagramDownloaderGUI(QMainWindow):
         copy_btn.setToolTip("Copy URL")
         copy_btn.clicked.connect(lambda: self.copy_url_to_clipboard(f"https://www.instagram.com/p/{shortcode}/"))
         button_row.addWidget(copy_btn)
+        _style_content_tile_action_button(copy_btn)
         
         # Firefox button
         ff_btn = QPushButton("🦊")
@@ -15662,6 +15897,7 @@ class InstagramDownloaderGUI(QMainWindow):
         ff_btn.setToolTip("Open in Firefox")
         ff_btn.clicked.connect(lambda: self.open_in_firefox(f"https://www.instagram.com/p/{shortcode}/"))
         button_row.addWidget(ff_btn)
+        _style_content_tile_action_button(ff_btn)
         
         # Chrome button
         chrome_btn = QPushButton("🌐")
@@ -15670,6 +15906,7 @@ class InstagramDownloaderGUI(QMainWindow):
         chrome_btn.setToolTip("Open in Chrome")
         chrome_btn.clicked.connect(lambda: self.open_in_chrome(f"https://www.instagram.com/p/{shortcode}/"))
         button_row.addWidget(chrome_btn)
+        _style_content_tile_action_button(chrome_btn)
         
         # Classify button
         classify_btn = QPushButton("🏷️")
@@ -15678,6 +15915,7 @@ class InstagramDownloaderGUI(QMainWindow):
         classify_btn.setToolTip("Classify Content")
         classify_btn.clicked.connect(lambda: self.classify_content_by_shortcode(shortcode))
         button_row.addWidget(classify_btn)
+        _style_content_tile_action_button(classify_btn)
         
         # Open In Explorer button (only show if content is downloaded)
         if status in ['downloaded', 'completed', 're-downloaded']:
@@ -15697,6 +15935,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 else:
                     explorer_btn.clicked.connect(lambda checked=False, sc=shortcode: self.open_downloaded_file(sc))
                 button_row.addWidget(explorer_btn)
+                _style_content_tile_action_button(explorer_btn)
         
         # Re-copy to Topics button (only show if content has topic assignments)
         if self.content_db and self.content_db.db:
@@ -15709,6 +15948,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 recopy_btn.setStyleSheet("QPushButton { background-color: #17a2b8; color: white; font-weight: bold; }")
                 recopy_btn.clicked.connect(lambda: self.recopy_to_topics(shortcode))
                 button_row.addWidget(recopy_btn)
+                _style_content_tile_action_button(recopy_btn)
         
         # Ignore button OR Restore/Remove buttons (if already ignored)
         if status == 'ignored':
@@ -15720,6 +15960,7 @@ class InstagramDownloaderGUI(QMainWindow):
             restore_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; font-weight: bold; }")
             restore_btn.clicked.connect(lambda: self.restore_to_active(shortcode))
             button_row.addWidget(restore_btn)
+            _style_content_tile_action_button(restore_btn)
             
             # Remove from View button
             remove_btn = QPushButton("❌")
@@ -15729,6 +15970,7 @@ class InstagramDownloaderGUI(QMainWindow):
             remove_btn.setStyleSheet("QPushButton { background-color: #dc3545; color: white; font-weight: bold; }")
             remove_btn.clicked.connect(lambda: self.remove_from_view(shortcode))
             button_row.addWidget(remove_btn)
+            _style_content_tile_action_button(remove_btn)
         else:
             ignore_btn = QPushButton("🚫")
             ignore_btn.setMaximumWidth(35)
@@ -15736,6 +15978,7 @@ class InstagramDownloaderGUI(QMainWindow):
             ignore_btn.setToolTip("Mark as Ignored")
             ignore_btn.clicked.connect(lambda: self.ignore_content(shortcode))
             button_row.addWidget(ignore_btn)
+            _style_content_tile_action_button(ignore_btn)
         
         # Get Thumbnail button
         thumb_btn = QPushButton("🖼️")
@@ -15744,6 +15987,7 @@ class InstagramDownloaderGUI(QMainWindow):
         thumb_btn.setToolTip("Download Thumbnail")
         thumb_btn.clicked.connect(lambda: self.download_thumbnail_by_shortcode(shortcode))
         button_row.addWidget(thumb_btn)
+        _style_content_tile_action_button(thumb_btn)
         
         # Add to Queue button (toggle between Queue/Unqueue)
         is_queued = shortcode in self.queued_shortcodes
@@ -15759,6 +16003,7 @@ class InstagramDownloaderGUI(QMainWindow):
             queue_btn.setToolTip("Add to download queue")
         queue_btn.clicked.connect(lambda: self.toggle_post_in_queue(post, queue_btn))
         button_row.addWidget(queue_btn)
+        _style_content_tile_action_button(queue_btn)
         
         # Download Now button
         download_btn = QPushButton("⬇️")
@@ -15768,6 +16013,7 @@ class InstagramDownloaderGUI(QMainWindow):
         download_btn.setToolTip("Download immediately")
         download_btn.clicked.connect(lambda: self.download_post_now(post))
         button_row.addWidget(download_btn)
+        _style_content_tile_action_button(download_btn)
 
         # Vid Prep button: only show for tiles that have a downloaded video file
         if self._has_video_files(shortcode):
@@ -15778,9 +16024,15 @@ class InstagramDownloaderGUI(QMainWindow):
             prep_btn.setToolTip("Send video to Vid Prep")
             prep_btn.clicked.connect(lambda checked=False, sc=shortcode: self.send_tile_to_vid_prep(sc))
             button_row.addWidget(prep_btn)
+            _style_content_tile_action_button(prep_btn)
         
-        button_row.addStretch()
-        layout.addLayout(button_row)
+        if not is_content_tile:
+            button_row.addStretch(1)
+        if is_content_tile:
+            button_row_widget.setFixedHeight(24)
+            layout.addWidget(button_row_widget)
+        else:
+            layout.addLayout(button_row)
         
         # Check if content is downloaded and get files
         # Accept 'downloaded', 'completed', and 're-downloaded' status values
@@ -15805,11 +16057,16 @@ class InstagramDownloaderGUI(QMainWindow):
             len(downloaded_files) == 1 and
             downloaded_files[0].get('type') in ['video', 'mp4']
         )
+        move_video_controls_to_footer = (
+            open_explorer_target == 'topic' and
+            is_single_video
+        )
         inline_examine = (
             include_examine_button and
             status not in ['failed', 'error', 'completed_with_errors'] and
             open_explorer_target == 'topic' and
-            is_single_video
+            is_single_video and
+            not move_video_controls_to_footer
         )
 
         # Add interactive media display based on download status.
@@ -15821,16 +16078,43 @@ class InstagramDownloaderGUI(QMainWindow):
             downloaded_files,
             inline_examine=inline_examine,
             examine_callback=open_examine_handler,
+            inline_play=not move_video_controls_to_footer,
         )
 
         needs_footer_controls = include_examine_button and status not in ['failed', 'error', 'completed_with_errors']
         if needs_footer_controls:
-            examine_row = QHBoxLayout()
+            examine_row_widget = QWidget()
+            examine_row = QHBoxLayout(examine_row_widget)
             examine_row.setContentsMargins(0, 2, 0, 0)
-            examine_row.setSpacing(2)
+            examine_row.setSpacing(1)
+
+            if move_video_controls_to_footer:
+                # Keep all action/toggle controls on one final row in content tiles.
+                # Footer play uses inline playback when inline mode is enabled.
+                footer_play_btn = QPushButton("Play")
+                footer_play_btn.setMaximumHeight(20)
+                footer_play_btn.setMaximumWidth(42)
+                footer_play_btn.setToolTip("Play Video")
+                footer_play_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; font-weight: bold; font-size: 7pt; padding: 0px 2px; }")
+                play_handler = getattr(tile, '_single_video_play_handler', None)
+                if callable(play_handler):
+                    footer_play_btn.clicked.connect(play_handler)
+                else:
+                    footer_play_btn.clicked.connect(lambda checked=False, path=downloaded_files[0].get('path', ''): self.play_video(path, None))
+                examine_row.addWidget(footer_play_btn)
+                _style_content_tile_action_button(footer_play_btn)
+
+                footer_examine_btn = QPushButton("Examine")
+                footer_examine_btn.setMaximumHeight(20)
+                footer_examine_btn.setMaximumWidth(56)
+                footer_examine_btn.setToolTip("Open Single Tile Viewer")
+                footer_examine_btn.setStyleSheet("QPushButton { background-color: #495057; color: white; font-weight: bold; font-size: 7pt; padding: 0px 2px; }")
+                footer_examine_btn.clicked.connect(open_examine_handler)
+                examine_row.addWidget(footer_examine_btn)
+                _style_content_tile_action_button(footer_examine_btn)
 
             # If we already placed Examine next to Play for content-topic video tiles, skip duplicate footer button.
-            if not inline_examine:
+            if not inline_examine and not move_video_controls_to_footer:
                 examine_btn = QPushButton("Examine")
                 if open_explorer_target == 'topic':
                     examine_btn.setMaximumHeight(24)
@@ -15841,6 +16125,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 examine_btn.setStyleSheet("QPushButton { background-color: #495057; color: white; font-weight: bold; }")
                 examine_btn.clicked.connect(open_examine_handler)
                 examine_row.addWidget(examine_btn)
+                _style_content_tile_action_button(examine_btn)
 
             # Content tab only: add Tree/Site completion toggles for current topic assignment.
             if open_explorer_target == 'topic' and self.content_db and self.content_db.db:
@@ -15865,7 +16150,8 @@ class InstagramDownloaderGUI(QMainWindow):
                         logger.debug(f"Fallback assignment-flag lookup failed for {shortcode_clean}: {e}")
 
                 tree_btn = QPushButton()
-                tree_btn.setMaximumHeight(24)
+                tree_btn.setMaximumHeight(20)
+                tree_btn.setMaximumWidth(34)
                 tree_btn.setToolTip("Cycle DL.topic_assignments.TreeUpdated: 0 (To-Do) -> 1 (Done) -> 2 (Ignored)")
                 tree_current = self._normalize_assignment_flag_state(flags.get('TreeUpdated', 0) if flags else 0)
                 tree_btn._assignment_flag_value = tree_current
@@ -15882,9 +16168,11 @@ class InstagramDownloaderGUI(QMainWindow):
                     )
                 )
                 examine_row.addWidget(tree_btn)
+                _style_content_tile_action_button(tree_btn)
 
                 site_btn = QPushButton()
-                site_btn.setMaximumHeight(24)
+                site_btn.setMaximumHeight(20)
+                site_btn.setMaximumWidth(30)
                 site_btn.setToolTip("Cycle DL.topic_assignments.SiteUpdated: 0 (To-Do) -> 1 (Done) -> 2 (Ignored)")
                 site_current = self._normalize_assignment_flag_state(flags.get('SiteUpdated', 0) if flags else 0)
                 site_btn._assignment_flag_value = site_current
@@ -15901,13 +16189,15 @@ class InstagramDownloaderGUI(QMainWindow):
                     )
                 )
                 examine_row.addWidget(site_btn)
+                _style_content_tile_action_button(site_btn)
 
                 prep_btn = QPushButton()
-                prep_btn.setMaximumHeight(24)
+                prep_btn.setMaximumHeight(20)
+                prep_btn.setMaximumWidth(36)
                 prep_btn.setToolTip("Cycle DL.topic_assignments.VidPrepUpdated: 0 (To-Do) -> 1 (Done) -> 2 (Ignored)")
                 prep_current = self._normalize_assignment_flag_state(flags.get('VidPrepUpdated', 0) if flags else 0)
                 prep_btn._assignment_flag_value = prep_current
-                self._style_assignment_toggle_button(prep_btn, 'Video Prep', prep_current)
+                self._style_assignment_toggle_button(prep_btn, 'Video', prep_current)
                 prep_btn.clicked.connect(
                     lambda checked=False, cr=content_ref_for_toggle, sc=shortcode_clean, p=post, b=prep_btn, tid=topic_id_for_toggle:
                     self._toggle_topic_assignment_flag(
@@ -15920,8 +16210,15 @@ class InstagramDownloaderGUI(QMainWindow):
                     )
                 )
                 examine_row.addWidget(prep_btn)
+                _style_content_tile_action_button(prep_btn)
 
-            layout.addLayout(examine_row)
+            if not is_content_tile:
+                examine_row.addStretch(1)
+            if is_content_tile:
+                examine_row_widget.setFixedHeight(24)
+                layout.addWidget(examine_row_widget)
+            else:
+                layout.addLayout(examine_row)
         
         # Make tile clickable to show details - but don't interfere with button clicks
         def tile_mouse_press(event):
