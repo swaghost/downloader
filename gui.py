@@ -16039,8 +16039,7 @@ class InstagramDownloaderGUI(QMainWindow):
         layout.addLayout(checkbox_row)
         
         # Buttons at the top
-        button_row_widget = QWidget()
-        button_row = QHBoxLayout(button_row_widget)
+        button_row = QHBoxLayout()
         button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(2)
         
@@ -16204,6 +16203,8 @@ class InstagramDownloaderGUI(QMainWindow):
         if not is_content_tile:
             button_row.addStretch(1)
         if is_content_tile:
+            button_row_widget = QWidget()
+            button_row_widget.setLayout(button_row)
             button_row_widget.setFixedHeight(24)
             layout.addWidget(button_row_widget)
         else:
@@ -16259,8 +16260,7 @@ class InstagramDownloaderGUI(QMainWindow):
 
         needs_footer_controls = include_examine_button and status not in ['failed', 'error', 'completed_with_errors']
         if needs_footer_controls:
-            examine_row_widget = QWidget()
-            examine_row = QHBoxLayout(examine_row_widget)
+            examine_row = QHBoxLayout()
             examine_row.setContentsMargins(0, 2, 0, 0)
             examine_row.setSpacing(1)
 
@@ -16391,6 +16391,8 @@ class InstagramDownloaderGUI(QMainWindow):
             if not is_content_tile:
                 examine_row.addStretch(1)
             if is_content_tile:
+                examine_row_widget = QWidget()
+                examine_row_widget.setLayout(examine_row)
                 examine_row_widget.setFixedHeight(24)
                 layout.addWidget(examine_row_widget)
             else:
