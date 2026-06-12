@@ -1171,6 +1171,10 @@ class InstagramDownloaderGUI(QMainWindow):
         self.content_filtered_posts = []
         self.vid_prep_prepend_topic_enabled = self.account_manager.get_setting('vid_prep_prepend_topic_filename', 'false') == 'true'
         self.vid_prep_selected_topic_name = self.account_manager.get_setting('vid_prep_selected_topic', '')
+        self.vid_prep_file_prefix = self.account_manager.get_setting('vid_prep_file_prefix', '')
+        self.vid_prep_file_index = self.account_manager.get_setting('vid_prep_file_index', '01')
+        self.vid_prep_modifier = self.account_manager.get_setting('vid_prep_modifier', '[NOTHING]')
+        self.vid_prep_separator = self.account_manager.get_setting('vid_prep_separator', '.')
         self.vid_prep_output_folder_mode = self.account_manager.get_setting('vid_prep_output_folder_mode', 'same_as_input')
         self.vid_prep_output_folder_path = self.account_manager.get_setting('vid_prep_output_folder_path', '')
         self.vid_prep_audio_library = self._load_vid_prep_audio_library_setting()
@@ -3261,15 +3265,15 @@ class InstagramDownloaderGUI(QMainWindow):
         preview_layout = QVBoxLayout(preview_group)
         preview_splitter = QSplitter(Qt.Horizontal)
         self.vid_prep_preview_splitter = preview_splitter
+        vid_prep_panel_height = 760
 
         source_panel_widget = QWidget()
         source_panel = QVBoxLayout(source_panel_widget)
         source_panel.setContentsMargins(0, 0, 0, 0)
-        source_panel.addWidget(QLabel("Input (Viewer / Cropper)"))
 
         self.vid_prep_preview = VideoCropPreview()
-        self.vid_prep_preview.setMinimumHeight(620)
-        self.vid_prep_preview.setMaximumHeight(620)
+        self.vid_prep_preview.setMinimumHeight(vid_prep_panel_height)
+        self.vid_prep_preview.setMaximumHeight(vid_prep_panel_height)
         self.vid_prep_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.vid_prep_preview.file_dropped.connect(self.on_vid_prep_file_dropped)
         self.vid_prep_preview.crop_changed.connect(self.on_vid_prep_crop_changed)
@@ -3346,6 +3350,13 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_flip_trim_btn.clicked.connect(self.flip_vid_prep_trim_to_tail)
         source_controls.addWidget(self.vid_prep_flip_trim_btn)
 
+        self.vid_prep_reset_trim_btn = QPushButton("Reset Trim")
+        self.vid_prep_reset_trim_btn.setFixedHeight(24)
+        self.vid_prep_reset_trim_btn.setFixedWidth(84)
+        self.vid_prep_reset_trim_btn.setToolTip("Reset trim to encompass the full video")
+        self.vid_prep_reset_trim_btn.clicked.connect(self.reset_vid_prep_trim_to_full_video)
+        source_controls.addWidget(self.vid_prep_reset_trim_btn)
+
         source_controls.addWidget(QLabel("Input Vol:"))
         self.vid_prep_input_volume_slider = QSlider(Qt.Horizontal)
         self.vid_prep_input_volume_slider.setRange(0, 100)
@@ -3396,6 +3407,13 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_source_jump_reset_btn.clicked.connect(self.reset_vid_prep_source_to_first_frame)
         source_jump_row.addWidget(self.vid_prep_source_jump_reset_btn)
 
+        self.vid_prep_source_jump_last_btn = QPushButton("Last Frame")
+        self.vid_prep_source_jump_last_btn.setFixedHeight(24)
+        self.vid_prep_source_jump_last_btn.setFixedWidth(84)
+        self.vid_prep_source_jump_last_btn.setToolTip("Go to final source frame")
+        self.vid_prep_source_jump_last_btn.clicked.connect(self.jump_vid_prep_source_to_last_frame)
+        source_jump_row.addWidget(self.vid_prep_source_jump_last_btn)
+
         self.vid_prep_source_jump_plus_1f_btn = QPushButton("+Frame")
         self.vid_prep_source_jump_plus_1f_btn.setFixedHeight(24)
         self.vid_prep_source_jump_plus_1f_btn.setFixedWidth(62)
@@ -3441,10 +3459,9 @@ class InstagramDownloaderGUI(QMainWindow):
         output_panel = QVBoxLayout(output_panel_widget)
         output_panel.setContentsMargins(0, 0, 0, 0)
         output_panel.setAlignment(Qt.AlignTop)
-        output_panel.addWidget(QLabel("Output (Last Export)"), 0, Qt.AlignTop)
         self.vid_prep_output_display_stack = QStackedWidget()
-        self.vid_prep_output_display_stack.setMinimumHeight(620)
-        self.vid_prep_output_display_stack.setMaximumHeight(620)
+        self.vid_prep_output_display_stack.setMinimumHeight(vid_prep_panel_height)
+        self.vid_prep_output_display_stack.setMaximumHeight(vid_prep_panel_height)
         self.vid_prep_output_display_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.vid_prep_output_placeholder = QLabel("Output preview placeholder\n(Preview or save to render output)")
         self.vid_prep_output_placeholder.setAlignment(Qt.AlignCenter)
@@ -3507,62 +3524,6 @@ class InstagramDownloaderGUI(QMainWindow):
 
         output_controls.addStretch()
         output_panel.addLayout(output_controls)
-
-        output_jump_row = QHBoxLayout()
-        output_jump_row.setContentsMargins(0, 0, 0, 0)
-        output_jump_row.setSpacing(4)
-
-        self.vid_prep_output_jump_minus_1s_btn = QPushButton("-1 Sec")
-        self.vid_prep_output_jump_minus_1s_btn.setFixedHeight(24)
-        self.vid_prep_output_jump_minus_1s_btn.setFixedWidth(60)
-        self.vid_prep_output_jump_minus_1s_btn.setToolTip("Jump output timeline backward 1 second")
-        self.vid_prep_output_jump_minus_1s_btn.clicked.connect(lambda: self.step_vid_prep_output_seconds(-1.0))
-        output_jump_row.addWidget(self.vid_prep_output_jump_minus_1s_btn)
-
-        self.vid_prep_output_jump_minus_5f_btn = QPushButton("-5 Frame")
-        self.vid_prep_output_jump_minus_5f_btn.setFixedHeight(24)
-        self.vid_prep_output_jump_minus_5f_btn.setFixedWidth(72)
-        self.vid_prep_output_jump_minus_5f_btn.setToolTip("Jump output timeline backward 5 frames")
-        self.vid_prep_output_jump_minus_5f_btn.clicked.connect(lambda: self.step_vid_prep_output_frames(-5))
-        output_jump_row.addWidget(self.vid_prep_output_jump_minus_5f_btn)
-
-        self.vid_prep_output_jump_minus_1f_btn = QPushButton("- Frame")
-        self.vid_prep_output_jump_minus_1f_btn.setFixedHeight(24)
-        self.vid_prep_output_jump_minus_1f_btn.setFixedWidth(64)
-        self.vid_prep_output_jump_minus_1f_btn.setToolTip("Jump output timeline backward 1 frame")
-        self.vid_prep_output_jump_minus_1f_btn.clicked.connect(lambda: self.step_vid_prep_output_frames(-1))
-        output_jump_row.addWidget(self.vid_prep_output_jump_minus_1f_btn)
-
-        self.vid_prep_output_jump_reset_btn = QPushButton("Reset")
-        self.vid_prep_output_jump_reset_btn.setFixedHeight(24)
-        self.vid_prep_output_jump_reset_btn.setFixedWidth(60)
-        self.vid_prep_output_jump_reset_btn.setToolTip("Go to first output frame")
-        self.vid_prep_output_jump_reset_btn.clicked.connect(self.reset_vid_prep_output_to_first_frame)
-        output_jump_row.addWidget(self.vid_prep_output_jump_reset_btn)
-
-        self.vid_prep_output_jump_plus_1f_btn = QPushButton("+Frame")
-        self.vid_prep_output_jump_plus_1f_btn.setFixedHeight(24)
-        self.vid_prep_output_jump_plus_1f_btn.setFixedWidth(62)
-        self.vid_prep_output_jump_plus_1f_btn.setToolTip("Jump output timeline forward 1 frame")
-        self.vid_prep_output_jump_plus_1f_btn.clicked.connect(lambda: self.step_vid_prep_output_frames(1))
-        output_jump_row.addWidget(self.vid_prep_output_jump_plus_1f_btn)
-
-        self.vid_prep_output_jump_plus_5f_btn = QPushButton("+5 Frame")
-        self.vid_prep_output_jump_plus_5f_btn.setFixedHeight(24)
-        self.vid_prep_output_jump_plus_5f_btn.setFixedWidth(72)
-        self.vid_prep_output_jump_plus_5f_btn.setToolTip("Jump output timeline forward 5 frames")
-        self.vid_prep_output_jump_plus_5f_btn.clicked.connect(lambda: self.step_vid_prep_output_frames(5))
-        output_jump_row.addWidget(self.vid_prep_output_jump_plus_5f_btn)
-
-        self.vid_prep_output_jump_plus_1s_btn = QPushButton("+1 Sec")
-        self.vid_prep_output_jump_plus_1s_btn.setFixedHeight(24)
-        self.vid_prep_output_jump_plus_1s_btn.setFixedWidth(60)
-        self.vid_prep_output_jump_plus_1s_btn.setToolTip("Jump output timeline forward 1 second")
-        self.vid_prep_output_jump_plus_1s_btn.clicked.connect(lambda: self.step_vid_prep_output_seconds(1.0))
-        output_jump_row.addWidget(self.vid_prep_output_jump_plus_1s_btn)
-
-        output_jump_row.addStretch()
-        output_panel.addLayout(output_jump_row)
 
         self.vid_prep_preview_stale_label = QLabel("Preview out of date")
         self.vid_prep_preview_stale_label.setStyleSheet("font-size: 8pt; color: #d97706; font-weight: bold;")
@@ -3671,27 +3632,6 @@ class InstagramDownloaderGUI(QMainWindow):
         output_layout.setContentsMargins(8, 8, 8, 8)
         output_layout.setSpacing(4)
 
-        filename_row = QHBoxLayout()
-        filename_row.addWidget(QLabel("Filename:"))
-        self.vid_prep_output_filename_input = QLineEdit()
-        self.vid_prep_output_filename_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.vid_prep_output_filename_input.setPlaceholderText("Generated after source video is loaded")
-        self.vid_prep_output_filename_input.textChanged.connect(self.update_vid_prep_output_filename_preview)
-        filename_row.addWidget(self.vid_prep_output_filename_input)
-        self.vid_prep_regenerate_filename_btn = QPushButton("Regenerate Filename")
-        self.vid_prep_regenerate_filename_btn.clicked.connect(self.regenerate_vid_prep_output_filename)
-        filename_row.addWidget(self.vid_prep_regenerate_filename_btn)
-        filename_row.addStretch()
-        output_layout.addLayout(filename_row)
-
-        prepend_topic_row = QHBoxLayout()
-        self.vid_prep_prepend_topic_checkbox = QCheckBox("Prepend Topic In Generated Filename")
-        self.vid_prep_prepend_topic_checkbox.setChecked(self.vid_prep_prepend_topic_enabled)
-        self.vid_prep_prepend_topic_checkbox.toggled.connect(self.on_vid_prep_prepend_topic_toggled)
-        prepend_topic_row.addWidget(self.vid_prep_prepend_topic_checkbox)
-        prepend_topic_row.addStretch()
-        output_layout.addLayout(prepend_topic_row)
-
         selected_topic_row = QHBoxLayout()
         selected_topic_row.addWidget(QLabel("Selected Topic:"))
         self.vid_prep_selected_topic_input = QLineEdit()
@@ -3705,6 +3645,70 @@ class InstagramDownloaderGUI(QMainWindow):
         selected_topic_row.addWidget(self.vid_prep_pick_topic_btn)
         selected_topic_row.addStretch()
         output_layout.addLayout(selected_topic_row)
+
+        filename_row = QHBoxLayout()
+        filename_row.addWidget(QLabel("Filename:"))
+        self.vid_prep_output_filename_input = QLineEdit()
+        self.vid_prep_output_filename_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.vid_prep_output_filename_input.setPlaceholderText("Generated after source video is loaded")
+        self.vid_prep_output_filename_input.textChanged.connect(self.update_vid_prep_output_filename_preview)
+        filename_row.addWidget(self.vid_prep_output_filename_input)
+        self.vid_prep_regenerate_filename_btn = QPushButton("Regenerate Filename")
+        self.vid_prep_regenerate_filename_btn.clicked.connect(self.regenerate_vid_prep_output_filename)
+        filename_row.addWidget(self.vid_prep_regenerate_filename_btn)
+        filename_row.addStretch()
+        output_layout.addLayout(filename_row)
+
+        prefix_row = QHBoxLayout()
+        prefix_row.addWidget(QLabel("File Prefix:"))
+        self.vid_prep_file_prefix_input = QLineEdit()
+        self.vid_prep_file_prefix_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.vid_prep_file_prefix_input.setPlaceholderText("Optional prefix")
+        self.vid_prep_file_prefix_input.setText(self.vid_prep_file_prefix)
+        self.vid_prep_file_prefix_input.textChanged.connect(self.on_vid_prep_file_prefix_changed)
+        prefix_row.addWidget(self.vid_prep_file_prefix_input)
+
+        prefix_row.addWidget(QLabel("File Index:"))
+        self.vid_prep_file_index_combo = QComboBox()
+        self.vid_prep_file_index_combo.addItems([f"{i:02d}" for i in range(1, 21)])
+        self.vid_prep_file_index_combo.setFixedWidth(70)
+        start_index = self.vid_prep_file_index if self.vid_prep_file_index in [self.vid_prep_file_index_combo.itemText(i) for i in range(self.vid_prep_file_index_combo.count())] else '01'
+        self.vid_prep_file_index_combo.setCurrentText(start_index)
+        self.vid_prep_file_index_combo.currentTextChanged.connect(self.on_vid_prep_file_index_changed)
+        prefix_row.addWidget(self.vid_prep_file_index_combo)
+
+        prefix_row.addStretch()
+        output_layout.addLayout(prefix_row)
+
+        prepend_topic_row = QHBoxLayout()
+        self.vid_prep_prepend_topic_checkbox = QCheckBox("Prepend Topic In Generated Filename")
+        self.vid_prep_prepend_topic_checkbox.setChecked(self.vid_prep_prepend_topic_enabled)
+        self.vid_prep_prepend_topic_checkbox.toggled.connect(self.on_vid_prep_prepend_topic_toggled)
+        prepend_topic_row.addWidget(self.vid_prep_prepend_topic_checkbox)
+        prepend_topic_row.addStretch()
+        output_layout.addLayout(prepend_topic_row)
+
+        modifier_row = QHBoxLayout()
+        modifier_row.addWidget(QLabel("Modifier:"))
+        self.vid_prep_modifier_combo = QComboBox()
+        self.vid_prep_modifier_combo.addItems(["GOOD", "BAD", "[NOTHING]"])
+        if self.vid_prep_modifier in [self.vid_prep_modifier_combo.itemText(i) for i in range(self.vid_prep_modifier_combo.count())]:
+            self.vid_prep_modifier_combo.setCurrentText(self.vid_prep_modifier)
+        else:
+            self.vid_prep_modifier_combo.setCurrentText("[NOTHING]")
+        self.vid_prep_modifier_combo.currentTextChanged.connect(self.on_vid_prep_modifier_changed)
+        modifier_row.addWidget(self.vid_prep_modifier_combo)
+        modifier_row.addWidget(QLabel("Separator:"))
+        self.vid_prep_separator_combo = QComboBox()
+        self.vid_prep_separator_combo.addItems(["-", "_", "."])
+        if self.vid_prep_separator in [self.vid_prep_separator_combo.itemText(i) for i in range(self.vid_prep_separator_combo.count())]:
+            self.vid_prep_separator_combo.setCurrentText(self.vid_prep_separator)
+        else:
+            self.vid_prep_separator_combo.setCurrentText(".")
+        self.vid_prep_separator_combo.currentTextChanged.connect(self.on_vid_prep_separator_changed)
+        modifier_row.addWidget(self.vid_prep_separator_combo)
+        modifier_row.addStretch()
+        output_layout.addLayout(modifier_row)
 
         folder_mode_row = QHBoxLayout()
         folder_mode_row.addWidget(QLabel("Output Folder:"))
@@ -4187,6 +4191,10 @@ class InstagramDownloaderGUI(QMainWindow):
         self.save_ui_setting('vid_prep_mp3_start', f"{self.vid_prep_mp3_start.value():.3f}")
         self.save_ui_setting('vid_prep_mp3_end', f"{self.vid_prep_mp3_end.value():.3f}")
         self.save_ui_setting('vid_prep_selected_topic', (self.vid_prep_selected_topic_input.text() or '').strip())
+        self.save_ui_setting('vid_prep_file_prefix', (self.vid_prep_file_prefix_input.text() or '').strip())
+        self.save_ui_setting('vid_prep_file_index', self._current_vid_prep_file_index())
+        self.save_ui_setting('vid_prep_modifier', self._current_vid_prep_modifier())
+        self.save_ui_setting('vid_prep_separator', self._current_vid_prep_separator())
         self.save_ui_setting('vid_prep_prepend_topic_filename', 'true' if self.vid_prep_prepend_topic_checkbox.isChecked() else 'false')
         self.save_ui_setting('vid_prep_output_folder_mode', self.vid_prep_output_folder_mode)
         self.save_ui_setting('vid_prep_output_folder_path', self.vid_prep_output_folder_path_input.text().strip())
@@ -4247,6 +4255,20 @@ class InstagramDownloaderGUI(QMainWindow):
         self.refresh_vid_prep_audio_library_list(self.vid_prep_mp3_path.text())
 
         self.vid_prep_selected_topic_input.setText(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_selected_topic', self.vid_prep_selected_topic_input.text()))
+        self.vid_prep_file_prefix_input.setText(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_file_prefix', self.vid_prep_file_prefix_input.text()))
+        saved_file_index = self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_file_index', self._current_vid_prep_file_index())
+        if saved_file_index in [self.vid_prep_file_index_combo.itemText(i) for i in range(self.vid_prep_file_index_combo.count())]:
+            self.vid_prep_file_index_combo.setCurrentText(saved_file_index)
+        saved_modifier = self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_modifier', self._current_vid_prep_modifier())
+        if saved_modifier in [self.vid_prep_modifier_combo.itemText(i) for i in range(self.vid_prep_modifier_combo.count())]:
+            self.vid_prep_modifier_combo.setCurrentText(saved_modifier)
+        saved_separator = self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_separator', self._current_vid_prep_separator())
+        if saved_separator in [self.vid_prep_separator_combo.itemText(i) for i in range(self.vid_prep_separator_combo.count())]:
+            self.vid_prep_separator_combo.setCurrentText(saved_separator)
+        self.vid_prep_file_prefix = (self.vid_prep_file_prefix_input.text() or '').strip()
+        self.vid_prep_file_index = self._current_vid_prep_file_index()
+        self.vid_prep_modifier = self._current_vid_prep_modifier()
+        self.vid_prep_separator = self._current_vid_prep_separator()
         prepend_topic = self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_prepend_topic_filename', 'true' if self.vid_prep_prepend_topic_checkbox.isChecked() else 'false') == 'true'
         self.vid_prep_prepend_topic_checkbox.setChecked(prepend_topic)
 
@@ -4408,18 +4430,83 @@ class InstagramDownloaderGUI(QMainWindow):
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned or "output"
 
-    def _get_vid_prep_topic_prefix(self):
-        """Return topic prefix for filename generation when enabled."""
-        if not self.vid_prep_prepend_topic_enabled:
-            return ""
-        topic = ""
-        if hasattr(self, 'vid_prep_selected_topic_input'):
-            topic = (self.vid_prep_selected_topic_input.text() or '').strip()
-        if not topic:
-            topic = getattr(self, 'current_topic_filter', '')
-        if not topic or topic == 'All Topics':
-            return ""
-        return f"{self._sanitize_vid_prep_filename_component(topic)}_"
+    def _sanitize_vid_prep_filename_token(self, value, fallback=''):
+        """Return a safe filename token, without spaces and separators."""
+        cleaned = re.sub(r'[<>:"/\\|?*]+', '_', str(value or '').strip())
+        cleaned = re.sub(r'\s+', '_', cleaned)
+        cleaned = re.sub(r'_+', '_', cleaned).strip('._ ')
+        if cleaned:
+            return cleaned
+        return fallback
+
+    def _extract_vid_prep_shortcode(self, source_path):
+        """Best-effort extraction of shortcode from source filename."""
+        stem = Path(source_path).stem
+        tokens = re.split(r'[^A-Za-z0-9_-]+', stem)
+        for token in reversed(tokens):
+            if re.fullmatch(r'[A-Za-z0-9_-]{6,}', token):
+                return token
+        return self._sanitize_vid_prep_filename_token(stem, 'unknown')
+
+    def _current_vid_prep_file_index(self):
+        """Return the currently selected file index string (01-20)."""
+        if hasattr(self, 'vid_prep_file_index_combo') and self.vid_prep_file_index_combo.count() > 0:
+            current = (self.vid_prep_file_index_combo.currentText() or '').strip()
+            if current:
+                return current
+        return getattr(self, 'vid_prep_file_index', '01') or '01'
+
+    def _current_vid_prep_modifier(self):
+        """Return active modifier value from UI/state."""
+        if hasattr(self, 'vid_prep_modifier_combo') and self.vid_prep_modifier_combo.count() > 0:
+            current = (self.vid_prep_modifier_combo.currentText() or '').strip()
+            if current:
+                return current
+        return getattr(self, 'vid_prep_modifier', '[NOTHING]') or '[NOTHING]'
+
+    def _current_vid_prep_separator(self):
+        """Return active filename separator from UI/state."""
+        if hasattr(self, 'vid_prep_separator_combo') and self.vid_prep_separator_combo.count() > 0:
+            current = (self.vid_prep_separator_combo.currentText() or '').strip()
+            if current in ('-', '_', '.'):
+                return current
+        saved = getattr(self, 'vid_prep_separator', '.')
+        return saved if saved in ('-', '_', '.') else '.'
+
+    def _reset_vid_prep_filename_parts_for_new_source(self):
+        """Reset filename fields when a new source video is loaded."""
+        if hasattr(self, 'vid_prep_file_prefix_input'):
+            self.vid_prep_file_prefix_input.blockSignals(True)
+            self.vid_prep_file_prefix_input.setText('')
+            self.vid_prep_file_prefix_input.blockSignals(False)
+        self.vid_prep_file_prefix = ''
+
+        if hasattr(self, 'vid_prep_file_index_combo'):
+            self.vid_prep_file_index_combo.blockSignals(True)
+            self.vid_prep_file_index_combo.setCurrentText('01')
+            self.vid_prep_file_index_combo.blockSignals(False)
+        self.vid_prep_file_index = '01'
+
+        self.account_manager.set_setting('vid_prep_file_prefix', self.vid_prep_file_prefix)
+        self.account_manager.set_setting('vid_prep_file_index', self.vid_prep_file_index)
+        self.save_ui_setting('vid_prep_file_prefix', self.vid_prep_file_prefix)
+        self.save_ui_setting('vid_prep_file_index', self.vid_prep_file_index)
+
+    def _increment_vid_prep_file_index(self):
+        """Advance file index after successful save, capped at 20."""
+        current = self._current_vid_prep_file_index()
+        try:
+            value = int(current)
+        except ValueError:
+            value = 1
+        next_value = min(20, max(1, value + 1))
+        next_text = f"{next_value:02d}"
+
+        if hasattr(self, 'vid_prep_file_index_combo'):
+            self.vid_prep_file_index_combo.setCurrentText(next_text)
+        self.vid_prep_file_index = next_text
+        self.account_manager.set_setting('vid_prep_file_index', self.vid_prep_file_index)
+        self.save_ui_setting('vid_prep_file_index', self.vid_prep_file_index)
 
     def _get_vid_prep_output_directory(self, source_path):
         """Resolve output directory from UI mode settings."""
@@ -4459,29 +4546,36 @@ class InstagramDownloaderGUI(QMainWindow):
         return src.parent
 
     def _generate_vid_prep_output_filename(self, source_path):
-        """Generate the next revisioned output filename only (no directory)."""
+        """Generate output filename as TOPIC[sep][PREFIX[sep]]INDEX[sep]MODIFIER[sep]SHORTCODE.ext."""
         src = Path(source_path)
-        output_dir = self._get_vid_prep_output_directory(source_path)
-        stem = self._sanitize_vid_prep_filename_component(src.stem)
         ext = src.suffix.lstrip('.')
+        separator = self._current_vid_prep_separator()
 
-        prefix = self._get_vid_prep_topic_prefix()
-        base_stem = f"{prefix}{stem}.cropped"
-        escaped_base = re.escape(base_stem)
-        escaped_ext = re.escape(ext)
-        pattern = re.compile(rf"^{escaped_base}\.(\d+)\.{escaped_ext}$", re.IGNORECASE)
+        topic_text = (self.vid_prep_selected_topic_input.text() if hasattr(self, 'vid_prep_selected_topic_input') else self.vid_prep_selected_topic_name) or ''
+        topic = self._sanitize_vid_prep_filename_token(topic_text, 'TOPIC')
 
-        max_rev = 0
-        if output_dir.exists() and output_dir.is_dir():
-            for item in output_dir.iterdir():
-                if not item.is_file():
-                    continue
-                m = pattern.match(item.name)
-                if m:
-                    max_rev = max(max_rev, int(m.group(1)))
+        prefix_text = (self.vid_prep_file_prefix_input.text() if hasattr(self, 'vid_prep_file_prefix_input') else self.vid_prep_file_prefix) or ''
+        file_prefix = self._sanitize_vid_prep_filename_token(prefix_text, '')
 
-        next_rev = max_rev + 1
-        return f"{base_stem}.{next_rev}.{ext}"
+        file_index = self._current_vid_prep_file_index()
+
+        modifier_value = self._current_vid_prep_modifier()
+        modifier = '' if modifier_value == '[NOTHING]' else self._sanitize_vid_prep_filename_token(modifier_value, '')
+
+        shortcode = self._sanitize_vid_prep_filename_token(self._extract_vid_prep_shortcode(source_path), 'unknown')
+
+        parts = [topic]
+        if file_prefix:
+            parts.append(file_prefix)
+        parts.append(file_index)
+        if modifier:
+            parts.append(modifier)
+        parts.append(shortcode)
+
+        base_name = separator.join([part for part in parts if part])
+        if ext:
+            return f"{base_name}.{ext}"
+        return base_name
 
     def regenerate_vid_prep_output_filename(self):
         """Regenerate filename from current source and settings."""
@@ -4506,8 +4600,50 @@ class InstagramDownloaderGUI(QMainWindow):
         self.account_manager.set_setting('vid_prep_selected_topic', self.vid_prep_selected_topic_name)
         self.save_ui_setting('vid_prep_selected_topic', self.vid_prep_selected_topic_name)
         self.update_vid_prep_output_filename_preview()
-        if self.vid_prep_prepend_topic_enabled and self.vid_prep_source_path:
+        if self.vid_prep_source_path:
             self.regenerate_vid_prep_output_filename()
+
+    def on_vid_prep_file_prefix_changed(self, prefix_text):
+        """Persist file prefix and regenerate output filename."""
+        self.vid_prep_file_prefix = (prefix_text or '').strip()
+        self.account_manager.set_setting('vid_prep_file_prefix', self.vid_prep_file_prefix)
+        self.save_ui_setting('vid_prep_file_prefix', self.vid_prep_file_prefix)
+        if self.vid_prep_source_path:
+            self.regenerate_vid_prep_output_filename()
+        else:
+            self.update_vid_prep_output_filename_preview()
+
+    def on_vid_prep_file_index_changed(self, index_text):
+        """Persist file index and regenerate output filename."""
+        text = (index_text or '').strip()
+        self.vid_prep_file_index = text if text else '01'
+        self.account_manager.set_setting('vid_prep_file_index', self.vid_prep_file_index)
+        self.save_ui_setting('vid_prep_file_index', self.vid_prep_file_index)
+        if self.vid_prep_source_path:
+            self.regenerate_vid_prep_output_filename()
+        else:
+            self.update_vid_prep_output_filename_preview()
+
+    def on_vid_prep_modifier_changed(self, modifier_text):
+        """Persist modifier and regenerate output filename."""
+        self.vid_prep_modifier = (modifier_text or '').strip() or '[NOTHING]'
+        self.account_manager.set_setting('vid_prep_modifier', self.vid_prep_modifier)
+        self.save_ui_setting('vid_prep_modifier', self.vid_prep_modifier)
+        if self.vid_prep_source_path:
+            self.regenerate_vid_prep_output_filename()
+        else:
+            self.update_vid_prep_output_filename_preview()
+
+    def on_vid_prep_separator_changed(self, separator_text):
+        """Persist separator and regenerate output filename."""
+        sep = (separator_text or '').strip()
+        self.vid_prep_separator = sep if sep in ('-', '_', '.') else '.'
+        self.account_manager.set_setting('vid_prep_separator', self.vid_prep_separator)
+        self.save_ui_setting('vid_prep_separator', self.vid_prep_separator)
+        if self.vid_prep_source_path:
+            self.regenerate_vid_prep_output_filename()
+        else:
+            self.update_vid_prep_output_filename_preview()
 
     def pick_vid_prep_topic(self):
         """Open a topic picker dialog and set selected topic for filename prefixing."""
@@ -4679,38 +4815,16 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_play_start_time = time.monotonic()
             self.vid_prep_play_start_frame = 0
 
-    def step_vid_prep_output_frames(self, frame_delta):
-        """Step output timeline by a signed number of frames."""
-        fps = max(1.0, float(self.vid_prep_fps or 30.0))
-        step_ms = int(round((1000.0 / fps) * int(frame_delta)))
-        self.step_vid_prep_output_ms(step_ms)
-
-    def step_vid_prep_output_seconds(self, seconds_delta):
-        """Step output timeline by a signed number of seconds."""
-        self.step_vid_prep_output_ms(int(round(float(seconds_delta) * 1000.0)))
-
-    def reset_vid_prep_output_to_first_frame(self):
-        """Reset output timeline to the beginning."""
-        self.step_vid_prep_output_ms(-10**9)
-
-    def step_vid_prep_output_ms(self, ms_delta):
-        """Step output timeline by a signed number of milliseconds."""
-        if not hasattr(self, 'vid_prep_output_scrubber'):
+    def jump_vid_prep_source_to_last_frame(self):
+        """Jump source timeline to the final frame."""
+        if not hasattr(self, 'vid_prep_scrubber') or self.vid_prep_frame_count <= 0:
             return
 
-        duration_ms = int(self.vid_prep_output_scrubber.maximum())
-        if duration_ms <= 0 and self.vid_prep_output_player is not None:
-            duration_ms = max(0, int(self.vid_prep_output_player.duration()))
-
-        current_ms = int(self.vid_prep_output_scrubber.value())
-        target_ms = max(0, min(duration_ms, current_ms + int(ms_delta)))
-        if target_ms == current_ms:
-            return
-
-        self.vid_prep_output_scrubber.blockSignals(True)
-        self.vid_prep_output_scrubber.setValue(target_ms)
-        self.vid_prep_output_scrubber.blockSignals(False)
-        self.seek_vid_prep_output(target_ms)
+        last_frame = max(0, self.vid_prep_frame_count - 1)
+        self.vid_prep_scrubber.setValue(last_frame)
+        if self.vid_prep_play_timer.isActive():
+            self.vid_prep_play_start_time = time.monotonic()
+            self.vid_prep_play_start_frame = last_frame
 
     def on_vid_prep_input_volume_changed(self, value):
         """Adjust input preview audio volume."""
@@ -4757,15 +4871,30 @@ class InstagramDownloaderGUI(QMainWindow):
         if not ok or frame is None:
             return
 
+        self._update_vid_prep_source_preview_frame(frame_idx, frame, sync_audio=not self.vid_prep_play_timer.isActive())
+
+    def _update_vid_prep_source_preview_frame(self, frame_idx, frame, sync_audio=False):
+        """Render source frame and synchronize timeline labels/widgets."""
+        if frame is None:
+            return
+
+        if self.vid_prep_frame_count > 0:
+            frame_idx = max(0, min(int(frame_idx), self.vid_prep_frame_count - 1))
+        else:
+            frame_idx = max(0, int(frame_idx))
+
         self.vid_prep_preview.set_video_frame(frame)
 
-        current_s = 0.0
-        if self.vid_prep_fps > 0:
-            current_s = frame_idx / self.vid_prep_fps
+        self.vid_prep_scrubber.blockSignals(True)
+        self.vid_prep_scrubber.setValue(frame_idx)
+        self.vid_prep_scrubber.blockSignals(False)
+
+        current_s = self._vid_prep_frame_to_seconds(frame_idx)
         self.vid_prep_time_label.setText(
             f"{self._format_vid_prep_time(current_s)} / {self._format_vid_prep_time(self.vid_prep_duration_s)}"
         )
-        if self.vid_prep_input_audio_player is not None and not self.vid_prep_play_timer.isActive():
+
+        if sync_audio and self.vid_prep_input_audio_player is not None:
             self.vid_prep_input_audio_player.setPosition(int(current_s * 1000))
 
     def _set_vid_prep_output_media(self, media_path):
@@ -4827,13 +4956,7 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_play_timer.stop()
             return
 
-        if self.vid_prep_play_start_time is None:
-            self.vid_prep_play_start_time = time.monotonic()
-            self.vid_prep_play_start_frame = int(self.vid_prep_scrubber.value())
-
-        elapsed_s = max(0.0, time.monotonic() - self.vid_prep_play_start_time)
-        next_frame = int(round(self.vid_prep_play_start_frame + (elapsed_s * max(1.0, self.vid_prep_fps))))
-        next_frame = max(self.vid_prep_scrubber.value() + 1, next_frame)
+        next_frame = int(self.vid_prep_scrubber.value()) + 1
         source_end = max(0, self.vid_prep_frame_count - 1)
         if next_frame > source_end:
             self.vid_prep_play_timer.stop()
@@ -4842,7 +4965,15 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_status.setText("Reached end of source video.")
             return
 
-        self.vid_prep_scrubber.setValue(next_frame)
+        ok, frame = self.vid_prep_cap.read()
+        if not ok or frame is None:
+            self.vid_prep_play_timer.stop()
+            if self.vid_prep_input_audio_player is not None:
+                self.vid_prep_input_audio_player.pause()
+            self.vid_prep_status.setText("Playback stopped: could not decode next frame.")
+            return
+
+        self._update_vid_prep_source_preview_frame(next_frame, frame, sync_audio=False)
 
     def show_vid_prep_output_preview(self):
         """Show last exported output video in preview player."""
@@ -4858,6 +4989,7 @@ class InstagramDownloaderGUI(QMainWindow):
 
     def on_vid_prep_file_dropped(self, file_path):
         """Handle video file dropped onto Vid Prep preview."""
+        self._reset_vid_prep_filename_parts_for_new_source()
         cv2 = self._get_cv2_for_vid_prep()
         if cv2 is None:
             self._release_vid_prep_capture()
@@ -4959,37 +5091,41 @@ class InstagramDownloaderGUI(QMainWindow):
         frame_idx = int(self.vid_prep_scrubber.value())
         if self.vid_prep_frame_count > 0:
             frame_idx = max(0, min(frame_idx, self.vid_prep_frame_count - 1))
-        else:
-            frame_idx = max(0, frame_idx)
         return frame_idx
 
     def set_vid_prep_trim_in_at_marker(self):
         """Set trim start to the current input timeline marker."""
         if self.vid_prep_frame_count <= 0:
-            self.vid_prep_status.setText("Load a video first, then set trim points.")
+            self.vid_prep_status.setText("Load a video first, then set trim in.")
             return
 
-        marker = self._get_vid_prep_current_marker_frame()
-        new_start = min(marker, int(self.vid_prep_trim_end_frame))
-        new_end = int(self.vid_prep_trim_end_frame)
+        marker_frame = self._get_vid_prep_current_marker_frame()
+        new_start = max(0, min(marker_frame, int(self.vid_prep_trim_end_frame)))
+        new_end = max(new_start, int(self.vid_prep_trim_end_frame))
 
         self.vid_prep_trim_slider.setValues(new_start, new_end)
         self.on_vid_prep_trim_range_changed(new_start, new_end)
-        self.vid_prep_status.setText(f"Trim In set to {self._format_vid_prep_time(self._vid_prep_frame_to_seconds(new_start))}.")
+        self.vid_prep_status.setText(
+            f"Trim In set to {self._format_vid_prep_time(self._vid_prep_frame_to_seconds(new_start))}."
+        )
 
     def set_vid_prep_trim_out_at_marker(self):
         """Set trim end to the current input timeline marker."""
         if self.vid_prep_frame_count <= 0:
-            self.vid_prep_status.setText("Load a video first, then set trim points.")
+            self.vid_prep_status.setText("Load a video first, then set trim out.")
             return
 
-        marker = self._get_vid_prep_current_marker_frame()
+        marker_frame = self._get_vid_prep_current_marker_frame()
         new_start = int(self.vid_prep_trim_start_frame)
-        new_end = max(marker, new_start)
+        new_end = max(new_start, marker_frame)
+        if self.vid_prep_frame_count > 0:
+            new_end = min(new_end, self.vid_prep_frame_count - 1)
 
         self.vid_prep_trim_slider.setValues(new_start, new_end)
         self.on_vid_prep_trim_range_changed(new_start, new_end)
-        self.vid_prep_status.setText(f"Trim Out set to {self._format_vid_prep_time(self._vid_prep_frame_to_seconds(new_end + 1))}.")
+        self.vid_prep_status.setText(
+            f"Trim Out set to {self._format_vid_prep_time(self._vid_prep_frame_to_seconds(new_end + 1))}."
+        )
 
     def flip_vid_prep_trim_to_tail(self):
         """Set trim start to current trim end, and trim end to the final video frame."""
@@ -5005,6 +5141,18 @@ class InstagramDownloaderGUI(QMainWindow):
         self.on_vid_prep_trim_range_changed(new_start, new_end)
         start_time = self._format_vid_prep_time(self._vid_prep_frame_to_seconds(new_start))
         self.vid_prep_status.setText(f"Flip Trim applied. Trim now starts at {start_time} and ends at video end.")
+
+    def reset_vid_prep_trim_to_full_video(self):
+        """Reset trim to cover the full loaded video."""
+        if self.vid_prep_frame_count <= 0:
+            self.vid_prep_status.setText("Load a video first, then reset trim.")
+            return
+
+        new_start = 0
+        new_end = max(0, int(self.vid_prep_frame_count - 1))
+        self.vid_prep_trim_slider.setValues(new_start, new_end)
+        self.on_vid_prep_trim_range_changed(new_start, new_end)
+        self.vid_prep_status.setText("Trim reset to full video.")
 
     def _build_vid_prep_output_path(self, source_path):
         """Create output path from editable filename + folder settings."""
@@ -5223,6 +5371,19 @@ class InstagramDownloaderGUI(QMainWindow):
     def save_vid_prep_output(self):
         """Process and save cropped video with selected audio mode."""
         output_path = self._build_vid_prep_output_path(self.vid_prep_source_path)
+
+        if output_path.exists():
+            overwrite = QMessageBox.question(
+                self,
+                "Vid Prep",
+                f"Output file already exists:\n{output_path}\n\nOverwrite this file?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if overwrite != QMessageBox.Yes:
+                self.vid_prep_status.setText("Save canceled: existing file was not overwritten.")
+                return
+
         try:
             cmd = self._build_vid_prep_ffmpeg_command(output_path)
         except ValueError as e:
@@ -5251,7 +5412,9 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_player.play()
         self.vid_prep_status.setText(f"Saved: {output_path}")
         self._set_vid_prep_output_preview_dirty(False)
-        QMessageBox.information(self, "Vid Prep", f"Saved cropped revision:\n{output_path}")
+        self._increment_vid_prep_file_index()
+        self.regenerate_vid_prep_output_filename()
+        QMessageBox.information(self, "Vid Prep", f"Saved output:\n{output_path}")
     
     def create_topics_tab(self):
         """Create the Topics management tab"""
@@ -14031,7 +14194,9 @@ class InstagramDownloaderGUI(QMainWindow):
 
         # Maximize workspace for full-screen style tabs by hiding right-side console/process panel.
         if hasattr(self, 'right_widget'):
-            self.right_widget.setVisible(tab_name not in ('Vid Prep', 'Content'))
+            should_show_right_widget = tab_name not in ('Vid Prep', 'Content')
+            if self.right_widget.isVisible() != should_show_right_widget:
+                QTimer.singleShot(0, lambda visible=should_show_right_widget: self.right_widget.setVisible(visible))
 
         if tab_name == "Topics" and self.content_db and self.content_db.db:
             logger.info("Loading topics tree for Topics tab")
@@ -14810,7 +14975,7 @@ class InstagramDownloaderGUI(QMainWindow):
                     if hasattr(parent_widget, 'is_carousel_media_container'):
                         reserve_controls = 0
                         min_video_height = 120
-                    elif hasattr(parent_widget, 'is_content_video_container'):
+                    elif hasattr(parent_widget, 'is_bounded_video_container'):
                         reserve_controls = 56
                         min_video_height = 72
                     else:
@@ -15476,19 +15641,21 @@ class InstagramDownloaderGUI(QMainWindow):
         container_height = video_height + 96
 
         is_content_tile = bool(tile is not None and getattr(tile, '_is_content_tile', False))
-        if is_content_tile:
+        is_single_tile_viewer = bool(tile is not None and getattr(tile, '_is_single_tile_viewer', False))
+        if is_content_tile or is_single_tile_viewer:
             max_tile_height = tile.maximumHeight() if tile is not None else 0
-            # Static overhead in content tiles:
-            # checkbox row + top button band + bottom button band + margins/spacings.
-            static_overhead = 98
+            # Bound media area against the surrounding tile chrome.
+            # Content tiles reserve both top and bottom button bands.
+            # Single-tile viewer only reserves the checkbox/id row and the top button row.
+            static_overhead = 54 if is_single_tile_viewer else 98
             if max_tile_height and max_tile_height > static_overhead:
                 container_height = min(container_height, max_tile_height - static_overhead)
             container_height = max(130, container_height)
-            video_height = max(74, container_height - 56)
+            video_height = max(74, container_height - (72 if is_single_tile_viewer else 56))
 
         video_container.setFixedSize(thumb_size, container_height)
-        if is_content_tile:
-            video_container.is_content_video_container = True
+        if is_content_tile or is_single_tile_viewer:
+            video_container.is_bounded_video_container = True
         
         # Video thumbnail
         thumb_label = QLabel()
@@ -15545,29 +15712,30 @@ class InstagramDownloaderGUI(QMainWindow):
         if inline_play:
             # Requested: make Play Video button roughly half-height.
             play_btn = QPushButton("▶ Play")
-            play_btn.setFixedHeight(14)
+            play_btn.setFixedHeight(18 if is_single_tile_viewer else 14)
             play_btn.setStyleSheet("""
                 QPushButton {
                     background-color: #28a745;
                     color: white;
                     font-weight: bold;
-                    font-size: 8pt;
-                    padding: 1px 4px;
+                    font-size: %s;
+                    padding: %s;
                     border-radius: 3px;
                 }
                 QPushButton:hover {
                     background-color: #218838;
                 }
-            """)
+            """ % ("9pt" if is_single_tile_viewer else "8pt", "2px 8px" if is_single_tile_viewer else "1px 4px"))
             play_btn.clicked.connect(play_handler)
             controls_row.addWidget(play_btn)
 
         # Optional inline Examine button on the same control row as Play.
         if inline_examine and callable(examine_callback):
             examine_btn = QPushButton("Examine")
-            examine_btn.setFixedHeight(14)
+            examine_btn.setFixedHeight(18 if is_single_tile_viewer else 14)
             examine_btn.setStyleSheet(
-                "QPushButton { background-color: #495057; color: white; font-weight: bold; font-size: 8pt; padding: 1px 4px; border-radius: 3px; }"
+                "QPushButton { background-color: #495057; color: white; font-weight: bold; font-size: %s; padding: %s; border-radius: 3px; }"
+                % ("9pt" if is_single_tile_viewer else "8pt", "2px 8px" if is_single_tile_viewer else "1px 4px")
             )
             examine_btn.setToolTip("Open Single Tile Viewer")
             examine_btn.clicked.connect(examine_callback)
@@ -15719,7 +15887,7 @@ class InstagramDownloaderGUI(QMainWindow):
 
         return None
 
-    def send_tile_to_vid_prep(self, shortcode):
+    def send_tile_to_vid_prep(self, shortcode, close_dialog=None):
         """Open Vid Prep tab and load the tile's video file for processing."""
         video_path = self._get_video_file_for_shortcode(shortcode)
         if not video_path:
@@ -15742,8 +15910,10 @@ class InstagramDownloaderGUI(QMainWindow):
 
         if vid_prep_index >= 0:
             self.tabs.setCurrentIndex(vid_prep_index)
+            if isinstance(close_dialog, QDialog):
+                close_dialog.accept()
     
-    def create_tile_widget(self, post, row_number=None, include_examine_button=True, tile_config_override=None, open_explorer_target='download'):
+    def create_tile_widget(self, post, row_number=None, include_examine_button=True, tile_config_override=None, open_explorer_target='download', viewer_mode=False):
         """Create a tile widget for a single post
         
         Args:
@@ -15751,6 +15921,7 @@ class InstagramDownloaderGUI(QMainWindow):
             row_number: Optional row number in the full list (1-based)
             include_examine_button: Whether to add the bottom Examine button
             tile_config_override: Optional dict with thumb/min_height/max_height overrides
+            viewer_mode: Whether the tile is being rendered inside the single-tile viewer dialog
         """
         # Tile dimensions based on size - reduced heights for tighter fit
         tile_config = {
@@ -15811,6 +15982,7 @@ class InstagramDownloaderGUI(QMainWindow):
         tile.setMinimumHeight(config['min_height'])
         tile.setMaximumHeight(config['max_height'])
         tile._is_content_tile = (open_explorer_target == 'topic')
+        tile._is_single_tile_viewer = bool(viewer_mode)
         # Set fixed width to match thumbnail + padding (left-aligned, no extra space)
         tile.setFixedWidth(config['thumb'] + 10)  # thumb + margins
         tile.setCursor(Qt.PointingHandCursor)
@@ -16022,7 +16194,10 @@ class InstagramDownloaderGUI(QMainWindow):
             prep_btn.setMaximumHeight(24)
             prep_btn.setStyleSheet("QPushButton { background-color: #6f42c1; color: white; font-weight: bold; }")
             prep_btn.setToolTip("Send video to Vid Prep")
-            prep_btn.clicked.connect(lambda checked=False, sc=shortcode: self.send_tile_to_vid_prep(sc))
+            prep_btn.clicked.connect(
+                lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None:
+                self.send_tile_to_vid_prep(sc, close_dialog=dlg)
+            )
             button_row.addWidget(prep_btn)
             _style_content_tile_action_button(prep_btn)
         
@@ -16059,7 +16234,8 @@ class InstagramDownloaderGUI(QMainWindow):
         )
         move_video_controls_to_footer = (
             open_explorer_target == 'topic' and
-            is_single_video
+            is_single_video and
+            not viewer_mode
         )
         inline_examine = (
             include_examine_button and
@@ -16267,6 +16443,7 @@ class InstagramDownloaderGUI(QMainWindow):
             include_examine_button=False,
             tile_config_override=viewer_config,
             open_explorer_target=open_explorer_target,
+            viewer_mode=True,
         )
         container_layout.addWidget(viewer_tile, 0, Qt.AlignTop | Qt.AlignHCenter)
         outer.addWidget(container, 1)
