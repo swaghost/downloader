@@ -653,88 +653,99 @@ class InstagramManager:
         import requests
         from PIL import Image
         from io import BytesIO
+
+        def _download_from_post_context(context, mode_label):
+            """Fetch thumbnail URL via instaloader context and save image bytes."""
+            post = instaloader.Post.from_shortcode(context, shortcode)
+            thumbnail_url = post.url
+
+            logger.info(f"Downloading thumbnail for {shortcode} from {thumbnail_url} ({mode_label})")
+            response = requests.get(thumbnail_url, timeout=30)
+            response.raise_for_status()
+
+            img = Image.open(BytesIO(response.content))
+            width, height = img.size
+
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(target_path, 'wb') as f:
+                f.write(response.content)
+
+            logger.info(f"Thumbnail saved: {target_path} ({width}x{height})")
+            return (True, (width, height))
         
         try:
             # Method 1: Try getting thumbnail from Instagram
             try:
-                post = instaloader.Post.from_shortcode(self.loader.context, shortcode)
-                thumbnail_url = post.url
-                
-                logger.info(f"Downloading thumbnail for {shortcode} from {thumbnail_url}")
-                response = requests.get(thumbnail_url, timeout=30)
-                response.raise_for_status()
-                
-                # Open image to get dimensions
-                img = Image.open(BytesIO(response.content))
-                width, height = img.size
-                
-                # Save to file
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(target_path, 'wb') as f:
-                    f.write(response.content)
-                
-                logger.info(f"Thumbnail saved: {target_path} ({width}x{height})")
-                return (True, (width, height))
+                # Prefer anonymous access to reduce authenticated request volume.
+                return _download_from_post_context(self.anon_loader.context, "anonymous")
+            except instaloader.exceptions.LoginRequiredException:
+                logger.info(f"Thumbnail for {shortcode} requires login; trying authenticated session")
             except Exception as e:
-                logger.debug(f"Could not fetch thumbnail from Instagram for {shortcode}: {e}")
-                
-                # Method 2: Try to extract from downloaded files in the same directory
-                # Look for downloaded files with this shortcode
-                download_dir = target_path.parent.parent  # Go up from .thumbnails to account dir
-                logger.info(f"Searching for downloaded files in: {download_dir}")
-                
-                # List files for debugging
-                try:
-                    existing_files = list(download_dir.glob(f"{shortcode}*"))[:5]  # Show first 5 matches
-                    logger.info(f"Files with shortcode prefix: {[f.name for f in existing_files]}")
-                except:
-                    pass
-                
-                # Try common patterns
-                for pattern in [f"{shortcode}.jpg", f"{shortcode}.mp4", f"{shortcode}_*.jpg", f"{shortcode}_*.mp4"]:
-                    logger.info(f"Trying pattern: {pattern}")
-                    matches = list(download_dir.glob(pattern))
-                    if matches:
-                        source_file = matches[0]
-                        logger.info(f"Found downloaded file: {source_file}, extracting thumbnail...")
-                        
-                        if source_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-                            # Image file - just copy and resize
-                            img = Image.open(source_file)
-                            # Create thumbnail (max 500x500)
-                            img.thumbnail((500, 500), Image.Resampling.LANCZOS)
-                            width, height = img.size
-                            
-                            target_path.parent.mkdir(parents=True, exist_ok=True)
-                            img.save(target_path, 'JPEG', quality=85)
-                            logger.info(f"Thumbnail extracted from image: {target_path} ({width}x{height})")
-                            return (True, (width, height))
-                        
-                        elif source_file.suffix.lower() in ['.mp4', '.mov']:
-                            # Video file - extract first frame
-                            try:
-                                import cv2
-                                vidcap = cv2.VideoCapture(str(source_file))
-                                success, image = vidcap.read()
-                                if success:
-                                    # Convert BGR to RGB
-                                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                                    img = Image.fromarray(image_rgb)
-                                    img.thumbnail((500, 500), Image.Resampling.LANCZOS)
-                                    width, height = img.size
-                                    
-                                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                                    img.save(target_path, 'JPEG', quality=85)
-                                    logger.info(f"Thumbnail extracted from video: {target_path} ({width}x{height})")
-                                    return (True, (width, height))
-                                vidcap.release()
-                            except ImportError:
-                                logger.debug("cv2 not available for video thumbnail extraction")
-                            except Exception as video_err:
-                                logger.debug(f"Could not extract frame from video: {video_err}")
-                
-                # If we got here, no methods worked
-                raise Exception(f"Could not fetch thumbnail from Instagram or extract from local files")
+                logger.debug(f"Anonymous thumbnail fetch failed for {shortcode}: {e}")
+
+            try:
+                if self.logged_in:
+                    return _download_from_post_context(self.loader.context, "authenticated")
+            except Exception as e:
+                logger.debug(f"Authenticated thumbnail fetch failed for {shortcode}: {e}")
+
+            # Method 2: Try to extract from downloaded files in the same directory
+            # Look for downloaded files with this shortcode
+            download_dir = target_path.parent.parent  # Go up from .thumbnails to account dir
+            logger.info(f"Searching for downloaded files in: {download_dir}")
+
+            # List files for debugging
+            try:
+                existing_files = list(download_dir.glob(f"{shortcode}*"))[:5]  # Show first 5 matches
+                logger.info(f"Files with shortcode prefix: {[f.name for f in existing_files]}")
+            except:
+                pass
+
+            # Try common patterns
+            for pattern in [f"{shortcode}.jpg", f"{shortcode}.mp4", f"{shortcode}_*.jpg", f"{shortcode}_*.mp4"]:
+                logger.info(f"Trying pattern: {pattern}")
+                matches = list(download_dir.glob(pattern))
+                if matches:
+                    source_file = matches[0]
+                    logger.info(f"Found downloaded file: {source_file}, extracting thumbnail...")
+
+                    if source_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                        # Image file - just copy and resize
+                        img = Image.open(source_file)
+                        # Create thumbnail (max 500x500)
+                        img.thumbnail((500, 500), Image.Resampling.LANCZOS)
+                        width, height = img.size
+
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        img.save(target_path, 'JPEG', quality=85)
+                        logger.info(f"Thumbnail extracted from image: {target_path} ({width}x{height})")
+                        return (True, (width, height))
+
+                    elif source_file.suffix.lower() in ['.mp4', '.mov']:
+                        # Video file - extract first frame
+                        try:
+                            import cv2
+                            vidcap = cv2.VideoCapture(str(source_file))
+                            success, image = vidcap.read()
+                            if success:
+                                # Convert BGR to RGB
+                                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                                img = Image.fromarray(image_rgb)
+                                img.thumbnail((500, 500), Image.Resampling.LANCZOS)
+                                width, height = img.size
+
+                                target_path.parent.mkdir(parents=True, exist_ok=True)
+                                img.save(target_path, 'JPEG', quality=85)
+                                logger.info(f"Thumbnail extracted from video: {target_path} ({width}x{height})")
+                                return (True, (width, height))
+                            vidcap.release()
+                        except ImportError:
+                            logger.debug("cv2 not available for video thumbnail extraction")
+                        except Exception as video_err:
+                            logger.debug(f"Could not extract frame from video: {video_err}")
+
+            # If we got here, no methods worked
+            raise Exception(f"Could not fetch thumbnail from Instagram or extract from local files")
         
         except Exception as e:
             logger.error(f"Failed to download thumbnail for {shortcode}: {e}")

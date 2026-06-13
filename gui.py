@@ -3677,6 +3677,31 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_file_index_combo.currentTextChanged.connect(self.on_vid_prep_file_index_changed)
         prefix_row.addWidget(self.vid_prep_file_index_combo)
 
+        self.vid_prep_file_index_back_btn = QPushButton("◀ Back-Up")
+        self.vid_prep_file_index_back_btn.setFixedHeight(24)
+        self.vid_prep_file_index_back_btn.setFixedWidth(90)
+        self.vid_prep_file_index_back_btn.setToolTip("Decrement file index")
+        self.vid_prep_file_index_back_btn.clicked.connect(self.decrement_vid_prep_file_index)
+        prefix_row.addWidget(self.vid_prep_file_index_back_btn)
+
+        self.vid_prep_file_index_next_btn = QPushButton("Add Next ▶")
+        self.vid_prep_file_index_next_btn.setFixedHeight(24)
+        self.vid_prep_file_index_next_btn.setFixedWidth(90)
+        self.vid_prep_file_index_next_btn.setToolTip("Increment file index")
+        self.vid_prep_file_index_next_btn.clicked.connect(self.increment_vid_prep_file_index)
+        prefix_row.addWidget(self.vid_prep_file_index_next_btn)
+
+        self.vid_prep_filename_delete_btn = QPushButton("DELETE")
+        self.vid_prep_filename_delete_btn.setFixedHeight(24)
+        self.vid_prep_filename_delete_btn.setFixedWidth(78)
+        self.vid_prep_filename_delete_btn.setToolTip("Clear generated filename")
+        self.vid_prep_filename_delete_btn.setStyleSheet(
+            "QPushButton { background-color: #dc3545; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #c82333; }"
+        )
+        self.vid_prep_filename_delete_btn.clicked.connect(self.delete_vid_prep_generated_filename)
+        prefix_row.addWidget(self.vid_prep_filename_delete_btn)
+
         prefix_row.addStretch()
         output_layout.addLayout(prefix_row)
 
@@ -4487,10 +4512,18 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_file_index_combo.blockSignals(False)
         self.vid_prep_file_index = '01'
 
+        if hasattr(self, 'vid_prep_modifier_combo'):
+            self.vid_prep_modifier_combo.blockSignals(True)
+            self.vid_prep_modifier_combo.setCurrentText('[NOTHING]')
+            self.vid_prep_modifier_combo.blockSignals(False)
+        self.vid_prep_modifier = '[NOTHING]'
+
         self.account_manager.set_setting('vid_prep_file_prefix', self.vid_prep_file_prefix)
         self.account_manager.set_setting('vid_prep_file_index', self.vid_prep_file_index)
+        self.account_manager.set_setting('vid_prep_modifier', self.vid_prep_modifier)
         self.save_ui_setting('vid_prep_file_prefix', self.vid_prep_file_prefix)
         self.save_ui_setting('vid_prep_file_index', self.vid_prep_file_index)
+        self.save_ui_setting('vid_prep_modifier', self.vid_prep_modifier)
 
     def _increment_vid_prep_file_index(self):
         """Advance file index after successful save, capped at 20."""
@@ -4507,6 +4540,37 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_file_index = next_text
         self.account_manager.set_setting('vid_prep_file_index', self.vid_prep_file_index)
         self.save_ui_setting('vid_prep_file_index', self.vid_prep_file_index)
+
+    def increment_vid_prep_file_index(self):
+        """User-triggered increment of file index (button handler)."""
+        self._increment_vid_prep_file_index()
+        if self.vid_prep_source_path:
+            self.regenerate_vid_prep_output_filename()
+
+    def decrement_vid_prep_file_index(self):
+        """Decrement file index (button handler)."""
+        current = self._current_vid_prep_file_index()
+        try:
+            value = int(current)
+        except ValueError:
+            value = 1
+        prev_value = max(1, min(20, value - 1))
+        prev_text = f"{prev_value:02d}"
+
+        if hasattr(self, 'vid_prep_file_index_combo'):
+            self.vid_prep_file_index_combo.setCurrentText(prev_text)
+        self.vid_prep_file_index = prev_text
+        self.account_manager.set_setting('vid_prep_file_index', self.vid_prep_file_index)
+        self.save_ui_setting('vid_prep_file_index', self.vid_prep_file_index)
+
+        if self.vid_prep_source_path:
+            self.regenerate_vid_prep_output_filename()
+
+    def delete_vid_prep_generated_filename(self):
+        """Clear the current filename field in Vid Prep output settings."""
+        if hasattr(self, 'vid_prep_output_filename_input'):
+            self.vid_prep_output_filename_input.setText("")
+            self.vid_prep_status.setText("Filename cleared.")
 
     def _get_vid_prep_output_directory(self, source_path):
         """Resolve output directory from UI mode settings."""
