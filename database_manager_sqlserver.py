@@ -2842,7 +2842,1081 @@ class DatabaseManagerSQLServer:
         except Exception as e:
             conn.rollback()
             raise Exception(f"Failed to delete thumbnail: {e}")
-    
+
+    def ensure_video_output_tables(self):
+        """Ensure VIDEO.VideoOutput, VIDEO.AudioTracks, and VIDEO.FileAssembly tables exist."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('''
+                IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'VIDEO')
+                BEGIN
+                    EXEC('CREATE SCHEMA VIDEO')
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.tables t
+                    INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = 'VIDEO' AND t.name = 'VideoOutput'
+                )
+                BEGIN
+                    CREATE TABLE VIDEO.VideoOutput (
+                        VidID INT IDENTITY(1,1) PRIMARY KEY,
+                        AccountName NVARCHAR(255) NOT NULL,
+                        OutputPath NVARCHAR(1000) NOT NULL,
+                        OutputFileName NVARCHAR(255) NULL,
+                        VideoFileTitle NVARCHAR(500) NULL,
+                        VideoFileDesc NVARCHAR(MAX) NULL,
+                        SourcePath NVARCHAR(1000) NULL,
+                        SourceShortcode NVARCHAR(100) NULL,
+                        SelectedTopic NVARCHAR(255) NULL,
+                        FilePrefix NVARCHAR(255) NULL,
+                        FileIndex NVARCHAR(20) NULL,
+                        Modifier NVARCHAR(50) NULL,
+                        Separator NVARCHAR(10) NULL,
+                        PrependTopic BIT NOT NULL CONSTRAINT DF_VideoOutput_PrependTopic DEFAULT 0,
+                        OutputFolderMode NVARCHAR(50) NULL,
+                        OutputFolderPath NVARCHAR(1000) NULL,
+                        CodecPreset NVARCHAR(50) NULL,
+                        CRF INT NULL,
+                        ResolutionPreset NVARCHAR(50) NULL,
+                        OutputWidth INT NULL,
+                        OutputHeight INT NULL,
+                        BackgroundMode NVARCHAR(50) NULL,
+                        BackgroundColor NVARCHAR(50) NULL,
+                        BackgroundImagePath NVARCHAR(1000) NULL,
+                        AudioMode NVARCHAR(50) NULL,
+                        AudioFilePath NVARCHAR(1000) NULL,
+                        AudioStartSeconds FLOAT NULL,
+                        AudioEndSeconds FLOAT NULL,
+                        CropX INT NULL,
+                        CropY INT NULL,
+                        CropWidth INT NULL,
+                        CropHeight INT NULL,
+                        TrimStartFrame INT NULL,
+                        TrimEndFrame INT NULL,
+                        SourceFrameCount INT NULL,
+                        SourceFps FLOAT NULL,
+                        SourceDurationSeconds FLOAT NULL,
+                        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_VideoOutput_CreatedAt DEFAULT GETDATE(),
+                        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_VideoOutput_UpdatedAt DEFAULT GETDATE()
+                    )
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF COL_LENGTH('VIDEO.AudioTracks', 'VidID') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD VidID INT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'TrackOrder') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD TrackOrder INT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'TrackPath') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD TrackPath NVARCHAR(1000) NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'TrackName') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD TrackName NVARCHAR(255) NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'VolumePercent') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD VolumePercent FLOAT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'ClipStartSeconds') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD ClipStartSeconds FLOAT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'ClipEndSeconds') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD ClipEndSeconds FLOAT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'EnterFrame') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD EnterFrame INT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'ExitFrame') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD ExitFrame INT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'FadeInSeconds') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD FadeInSeconds FLOAT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'FadeOutSeconds') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD FadeOutSeconds FLOAT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'CreatedAt') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_AudioTracks_CreatedAt DEFAULT GETDATE();
+            ''')
+            conn.commit()
+
+            # Migrate legacy VIDEO.VideoOutput schemas by adding any missing columns
+            # required by current save/load logic.
+            cursor.execute('''
+                IF COL_LENGTH('VIDEO.VideoOutput', 'AccountName') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD AccountName NVARCHAR(255) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'OutputPath') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD OutputPath NVARCHAR(1000) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'OutputFileName') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD OutputFileName NVARCHAR(255) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'VideoFileTitle') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD VideoFileTitle NVARCHAR(500) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'VideoFileDesc') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD VideoFileDesc NVARCHAR(MAX) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'SourcePath') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD SourcePath NVARCHAR(1000) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'SourceShortcode') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD SourceShortcode NVARCHAR(100) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'SelectedTopic') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD SelectedTopic NVARCHAR(255) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'FilePrefix') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD FilePrefix NVARCHAR(255) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'FileIndex') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD FileIndex NVARCHAR(20) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'Modifier') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD Modifier NVARCHAR(50) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'Separator') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD Separator NVARCHAR(10) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'PrependTopic') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD PrependTopic BIT NOT NULL CONSTRAINT DF_VideoOutput_PrependTopic DEFAULT 0;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'OutputFolderMode') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD OutputFolderMode NVARCHAR(50) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'OutputFolderPath') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD OutputFolderPath NVARCHAR(1000) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'CodecPreset') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD CodecPreset NVARCHAR(50) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'CRF') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD CRF INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'ResolutionPreset') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD ResolutionPreset NVARCHAR(50) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'OutputWidth') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD OutputWidth INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'OutputHeight') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD OutputHeight INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'BackgroundMode') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD BackgroundMode NVARCHAR(50) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'BackgroundColor') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD BackgroundColor NVARCHAR(50) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'BackgroundImagePath') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD BackgroundImagePath NVARCHAR(1000) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'AudioMode') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD AudioMode NVARCHAR(50) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'AudioFilePath') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD AudioFilePath NVARCHAR(1000) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'AudioStartSeconds') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD AudioStartSeconds FLOAT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'AudioEndSeconds') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD AudioEndSeconds FLOAT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'CropX') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD CropX INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'CropY') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD CropY INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'CropWidth') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD CropWidth INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'CropHeight') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD CropHeight INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'TrimStartFrame') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD TrimStartFrame INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'TrimEndFrame') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD TrimEndFrame INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'SourceFrameCount') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD SourceFrameCount INT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'SourceFps') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD SourceFps FLOAT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'SourceDurationSeconds') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD SourceDurationSeconds FLOAT NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'CreatedAt') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_VideoOutput_CreatedAt DEFAULT GETDATE();
+                IF COL_LENGTH('VIDEO.VideoOutput', 'UpdatedAt') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_VideoOutput_UpdatedAt DEFAULT GETDATE();
+            ''')
+            conn.commit()
+
+            # Backfill AccountName on legacy rows so account-scoped save/lookups work.
+            cursor.execute(
+                '''
+                UPDATE VIDEO.VideoOutput
+                SET AccountName = ?
+                WHERE AccountName IS NULL OR LTRIM(RTRIM(AccountName)) = ''
+                ''',
+                (self.account_name or 'legacy',),
+            )
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.indexes
+                    WHERE object_id = OBJECT_ID('VIDEO.VideoOutput')
+                      AND name = 'UX_VideoOutput_Account_OutputPath'
+                )
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM VIDEO.VideoOutput
+                        GROUP BY AccountName, OutputPath
+                        HAVING COUNT(*) > 1
+                    )
+                    BEGIN
+                        CREATE UNIQUE INDEX UX_VideoOutput_Account_OutputPath
+                        ON VIDEO.VideoOutput(AccountName, OutputPath)
+                    END
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.tables t
+                    INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = 'VIDEO' AND t.name = 'AudioTracks'
+                )
+                BEGIN
+                    CREATE TABLE VIDEO.AudioTracks (
+                        AudioTrackID INT IDENTITY(1,1) PRIMARY KEY,
+                        VidID INT NOT NULL,
+                        TrackOrder INT NOT NULL,
+                        TrackPath NVARCHAR(1000) NOT NULL,
+                        TrackName NVARCHAR(255) NULL,
+                        VolumePercent FLOAT NULL,
+                        ClipStartSeconds FLOAT NULL,
+                        ClipEndSeconds FLOAT NULL,
+                        EnterFrame INT NULL,
+                        ExitFrame INT NULL,
+                        FadeInSeconds FLOAT NULL,
+                        FadeOutSeconds FLOAT NULL,
+                        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_AudioTracks_CreatedAt DEFAULT GETDATE(),
+                        CONSTRAINT FK_AudioTracks_VideoOutput FOREIGN KEY (VidID)
+                            REFERENCES VIDEO.VideoOutput(VidID) ON DELETE CASCADE
+                    )
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF COL_LENGTH('VIDEO.FileAssembly', 'VidID') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD VidID INT NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'FileID') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD FileID INT NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'AssemblyOrder') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD AssemblyOrder INT NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'AssemblyStage') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD AssemblyStage NVARCHAR(100) NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'InputPath') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD InputPath NVARCHAR(1000) NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'OutputPath') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD OutputPath NVARCHAR(1000) NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'ToolName') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD ToolName NVARCHAR(100) NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'CommandLine') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD CommandLine NVARCHAR(MAX) NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'AssemblyPayload') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD AssemblyPayload NVARCHAR(MAX) NULL;
+                IF COL_LENGTH('VIDEO.FileAssembly', 'CreatedAt') IS NULL
+                    ALTER TABLE VIDEO.FileAssembly ADD CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_FileAssembly_CreatedAt DEFAULT GETDATE();
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.indexes
+                    WHERE object_id = OBJECT_ID('VIDEO.AudioTracks')
+                      AND name = 'IX_AudioTracks_VidID_Order'
+                )
+                BEGIN
+                    CREATE INDEX IX_AudioTracks_VidID_Order
+                    ON VIDEO.AudioTracks(VidID, TrackOrder)
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.tables t
+                    INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = 'VIDEO' AND t.name = 'FileAssembly'
+                )
+                BEGIN
+                    CREATE TABLE VIDEO.FileAssembly (
+                        FileAssemblyID INT IDENTITY(1,1) PRIMARY KEY,
+                        VidID INT NOT NULL,
+                        AssemblyOrder INT NOT NULL,
+                        AssemblyStage NVARCHAR(100) NOT NULL,
+                        InputPath NVARCHAR(1000) NULL,
+                        OutputPath NVARCHAR(1000) NULL,
+                        ToolName NVARCHAR(100) NULL,
+                        CommandLine NVARCHAR(MAX) NULL,
+                        AssemblyPayload NVARCHAR(MAX) NULL,
+                        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_FileAssembly_CreatedAt DEFAULT GETDATE(),
+                        CONSTRAINT FK_FileAssembly_VideoOutput FOREIGN KEY (VidID)
+                            REFERENCES VIDEO.VideoOutput(VidID) ON DELETE CASCADE
+                    )
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.indexes
+                    WHERE object_id = OBJECT_ID('VIDEO.FileAssembly')
+                      AND name = 'IX_FileAssembly_VidID_Order'
+                )
+                BEGIN
+                    CREATE INDEX IX_FileAssembly_VidID_Order
+                    ON VIDEO.FileAssembly(VidID, AssemblyOrder)
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.tables t
+                    INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = 'VIDEO' AND t.name = 'Applications'
+                )
+                BEGIN
+                    CREATE TABLE VIDEO.Applications (
+                        VidAID BIGINT IDENTITY(1,1) PRIMARY KEY,
+                        VidID INT NOT NULL,
+                        TechniqueClassID INT NOT NULL,
+                        TechniqueTypeID INT NOT NULL,
+                        TSID BIGINT NULL,
+                        AlternateTechniqueName NVARCHAR(512) NULL,
+                        KeyTechnique BIT NULL,
+                        FormationID BIGINT NULL,
+                        PossessionStateID INT NULL,
+                        PitchPositionID INT NULL,
+                        ExerciseClassID BIGINT NULL,
+                        MuscleGroupID BIGINT NULL,
+                        EngagementMechanismID BIGINT NULL,
+                        CONSTRAINT FK_Applications_VideoOutput FOREIGN KEY (VidID)
+                            REFERENCES VIDEO.VideoOutput(VidID) ON DELETE CASCADE
+                    )
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.indexes
+                    WHERE object_id = OBJECT_ID('VIDEO.Applications')
+                      AND name = 'IX_Applications_VidID'
+                )
+                BEGIN
+                    CREATE INDEX IX_Applications_VidID
+                    ON VIDEO.Applications(VidID, VidAID)
+                END
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.indexes
+                    WHERE object_id = OBJECT_ID('VIDEO.Applications')
+                      AND name = 'UX_Applications_Vid_Class_Type_TSID'
+                )
+                BEGIN
+                    CREATE UNIQUE INDEX UX_Applications_Vid_Class_Type_TSID
+                    ON VIDEO.Applications(VidID, TechniqueClassID, TechniqueTypeID, TSID)
+                    WHERE TSID IS NOT NULL
+                END
+            ''')
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to ensure VIDEO tables: {e}")
+
+    def save_video_output_record(
+        self,
+        video_output: Dict[str, Any],
+        audio_tracks: Optional[List[Dict[str, Any]]] = None,
+        file_assembly: Optional[List[Dict[str, Any]]] = None,
+        delete_existing: bool = False,
+    ) -> int:
+        """Save VIDEO.VideoOutput row and its VIDEO.AudioTracks/FileAssembly rows.
+
+        Args:
+            video_output: Video output metadata dictionary.
+            audio_tracks: List of track dictionaries.
+            file_assembly: List of file assembly dictionaries documenting creation steps.
+            delete_existing: Delete an existing row for same account/path before insert.
+
+        Returns:
+            Newly inserted VidID.
+        """
+        self.ensure_video_output_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        output_path = str(video_output.get('output_path') or '').strip()
+        if not output_path:
+            raise ValueError("video_output.output_path is required")
+
+        account_name = str(video_output.get('account_name') or self.account_name or '').strip()
+        if not account_name:
+            raise ValueError("account_name is required")
+
+        try:
+            cursor.execute(
+                '''
+                SELECT VidID
+                FROM VIDEO.VideoOutput
+                WHERE AccountName = ? AND OutputPath = ?
+                ''',
+                (account_name, output_path),
+            )
+            existing_row = cursor.fetchone()
+            if existing_row:
+                if not delete_existing:
+                    raise ValueError(
+                        f"Video output record already exists for account '{account_name}' and path '{output_path}'"
+                    )
+                cursor.execute(
+                    '''
+                    DELETE FROM VIDEO.VideoOutput
+                    WHERE AccountName = ? AND OutputPath = ?
+                    ''',
+                    (account_name, output_path),
+                )
+
+            cursor.execute(
+                '''
+                INSERT INTO VIDEO.VideoOutput (
+                    AccountName,
+                    OutputPath,
+                    OutputFileName,
+                    VideoFileTitle,
+                    VideoFileDesc,
+                    SourcePath,
+                    SourceShortcode,
+                    SelectedTopic,
+                    FilePrefix,
+                    FileIndex,
+                    Modifier,
+                    Separator,
+                    PrependTopic,
+                    OutputFolderMode,
+                    OutputFolderPath,
+                    CodecPreset,
+                    CRF,
+                    ResolutionPreset,
+                    OutputWidth,
+                    OutputHeight,
+                    BackgroundMode,
+                    BackgroundColor,
+                    BackgroundImagePath,
+                    AudioMode,
+                    AudioFilePath,
+                    AudioStartSeconds,
+                    AudioEndSeconds,
+                    CropX,
+                    CropY,
+                    CropWidth,
+                    CropHeight,
+                    TrimStartFrame,
+                    TrimEndFrame,
+                    SourceFrameCount,
+                    SourceFps,
+                    SourceDurationSeconds,
+                    UpdatedAt
+                )
+                OUTPUT INSERTED.VidID
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE())
+                ''',
+                (
+                    account_name,
+                    output_path,
+                    video_output.get('output_file_name'),
+                    video_output.get('video_file_title'),
+                    video_output.get('video_file_desc'),
+                    video_output.get('source_path'),
+                    video_output.get('source_shortcode'),
+                    video_output.get('selected_topic'),
+                    video_output.get('file_prefix'),
+                    video_output.get('file_index'),
+                    video_output.get('modifier'),
+                    video_output.get('separator'),
+                    1 if video_output.get('prepend_topic') else 0,
+                    video_output.get('output_folder_mode'),
+                    video_output.get('output_folder_path'),
+                    video_output.get('codec_preset'),
+                    video_output.get('crf'),
+                    video_output.get('resolution_preset'),
+                    video_output.get('output_width'),
+                    video_output.get('output_height'),
+                    video_output.get('background_mode'),
+                    video_output.get('background_color'),
+                    video_output.get('background_image_path'),
+                    video_output.get('audio_mode'),
+                    video_output.get('audio_file_path'),
+                    video_output.get('audio_start_seconds'),
+                    video_output.get('audio_end_seconds'),
+                    video_output.get('crop_x'),
+                    video_output.get('crop_y'),
+                    video_output.get('crop_width'),
+                    video_output.get('crop_height'),
+                    video_output.get('trim_start_frame'),
+                    video_output.get('trim_end_frame'),
+                    video_output.get('source_frame_count'),
+                    video_output.get('source_fps'),
+                    video_output.get('source_duration_seconds'),
+                ),
+            )
+
+            inserted_row = cursor.fetchone()
+            if not inserted_row:
+                raise Exception("Failed to obtain inserted VidID")
+            vid_id = int(inserted_row[0])
+
+            for order, track in enumerate(audio_tracks or [], start=1):
+                track_path = str(track.get('track_path') or '').strip()
+                if not track_path:
+                    continue
+
+                cursor.execute(
+                    '''
+                    INSERT INTO VIDEO.AudioTracks (
+                        VidID,
+                        TrackOrder,
+                        TrackPath,
+                        TrackName,
+                        VolumePercent,
+                        ClipStartSeconds,
+                        ClipEndSeconds,
+                        EnterFrame,
+                        ExitFrame,
+                        FadeInSeconds,
+                        FadeOutSeconds
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        vid_id,
+                        int(track.get('track_order') or order),
+                        track_path,
+                        track.get('track_name') or os.path.basename(track_path),
+                        track.get('volume_percent'),
+                        track.get('clip_start_seconds'),
+                        track.get('clip_end_seconds'),
+                        track.get('enter_frame'),
+                        track.get('exit_frame'),
+                        track.get('fade_in_seconds'),
+                        track.get('fade_out_seconds'),
+                    ),
+                )
+
+            for order, assembly_row in enumerate(file_assembly or [], start=1):
+                assembly_stage = str(assembly_row.get('assembly_stage') or '').strip() or 'ffmpeg_export'
+                input_path = str(assembly_row.get('input_path') or '').strip() or None
+                output_path_for_row = str(assembly_row.get('output_path') or '').strip() or output_path
+                tool_name = str(assembly_row.get('tool_name') or '').strip() or None
+                command_line = assembly_row.get('command_line')
+                payload = assembly_row.get('assembly_payload')
+
+                if command_line is not None and not isinstance(command_line, str):
+                    try:
+                        command_line = json.dumps(command_line, ensure_ascii=False)
+                    except Exception:
+                        command_line = str(command_line)
+
+                if payload is not None and not isinstance(payload, str):
+                    try:
+                        payload = json.dumps(payload, ensure_ascii=False)
+                    except Exception:
+                        payload = str(payload)
+
+                cursor.execute(
+                    '''
+                    SELECT 1
+                    FROM sys.columns
+                    WHERE object_id = OBJECT_ID('VIDEO.FileAssembly')
+                      AND name = 'FileID'
+                    '''
+                )
+                has_file_id_col = cursor.fetchone() is not None
+
+                file_id_value = assembly_row.get('file_id')
+                if file_id_value is None:
+                    file_id_value = assembly_row.get('FileID')
+                if file_id_value is None:
+                    # Legacy schema compatibility: some DBs require FileID NOT NULL.
+                    file_id_value = vid_id
+
+                if has_file_id_col:
+                    cursor.execute(
+                        '''
+                        INSERT INTO VIDEO.FileAssembly (
+                            VidID,
+                            FileID,
+                            AssemblyOrder,
+                            AssemblyStage,
+                            InputPath,
+                            OutputPath,
+                            ToolName,
+                            CommandLine,
+                            AssemblyPayload
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''',
+                        (
+                            vid_id,
+                            int(file_id_value),
+                            int(assembly_row.get('assembly_order') or order),
+                            assembly_stage,
+                            input_path,
+                            output_path_for_row,
+                            tool_name,
+                            command_line,
+                            payload,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                    '''
+                    INSERT INTO VIDEO.FileAssembly (
+                        VidID,
+                        AssemblyOrder,
+                        AssemblyStage,
+                        InputPath,
+                        OutputPath,
+                        ToolName,
+                        CommandLine,
+                        AssemblyPayload
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        vid_id,
+                        int(assembly_row.get('assembly_order') or order),
+                        assembly_stage,
+                        input_path,
+                        output_path_for_row,
+                        tool_name,
+                        command_line,
+                        payload,
+                    ),
+                )
+
+            conn.commit()
+            return vid_id
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to save video output record: {e}")
+
+    def get_video_output_record(self, output_path: str, account_name: str = None) -> Optional[Dict[str, Any]]:
+        """Get a saved VIDEO.VideoOutput row by output path."""
+        self.ensure_video_output_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        if account_name is None:
+            account_name = self.account_name
+
+        cursor.execute(
+            '''
+            SELECT TOP 1
+                VidID,
+                AccountName,
+                OutputPath,
+                OutputFileName,
+                VideoFileTitle,
+                VideoFileDesc,
+                SourcePath,
+                SourceShortcode,
+                SelectedTopic,
+                FilePrefix,
+                FileIndex,
+                Modifier,
+                Separator,
+                PrependTopic,
+                OutputFolderMode,
+                OutputFolderPath,
+                CodecPreset,
+                CRF,
+                ResolutionPreset,
+                OutputWidth,
+                OutputHeight,
+                BackgroundMode,
+                BackgroundColor,
+                BackgroundImagePath,
+                AudioMode,
+                AudioFilePath,
+                AudioStartSeconds,
+                AudioEndSeconds,
+                CropX,
+                CropY,
+                CropWidth,
+                CropHeight,
+                TrimStartFrame,
+                TrimEndFrame,
+                SourceFrameCount,
+                SourceFps,
+                SourceDurationSeconds,
+                CreatedAt,
+                UpdatedAt
+            FROM VIDEO.VideoOutput
+            WHERE AccountName = ? AND OutputPath = ?
+            ORDER BY VidID DESC
+            ''',
+            (account_name, str(output_path).strip()),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return self._dict_from_row(cursor, row)
+
+    def get_video_audio_tracks(self, vid_id: int) -> List[Dict[str, Any]]:
+        """Get audio tracks linked to a VIDEO.VideoOutput row."""
+        self.ensure_video_output_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            '''
+            SELECT
+                AudioTrackID,
+                VidID,
+                TrackOrder,
+                TrackPath,
+                TrackName,
+                VolumePercent,
+                ClipStartSeconds,
+                ClipEndSeconds,
+                EnterFrame,
+                ExitFrame,
+                FadeInSeconds,
+                FadeOutSeconds,
+                CreatedAt
+            FROM VIDEO.AudioTracks
+            WHERE VidID = ?
+            ORDER BY TrackOrder ASC, AudioTrackID ASC
+            ''',
+            (int(vid_id),),
+        )
+
+        results = []
+        for row in cursor.fetchall():
+            results.append(self._dict_from_row(cursor, row))
+        return results
+
+    def get_video_file_assembly(self, vid_id: int) -> List[Dict[str, Any]]:
+        """Get file assembly rows linked to a VIDEO.VideoOutput row."""
+        self.ensure_video_output_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            '''
+            SELECT
+                FileAssemblyID,
+                VidID,
+                AssemblyOrder,
+                AssemblyStage,
+                InputPath,
+                OutputPath,
+                ToolName,
+                CommandLine,
+                AssemblyPayload,
+                CreatedAt
+            FROM VIDEO.FileAssembly
+            WHERE VidID = ?
+            ORDER BY AssemblyOrder ASC, FileAssemblyID ASC
+            ''',
+            (int(vid_id),),
+        )
+
+        results = []
+        for row in cursor.fetchall():
+            results.append(self._dict_from_row(cursor, row))
+        return results
+
+    def get_video_output_bundle(self, output_path: str, account_name: str = None) -> Optional[Dict[str, Any]]:
+        """Get a saved output record and its linked audio tracks."""
+        record = self.get_video_output_record(output_path, account_name=account_name)
+        if not record:
+            return None
+
+        record['audio_tracks'] = self.get_video_audio_tracks(record['VidID'])
+        record['file_assembly'] = self.get_video_file_assembly(record['VidID'])
+        record['applications'] = self.get_video_applications(record['VidID'])
+        record['nodes'] = self.get_video_nodes(record['VidID'])
+        return record
+
+    def save_video_application(
+        self,
+        vid_id: int,
+        technique_class_id: int,
+        technique_type_id: int,
+        tsid: Optional[int] = None,
+        key_technique: Optional[bool] = None,
+    ) -> int:
+        """Insert a VIDEO.Applications row and return inserted VidAID."""
+        self.ensure_video_output_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                '''
+                SELECT TOP 1 VidAID
+                FROM VIDEO.Applications
+                WHERE VidID = ?
+                  AND TechniqueClassID = ?
+                  AND TechniqueTypeID = ?
+                  AND TSID = ?
+                ''',
+                (
+                    int(vid_id),
+                    int(technique_class_id),
+                    int(technique_type_id),
+                    int(tsid) if tsid is not None else None,
+                ),
+            )
+            existing_row = cursor.fetchone()
+            if existing_row:
+                raise ValueError(
+                    f"Application already exists for VidID={int(vid_id)}, "
+                    f"TechniqueClassID={int(technique_class_id)}, "
+                    f"TechniqueTypeID={int(technique_type_id)}, TSID={int(tsid) if tsid is not None else 'NULL'}"
+                )
+
+            cursor.execute(
+                '''
+                INSERT INTO VIDEO.Applications (
+                    VidID,
+                    TechniqueClassID,
+                    TechniqueTypeID,
+                    TSID,
+                    AlternateTechniqueName,
+                    KeyTechnique,
+                    FormationID,
+                    PossessionStateID,
+                    PitchPositionID,
+                    ExerciseClassID,
+                    MuscleGroupID,
+                    EngagementMechanismID
+                )
+                OUTPUT INSERTED.VidAID
+                VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL)
+                ''',
+                (
+                    int(vid_id),
+                    int(technique_class_id),
+                    int(technique_type_id),
+                    int(tsid) if tsid is not None else None,
+                    (1 if key_technique is True else 0) if key_technique is not None else None,
+                ),
+            )
+            inserted_row = cursor.fetchone()
+            if not inserted_row:
+                raise Exception("Failed to obtain inserted VidAID")
+            conn.commit()
+            return int(inserted_row[0])
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to save video application: {e}")
+
+    def replace_video_applications(self, vid_id: int, applications: List[Dict[str, Any]]) -> None:
+        """Replace all VIDEO.Applications rows for a VidID with provided payload rows."""
+        self.ensure_video_output_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                '''
+                DELETE FROM VIDEO.Applications
+                WHERE VidID = ?
+                ''',
+                (int(vid_id),),
+            )
+
+            seen_keys = set()
+            for row in applications or []:
+                class_id = int(row.get('TechniqueClassID'))
+                type_id = int(row.get('TechniqueTypeID'))
+                tsid = int(row.get('TSID')) if row.get('TSID') is not None else None
+                key_technique = row.get('KeyTechnique')
+
+                dedupe_key = (class_id, type_id, tsid)
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+
+                cursor.execute(
+                    '''
+                    INSERT INTO VIDEO.Applications (
+                        VidID,
+                        TechniqueClassID,
+                        TechniqueTypeID,
+                        TSID,
+                        AlternateTechniqueName,
+                        KeyTechnique,
+                        FormationID,
+                        PossessionStateID,
+                        PitchPositionID,
+                        ExerciseClassID,
+                        MuscleGroupID,
+                        EngagementMechanismID
+                    )
+                    VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL)
+                    ''',
+                    (
+                        int(vid_id),
+                        class_id,
+                        type_id,
+                        tsid,
+                        (1 if bool(key_technique) else 0) if key_technique is not None else None,
+                    ),
+                )
+
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to replace video applications: {e}")
+
+    def get_video_applications(self, vid_id: int) -> List[Dict[str, Any]]:
+        """Get VIDEO.Applications rows for a VidID."""
+        self.ensure_video_output_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            '''
+            SELECT
+                VidAID,
+                VidID,
+                TechniqueClassID,
+                TechniqueTypeID,
+                TSID,
+                AlternateTechniqueName,
+                KeyTechnique,
+                FormationID,
+                PossessionStateID,
+                PitchPositionID,
+                ExerciseClassID,
+                MuscleGroupID,
+                EngagementMechanismID
+            FROM VIDEO.Applications
+            WHERE VidID = ?
+            ORDER BY VidAID ASC
+            ''',
+            (int(vid_id),),
+        )
+
+        results = []
+        for row in cursor.fetchall():
+            results.append(self._dict_from_row(cursor, row))
+        return results
+
+    def delete_video_application(self, vid_aid: int) -> bool:
+        """Delete a VIDEO.Applications row by VidAID."""
+        self.ensure_video_output_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                '''
+                DELETE FROM VIDEO.Applications
+                WHERE VidAID = ?
+                ''',
+                (int(vid_aid),),
+            )
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            return deleted
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to delete video application: {e}")
+
+    def ensure_video_node_tables(self):
+        """Ensure VIDEO.NodeOutput exists in a multi-row capable form."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.tables t
+                    INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = \'VIDEO\' AND t.name = \'NodeOutput\'
+                )
+                BEGIN
+                    CREATE TABLE VIDEO.NodeOutput (
+                        VidNID BIGINT IDENTITY(1,1) NOT NULL,
+                        VidID  BIGINT NOT NULL,
+                        FlowID BIGINT NULL,
+                        ParentNodeID BIGINT NULL,
+                        NodeName NVARCHAR(256) NULL,
+                        NodeDescription NVARCHAR(MAX) NULL,
+                        CONSTRAINT PK_NodeOutput PRIMARY KEY CLUSTERED (VidNID ASC),
+                        CONSTRAINT FK_NodeOutput_VideoOutput FOREIGN KEY (VidID)
+                            REFERENCES VIDEO.VideoOutput(VidID) ON DELETE CASCADE
+                    )
+                END
+            ''')
+            conn.commit()
+            cursor.execute('''
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE object_id = OBJECT_ID(\'VIDEO.NodeOutput\')
+                      AND name = \'IX_NodeOutput_VidID\'
+                )
+                BEGIN
+                    CREATE INDEX IX_NodeOutput_VidID
+                    ON VIDEO.NodeOutput(VidID, VidNID)
+                END
+            ''')
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to ensure VIDEO.NodeOutput table: {e}")
+
+    def replace_video_nodes(self, vid_id: int, nodes: List[Dict[str, Any]]) -> None:
+        """Replace all VIDEO.NodeOutput rows for a VidID with the provided list."""
+        self.ensure_video_node_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                'DELETE FROM VIDEO.NodeOutput WHERE VidID = ?',
+                (int(vid_id),),
+            )
+            for node in nodes or []:
+                node_name = (str(node.get('NodeName') or '')).strip() or None
+                cursor.execute(
+                    '''
+                    INSERT INTO VIDEO.NodeOutput
+                        (VidID, FlowID, ParentNodeID, NodeName, NodeDescription)
+                    VALUES (?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        int(vid_id),
+                        int(node['FlowID']) if node.get('FlowID') is not None else None,
+                        int(node['ParentNodeID']) if node.get('ParentNodeID') is not None else None,
+                        node_name,
+                        (str(node.get('NodeDescription') or '')).strip() or None,
+                    ),
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to replace video nodes: {e}")
+
+    def get_video_nodes(self, vid_id: int) -> List[Dict[str, Any]]:
+        """Get VIDEO.NodeOutput rows for a VidID."""
+        self.ensure_video_node_tables()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT VidNID, VidID, FlowID, ParentNodeID, NodeName, NodeDescription
+            FROM VIDEO.NodeOutput
+            WHERE VidID = ?
+            ORDER BY VidNID ASC
+            ''',
+            (int(vid_id),),
+        )
+        results = []
+        for row in cursor.fetchall():
+            results.append(self._dict_from_row(cursor, row))
+        return results
+
     def ensure_queue_table(self):
         """Ensure download queue table exists."""
         conn = self._get_connection()

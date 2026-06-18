@@ -129,7 +129,10 @@ class InstagramManager:
         
         try:
             logger.info(f"Fetching saved posts for {self.username}")
-            profile = instaloader.Profile.from_username(self.loader.context, self.username)
+            # Use the authenticated account from the active session. This is
+            # more robust than looking up by self.username, which may be a
+            # local/account identifier rather than an Instagram profile handle.
+            profile = instaloader.Profile.own_profile(self.loader.context)
             
             count = 0
             for post in profile.get_saved_posts():
@@ -162,8 +165,8 @@ class InstagramManager:
             return False, "Not logged in"
         
         try:
-            # Try to get the logged-in user's profile (lightweight operation)
-            profile = instaloader.Profile.from_username(self.loader.context, self.username)
+            # Validate session by resolving the authenticated profile directly.
+            profile = instaloader.Profile.own_profile(self.loader.context)
             # If we can get basic info without error, session is valid
             _ = profile.username
             

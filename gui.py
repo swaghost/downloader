@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import wave
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -24,11 +25,11 @@ from PyQt5.QtWidgets import (
     QGroupBox, QGridLayout, QInputDialog, QTableWidget, QTableWidgetItem,
     QSplitter, QHeaderView, QCheckBox, QDialog, QScrollArea, QFrame,
     QStackedWidget, QComboBox, QSpinBox, QToolTip, QSlider, QTreeWidget, QTreeWidgetItem,
-    QSizePolicy, QRadioButton, QButtonGroup, QDoubleSpinBox, QColorDialog, QLayout,
+    QSizePolicy, QRadioButton, QButtonGroup, QDoubleSpinBox, QColorDialog, QLayout, QAbstractItemView,
     QStyledItemDelegate, QStyleOptionViewItem, QStyle
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QMetaObject, Q_ARG, QSize, QTimer, QPoint, QUrl, QMutex, QRect, QEvent
-from PyQt5.QtGui import QPixmap, QColor, QFont, QImage, QPainter, QPen, QBrush, QPalette
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QMetaObject, Q_ARG, QSize, QTimer, QPoint, QUrl, QMutex, QRect, QEvent, QMimeData
+from PyQt5.QtGui import QPixmap, QColor, QFont, QImage, QPainter, QPen, QBrush, QPalette, QDrag, QTextCharFormat, QIntValidator
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 import logging
@@ -74,6 +75,7 @@ class Mp3DropListWidget(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.setDragEnabled(True)
         self.viewport().setAcceptDrops(True)
         self.viewport().installEventFilter(self)
 
@@ -132,6 +134,103 @@ class Mp3DropListWidget(QListWidget):
             return
 
         event.ignore()
+
+    def startDrag(self, supported_actions):
+        """Drag selected saved-music items as file URLs for cross-list drops."""
+        selected_items = self.selectedItems()
+        if not selected_items:
+            return
+
+        urls = []
+        for item in selected_items:
+            file_path = item.data(Qt.UserRole)
+            if file_path and os.path.exists(file_path):
+                urls.append(QUrl.fromLocalFile(file_path))
+
+        if not urls:
+            return
+
+        mime_data = QMimeData()
+        mime_data.setUrls(urls)
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag.exec_(Qt.CopyAction, Qt.CopyAction)
+
+
+class AudioTrackEditorListWidget(QListWidget):
+    """List widget supporting audio file drops and drag/drop reordering."""
+    files_dropped = pyqtSignal(list)
+    order_changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+
+    def _extract_supported_paths(self, mime_data):
+        if not mime_data:
+            return []
+
+        supported = ('.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg')
+        paths = []
+
+        if mime_data.hasUrls():
+            for url in mime_data.urls():
+                if not url.isLocalFile():
+                    continue
+                local_path = os.path.normpath(url.toLocalFile())
+                if str(local_path).lower().endswith(supported):
+                    paths.append(local_path)
+
+        # Accept text payloads too because some Qt drag sources emit text/uri-list or newline paths.
+        if not paths and mime_data.hasText():
+            raw_text = mime_data.text() or ''
+            for token in re.split(r'[\r\n]+', raw_text):
+                candidate = token.strip()
+                if not candidate:
+                    continue
+                if candidate.startswith('file:///'):
+                    local_path = QUrl(candidate).toLocalFile()
+                else:
+                    local_path = candidate.strip('"')
+                local_path = os.path.normpath(local_path)
+                if str(local_path).lower().endswith(supported):
+                    paths.append(local_path)
+
+        unique_paths = []
+        seen = set()
+        for path in paths:
+            norm_key = os.path.normcase(path)
+            if norm_key in seen:
+                continue
+            seen.add(norm_key)
+            unique_paths.append(path)
+        return unique_paths
+
+    def dragEnterEvent(self, event):
+        if self._extract_supported_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._extract_supported_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        file_paths = self._extract_supported_paths(event.mimeData())
+        if file_paths:
+            self.files_dropped.emit(file_paths)
+            event.acceptProposedAction()
+            return
+
+        super().dropEvent(event)
+        self.order_changed.emit()
 
 
 class PreserveTreeItemForegroundDelegate(QStyledItemDelegate):
@@ -249,9 +348,41 @@ class LoginThread(QThread):
             self.finished.emit(False, f"Error: {str(e)}")
 
 
+class SoccrTechniquesTestThread(QThread):
+    """Background thread for testing soccr_api_client techniques endpoint."""
+    test_completed = pyqtSignal(bool, str, float)
+
+    def __init__(self, configuration_factory):
+        super().__init__()
+        self.configuration_factory = configuration_factory
+
+    def run(self):
+        start_time = time.perf_counter()
+        try:
+            configuration = self.configuration_factory()
+            if configuration is None:
+                elapsed_s = time.perf_counter() - start_time
+                self.test_completed.emit(False, "Soccr API client is OFF. Select Dev or Prod first.", elapsed_s)
+                return
+
+            from soccr_api_client import ApiClient
+            from soccr_api_client.api.techniques_api import TechniquesApi
+
+            with ApiClient(configuration) as api_client:
+                api = TechniquesApi(api_client)
+                result = api.get_techniques_test()
+
+            elapsed_s = time.perf_counter() - start_time
+            self.test_completed.emit(True, str(result), elapsed_s)
+        except Exception as e:
+            elapsed_s = time.perf_counter() - start_time
+            self.test_completed.emit(False, str(e), elapsed_s)
+
+
 class LoadSavedThread(QThread):
     """Background thread for loading saved posts"""
     post_loaded = pyqtSignal(dict)  # individual post
+    duplicate_post_loaded = pyqtSignal(dict)  # duplicate post to show in green
     finished = pyqtSignal(int)  # total count
     error = pyqtSignal(str)
     duplicate_found = pyqtSignal(str)  # shortcode of duplicate post
@@ -296,10 +427,11 @@ class LoadSavedThread(QThread):
                 
                 if is_existing:
                     existing_count += 1
-                    # Don't add to UI - it's already in database
-                    # Just emit progress but skip UI update to avoid duplicates
+                    # Emit progress update
                     self.progress.emit(total_fetched, new_count, existing_count, shortcode)
-                    logger.debug(f"Skipping {shortcode} - already in database")
+                    # Emit as duplicate to show in green UI and skip downloading
+                    self.duplicate_post_loaded.emit(post)
+                    logger.debug(f"Duplicate found, showing in green: {shortcode}")
                     continue
                 else:
                     new_count += 1
@@ -1070,6 +1202,187 @@ class VideoTrimRangeSlider(QWidget):
         self.range_changed.emit(self._start, self._end)
 
 
+class TrackPositionSlider(VideoTrimRangeSlider):
+    """Range slider that supports resizing and moving a track interval."""
+    activated = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dragging_handle = None
+        self._dragging_body = False
+        self._body_drag_offset = 0
+        self.setMinimumHeight(32)
+        self.setCursor(Qt.OpenHandCursor)
+
+    def _selected_rect(self):
+        usable = self._usable_rect()
+        start_x = self._value_to_x(self._start)
+        end_x = self._value_to_x(self._end)
+        left = min(start_x, end_x)
+        right = max(start_x, end_x)
+        return QRect(left, usable.top(), max(1, right - left), usable.height())
+
+    def _pick_handle(self, pos):
+        start_rect = self._handle_rect(self._start)
+        end_rect = self._handle_rect(self._end)
+        if start_rect.adjusted(-6, -6, 6, 6).contains(pos):
+            return "start"
+        if end_rect.adjusted(-6, -6, 6, 6).contains(pos):
+            return "end"
+        if self._selected_rect().adjusted(-2, -6, 2, 6).contains(pos):
+            return "move"
+        return super()._pick_handle(pos)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        self.activated.emit()
+        self._dragging_handle = self._pick_handle(event.pos())
+        if self._dragging_handle == "move":
+            self._dragging_body = True
+            self._body_drag_offset = event.pos().x() - self._value_to_x(self._start)
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        self._dragging_body = False
+        self._update_from_x(event.pos().x())
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_body:
+            span = max(0, self._end - self._start)
+            if span <= 0:
+                return
+            new_start = self._x_to_value(event.pos().x() - self._body_drag_offset)
+            self._start = max(self._minimum, min(new_start, self._maximum - span))
+            self._end = min(self._maximum, self._start + span)
+            self.update()
+            self.range_changed.emit(self._start, self._end)
+            return
+        return super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging_body = False
+            self._dragging_handle = None
+            self.setCursor(Qt.OpenHandCursor)
+        return super().mouseReleaseEvent(event)
+
+
+class AudioTrackRangeSlider(VideoTrimRangeSlider):
+    """Range slider for track placement that supports dragging the full span."""
+    activated = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(34)
+        self._move_origin_start = 0
+        self._move_origin_end = 0
+        self._move_press_value = 0
+
+    def _selected_rect(self):
+        usable = self._usable_rect()
+        start_x = self._value_to_x(self._start)
+        end_x = self._value_to_x(self._end)
+        left = min(start_x, end_x)
+        right = max(start_x, end_x)
+        return QRect(left, usable.top(), max(1, right - left), usable.height())
+
+    def _pick_handle(self, pos):
+        start_rect = self._handle_rect(self._start)
+        end_rect = self._handle_rect(self._end)
+        if start_rect.adjusted(-6, -6, 6, 6).contains(pos):
+            return "start"
+        if end_rect.adjusted(-6, -6, 6, 6).contains(pos):
+            return "end"
+        if self._selected_rect().adjusted(-2, -6, 2, 6).contains(pos):
+            return "move"
+        start_dist = abs(pos.x() - start_rect.center().x())
+        end_dist = abs(pos.x() - end_rect.center().x())
+        return "start" if start_dist <= end_dist else "end"
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        self.activated.emit()
+        self._dragging_handle = self._pick_handle(event.pos())
+        if self._dragging_handle == "move":
+            self._move_origin_start = self._start
+            self._move_origin_end = self._end
+            self._move_press_value = self._x_to_value(event.pos().x())
+        self._update_from_x(event.pos().x())
+
+
+class AudioTrackTableWidget(QTableWidget):
+    """Table widget for track rows with drag/drop file addition support."""
+    files_dropped = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.viewport().installEventFilter(self)
+        self.setDefaultDropAction(Qt.CopyAction)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DropOnly)
+
+    def _extract_supported_paths(self, mime_data):
+        if not mime_data or not mime_data.hasUrls():
+            return []
+
+        supported = ('.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg')
+        paths = []
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            local_path = url.toLocalFile()
+            if str(local_path).lower().endswith(supported):
+                paths.append(local_path)
+        return paths
+
+    def dragEnterEvent(self, event):
+        if self._extract_supported_paths(event.mimeData()):
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._extract_supported_paths(event.mimeData()):
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        file_paths = self._extract_supported_paths(event.mimeData())
+        if file_paths:
+            self.files_dropped.emit(file_paths)
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            return
+        super().dropEvent(event)
+
+    def eventFilter(self, obj, event):
+        if obj is self.viewport() and event.type() in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
+            if event.type() == QEvent.Drop:
+                file_paths = self._extract_supported_paths(event.mimeData())
+                if file_paths:
+                    self.files_dropped.emit(file_paths)
+                    event.setDropAction(Qt.CopyAction)
+                    event.accept()
+                    return True
+                event.ignore()
+                return True
+
+            if self._extract_supported_paths(event.mimeData()):
+                event.setDropAction(Qt.CopyAction)
+                event.accept()
+                return True
+            event.ignore()
+            return True
+
+        return super().eventFilter(obj, event)
+
+
 class InstagramDownloaderGUI(QMainWindow):
     """Main application window"""
     
@@ -1095,6 +1408,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.fetch_initial_page = 0
         
         self.db_load_thread = None  # Thread for loading database entries
+        self.soccr_client_test_thread = None  # Thread for Soccr API test calls
         self.queued_shortcodes = set()  # Track shortcodes in download queue
         self.selected_tiles = set()  # Track selected tile shortcodes for batch operations
         self.carousel_indices = {}  # Track current index for carousel posts {shortcode: index}
@@ -1164,6 +1478,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_fps = 30.0
         self.vid_prep_duration_s = 0.0
         self.vid_prep_last_output_path = None
+        self.vid_prep_source_loop_enabled = False
         self.content_selected_topic = ''
         self.content_selected_topic_id = None
         self.content_current_page = 0
@@ -1178,12 +1493,28 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_folder_mode = self.account_manager.get_setting('vid_prep_output_folder_mode', 'same_as_input')
         self.vid_prep_output_folder_path = self.account_manager.get_setting('vid_prep_output_folder_path', '')
         self.vid_prep_audio_library = self._load_vid_prep_audio_library_setting()
+        self.vid_prep_sfx_library = self._load_vid_prep_sfx_library_setting()
+        self.vid_prep_audio_tracks = []
+        self.vid_prep_next_audio_track_id = 1
+        self._vid_prep_audio_track_editor_updating = False
+        self.vid_prep_current_vid_id = None
+        self.vid_prep_suggested_applications = []
+        self.vid_prep_suggested_applications_dirty = False
+        self.vid_prep_sports_cache = {}
+        self.vid_prep_suggested_nodes = []
+        self.vid_prep_suggested_nodes_dirty = False
+        self.vid_prep_technique_class_cache = {}
+        self.vid_prep_technique_type_cache = {}
+        self.vid_prep_series_cache = {}
         
         # Load settings BEFORE init_ui (which creates the checkboxes)
         self.auto_load_at_startup = self.account_manager.get_setting('auto_load_at_startup', 'true') == 'true'
         self.stop_at_first_duplicate = self.account_manager.get_setting('stop_at_first_duplicate', 'false') == 'true'
         self.auto_fetch_thumbnails = self.account_manager.get_setting('auto_fetch_thumbnails', 'false') == 'true'
         self.auto_fetch_new_thumbnails = self.account_manager.get_setting('auto_fetch_new_thumbnails', 'true') == 'true'
+        self.soccr_api_client_mode = config.normalize_soccr_api_client_mode(
+            self.account_manager.get_setting('soccr_api_client_mode', 'dev')
+        )
         
         self.init_ui()
         config.ensure_directories()
@@ -3322,6 +3653,13 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_source_stop_btn.clicked.connect(self.stop_vid_prep_source)
         source_controls.addWidget(self.vid_prep_source_stop_btn)
 
+        self.vid_prep_source_loop_btn = QPushButton("🔁 Loop Off")
+        self.vid_prep_source_loop_btn.setFixedHeight(24)
+        self.vid_prep_source_loop_btn.setFixedWidth(84)
+        self.vid_prep_source_loop_btn.setCheckable(True)
+        self.vid_prep_source_loop_btn.toggled.connect(self.on_vid_prep_source_loop_toggled)
+        source_controls.addWidget(self.vid_prep_source_loop_btn)
+
         self.vid_prep_full_crop_btn = QPushButton("Full Crop")
         self.vid_prep_full_crop_btn.setFixedHeight(24)
         self.vid_prep_full_crop_btn.setFixedWidth(76)
@@ -3532,6 +3870,7 @@ class InstagramDownloaderGUI(QMainWindow):
         preview_splitter.addWidget(output_panel_widget)
         preview_splitter.setStretchFactor(0, 1)
         preview_splitter.setStretchFactor(1, 1)
+        preview_splitter.handle(1).setEnabled(False)
         preview_splitter.splitterMoved.connect(self._enforce_vid_prep_equal_panel_widths)
         preview_splitter.setSizes([1, 1])
         preview_splitter.setChildrenCollapsible(False)
@@ -3567,64 +3906,178 @@ class InstagramDownloaderGUI(QMainWindow):
         audio_mode_row.addWidget(self.vid_prep_audio_mix_radio)
         audio_mode_row.addStretch()
         audio_layout.addLayout(audio_mode_row)
+        self.vid_prep_selected_audio_path = ''
 
-        mp3_row = QHBoxLayout()
-        mp3_row.addWidget(QLabel("Audio File:"))
-        self.vid_prep_mp3_path = QLineEdit()
-        self.vid_prep_mp3_path.setPlaceholderText("Choose audio file...")
-        self.vid_prep_mp3_path.textChanged.connect(self.on_vid_prep_audio_setting_changed)
-        mp3_row.addWidget(self.vid_prep_mp3_path)
-        mp3_browse = QPushButton("Browse...")
-        mp3_browse.clicked.connect(self.browse_vid_prep_mp3)
-        mp3_row.addWidget(mp3_browse)
-        audio_layout.addLayout(mp3_row)
+        library_lists_row = QHBoxLayout()
+        library_lists_row.setContentsMargins(0, 0, 0, 0)
+        library_lists_row.setSpacing(8)
 
-        library_header_row = QHBoxLayout()
-        library_header_row.addWidget(QLabel("Saved Music:"))
+        music_library_group = QGroupBox("Saved Music")
+        music_library_layout = QVBoxLayout(music_library_group)
+        music_library_layout.setContentsMargins(6, 6, 6, 6)
+        music_library_layout.setSpacing(4)
+        music_actions_row = QHBoxLayout()
         self.vid_prep_audio_library_add_btn = QPushButton("Add Files...")
         self.vid_prep_audio_library_add_btn.clicked.connect(self.add_vid_prep_audio_files)
-        library_header_row.addWidget(self.vid_prep_audio_library_add_btn)
+        music_actions_row.addWidget(self.vid_prep_audio_library_add_btn)
         self.vid_prep_audio_library_use_btn = QPushButton("Use Selected")
         self.vid_prep_audio_library_use_btn.clicked.connect(self.use_selected_vid_prep_audio)
-        library_header_row.addWidget(self.vid_prep_audio_library_use_btn)
+        music_actions_row.addWidget(self.vid_prep_audio_library_use_btn)
         self.vid_prep_audio_library_preview_btn = QPushButton("▶ Preview")
         self.vid_prep_audio_library_preview_btn.clicked.connect(self.preview_selected_vid_prep_audio)
         self.vid_prep_audio_library_preview_btn.setEnabled(False)
-        library_header_row.addWidget(self.vid_prep_audio_library_preview_btn)
+        music_actions_row.addWidget(self.vid_prep_audio_library_preview_btn)
         self.vid_prep_audio_library_remove_btn = QPushButton("Remove Selected")
         self.vid_prep_audio_library_remove_btn.clicked.connect(self.remove_selected_vid_prep_audio)
-        library_header_row.addWidget(self.vid_prep_audio_library_remove_btn)
-        library_header_row.addStretch()
-        audio_layout.addLayout(library_header_row)
+        music_actions_row.addWidget(self.vid_prep_audio_library_remove_btn)
+        music_actions_row.addStretch()
+        music_library_layout.addLayout(music_actions_row)
 
         self.vid_prep_audio_library_list = Mp3DropListWidget()
-        self.vid_prep_audio_library_list.setMinimumHeight(110)
-        self.vid_prep_audio_library_list.setMaximumHeight(220)
+        self.vid_prep_audio_library_list.setMinimumHeight(74)
+        self.vid_prep_audio_library_list.setMaximumHeight(146)
         self.vid_prep_audio_library_list.setToolTip("Saved music library. Drag and drop .mp3 files here to add them.")
         self.vid_prep_audio_library_list.currentItemChanged.connect(self.on_vid_prep_audio_library_selection_changed)
         self.vid_prep_audio_library_list.itemDoubleClicked.connect(lambda _item: self.use_selected_vid_prep_audio())
         self.vid_prep_audio_library_list.files_dropped.connect(self.on_vid_prep_audio_files_dropped)
-        audio_layout.addWidget(self.vid_prep_audio_library_list)
+        music_library_layout.addWidget(self.vid_prep_audio_library_list)
+        library_lists_row.addWidget(music_library_group, 1)
 
-        segment_row = QHBoxLayout()
-        segment_row.addWidget(QLabel("Start (s.ms):"))
-        self.vid_prep_mp3_start = QDoubleSpinBox()
-        self.vid_prep_mp3_start.setRange(0.0, 86400.0)
-        self.vid_prep_mp3_start.setDecimals(3)
-        self.vid_prep_mp3_start.setSingleStep(0.1)
-        self.vid_prep_mp3_start.valueChanged.connect(self.on_vid_prep_audio_setting_changed)
-        segment_row.addWidget(self.vid_prep_mp3_start)
+        sfx_library_group = QGroupBox("Sound Effects")
+        sfx_library_layout = QVBoxLayout(sfx_library_group)
+        sfx_library_layout.setContentsMargins(6, 6, 6, 6)
+        sfx_library_layout.setSpacing(4)
+        sfx_actions_row = QHBoxLayout()
+        self.vid_prep_sfx_library_add_btn = QPushButton("Add Files...")
+        self.vid_prep_sfx_library_add_btn.clicked.connect(self.add_vid_prep_sfx_files)
+        sfx_actions_row.addWidget(self.vid_prep_sfx_library_add_btn)
+        self.vid_prep_sfx_library_use_btn = QPushButton("Use Selected")
+        self.vid_prep_sfx_library_use_btn.clicked.connect(self.use_selected_vid_prep_sfx)
+        sfx_actions_row.addWidget(self.vid_prep_sfx_library_use_btn)
+        self.vid_prep_sfx_library_preview_btn = QPushButton("▶ Preview")
+        self.vid_prep_sfx_library_preview_btn.clicked.connect(self.preview_selected_vid_prep_sfx)
+        self.vid_prep_sfx_library_preview_btn.setEnabled(False)
+        sfx_actions_row.addWidget(self.vid_prep_sfx_library_preview_btn)
+        self.vid_prep_sfx_library_remove_btn = QPushButton("Remove Selected")
+        self.vid_prep_sfx_library_remove_btn.clicked.connect(self.remove_selected_vid_prep_sfx)
+        sfx_actions_row.addWidget(self.vid_prep_sfx_library_remove_btn)
+        sfx_actions_row.addStretch()
+        sfx_library_layout.addLayout(sfx_actions_row)
 
-        segment_row.addWidget(QLabel("End (s.ms):"))
-        self.vid_prep_mp3_end = QDoubleSpinBox()
-        self.vid_prep_mp3_end.setRange(0.0, 86400.0)
-        self.vid_prep_mp3_end.setDecimals(3)
-        self.vid_prep_mp3_end.setSingleStep(0.1)
-        self.vid_prep_mp3_end.setValue(30.0)
-        self.vid_prep_mp3_end.valueChanged.connect(self.on_vid_prep_audio_setting_changed)
-        segment_row.addWidget(self.vid_prep_mp3_end)
-        segment_row.addStretch()
-        audio_layout.addLayout(segment_row)
+        self.vid_prep_sfx_library_list = Mp3DropListWidget()
+        self.vid_prep_sfx_library_list.setMinimumHeight(74)
+        self.vid_prep_sfx_library_list.setMaximumHeight(146)
+        self.vid_prep_sfx_library_list.setToolTip("Sound effects library. Drag and drop .mp3 files here to add them.")
+        self.vid_prep_sfx_library_list.currentItemChanged.connect(self.on_vid_prep_sfx_library_selection_changed)
+        self.vid_prep_sfx_library_list.itemDoubleClicked.connect(lambda _item: self.use_selected_vid_prep_sfx())
+        self.vid_prep_sfx_library_list.files_dropped.connect(self.on_vid_prep_sfx_files_dropped)
+        sfx_library_layout.addWidget(self.vid_prep_sfx_library_list)
+        library_lists_row.addWidget(sfx_library_group, 1)
+
+        audio_layout.addLayout(library_lists_row)
+
+        tracks_group = QGroupBox("Audio Tracks Editor")
+        tracks_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tracks_layout = QVBoxLayout(tracks_group)
+        tracks_layout.setContentsMargins(8, 8, 8, 8)
+        tracks_layout.setSpacing(6)
+
+        tracks_info = QLabel("Drag/drop audio files below. Reorder by dragging list rows. Track settings are saved with each exported video.")
+        tracks_info.setWordWrap(True)
+        tracks_layout.addWidget(tracks_info)
+
+        track_actions = QHBoxLayout()
+        self.vid_prep_audio_track_add_btn = QPushButton("Add Tracks...")
+        self.vid_prep_audio_track_add_btn.clicked.connect(self.add_vid_prep_audio_tracks)
+        track_actions.addWidget(self.vid_prep_audio_track_add_btn)
+        self.vid_prep_audio_track_remove_btn = QPushButton("Remove Selected")
+        self.vid_prep_audio_track_remove_btn.clicked.connect(self.remove_selected_vid_prep_audio_track)
+        track_actions.addWidget(self.vid_prep_audio_track_remove_btn)
+        self.vid_prep_audio_track_clear_btn = QPushButton("Clear All")
+        self.vid_prep_audio_track_clear_btn.clicked.connect(self.clear_vid_prep_audio_tracks)
+        track_actions.addWidget(self.vid_prep_audio_track_clear_btn)
+        track_actions.addStretch()
+        tracks_layout.addLayout(track_actions)
+
+        self.vid_prep_audio_track_list = AudioTrackTableWidget()
+        self.vid_prep_audio_track_list.setMinimumHeight(128)
+        self.vid_prep_audio_track_list.setMaximumHeight(188)
+        self.vid_prep_audio_track_list.setToolTip("Drop audio files here to create tracks. Use the row buttons to move tracks up/down.")
+        self.vid_prep_audio_track_list.setColumnCount(4)
+        self.vid_prep_audio_track_list.setHorizontalHeaderLabels(["Track #", "File Name", "Track Position", ""])
+        self.vid_prep_audio_track_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.vid_prep_audio_track_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.vid_prep_audio_track_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.vid_prep_audio_track_list.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.vid_prep_audio_track_list.setColumnWidth(1, 180)
+        self.vid_prep_audio_track_list.setColumnWidth(3, 30)
+        self.vid_prep_audio_track_list.verticalHeader().setDefaultSectionSize(38)
+        self.vid_prep_audio_track_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.vid_prep_audio_track_list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.vid_prep_audio_track_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.vid_prep_audio_track_list.itemSelectionChanged.connect(self.on_vid_prep_audio_track_selection_changed)
+        self.vid_prep_audio_track_list.files_dropped.connect(self.on_vid_prep_audio_tracks_dropped)
+        tracks_layout.addWidget(self.vid_prep_audio_track_list)
+
+        track_editor_grid = QGridLayout()
+        track_editor_grid.setHorizontalSpacing(6)
+        track_editor_grid.setVerticalSpacing(4)
+
+        track_editor_grid.addWidget(QLabel("Volume (%):"), 0, 0)
+        self.vid_prep_track_volume_spin = QDoubleSpinBox()
+        self.vid_prep_track_volume_spin.setRange(0.0, 400.0)
+        self.vid_prep_track_volume_spin.setDecimals(1)
+        self.vid_prep_track_volume_spin.setSingleStep(5.0)
+        self.vid_prep_track_volume_spin.setValue(100.0)
+        self.vid_prep_track_volume_spin.valueChanged.connect(self.on_vid_prep_audio_track_editor_changed)
+        track_editor_grid.addWidget(self.vid_prep_track_volume_spin, 0, 1)
+
+        track_editor_grid.addWidget(QLabel("Clip Start (s):"), 0, 2)
+        self.vid_prep_track_clip_start_spin = QDoubleSpinBox()
+        self.vid_prep_track_clip_start_spin.setRange(0.0, 86400.0)
+        self.vid_prep_track_clip_start_spin.setDecimals(3)
+        self.vid_prep_track_clip_start_spin.setSingleStep(0.1)
+        self.vid_prep_track_clip_start_spin.valueChanged.connect(self.on_vid_prep_audio_track_editor_changed)
+        track_editor_grid.addWidget(self.vid_prep_track_clip_start_spin, 0, 3)
+
+        track_editor_grid.addWidget(QLabel("Clip End (s):"), 0, 4)
+        self.vid_prep_track_clip_end_spin = QDoubleSpinBox()
+        self.vid_prep_track_clip_end_spin.setRange(0.0, 86400.0)
+        self.vid_prep_track_clip_end_spin.setDecimals(3)
+        self.vid_prep_track_clip_end_spin.setSingleStep(0.1)
+        self.vid_prep_track_clip_end_spin.valueChanged.connect(self.on_vid_prep_audio_track_editor_changed)
+        track_editor_grid.addWidget(self.vid_prep_track_clip_end_spin, 0, 5)
+
+        track_editor_grid.addWidget(QLabel("Enter Frame:"), 1, 0)
+        self.vid_prep_track_enter_frame_spin = QSpinBox()
+        self.vid_prep_track_enter_frame_spin.setRange(0, 2147483647)
+        self.vid_prep_track_enter_frame_spin.valueChanged.connect(self.on_vid_prep_audio_track_editor_changed)
+        track_editor_grid.addWidget(self.vid_prep_track_enter_frame_spin, 1, 1)
+
+        track_editor_grid.addWidget(QLabel("Exit Frame:"), 1, 2)
+        self.vid_prep_track_exit_frame_spin = QSpinBox()
+        self.vid_prep_track_exit_frame_spin.setRange(0, 2147483647)
+        self.vid_prep_track_exit_frame_spin.valueChanged.connect(self.on_vid_prep_audio_track_editor_changed)
+        track_editor_grid.addWidget(self.vid_prep_track_exit_frame_spin, 1, 3)
+
+        track_editor_grid.addWidget(QLabel("Fade In (s):"), 1, 4)
+        self.vid_prep_track_fade_in_spin = QDoubleSpinBox()
+        self.vid_prep_track_fade_in_spin.setRange(0.0, 60.0)
+        self.vid_prep_track_fade_in_spin.setDecimals(3)
+        self.vid_prep_track_fade_in_spin.setSingleStep(0.1)
+        self.vid_prep_track_fade_in_spin.valueChanged.connect(self.on_vid_prep_audio_track_editor_changed)
+        track_editor_grid.addWidget(self.vid_prep_track_fade_in_spin, 1, 5)
+
+        track_editor_grid.addWidget(QLabel("Fade Out (s):"), 2, 0)
+        self.vid_prep_track_fade_out_spin = QDoubleSpinBox()
+        self.vid_prep_track_fade_out_spin.setRange(0.0, 60.0)
+        self.vid_prep_track_fade_out_spin.setDecimals(3)
+        self.vid_prep_track_fade_out_spin.setSingleStep(0.1)
+        self.vid_prep_track_fade_out_spin.valueChanged.connect(self.on_vid_prep_audio_track_editor_changed)
+        track_editor_grid.addWidget(self.vid_prep_track_fade_out_spin, 2, 1)
+
+        tracks_layout.addLayout(track_editor_grid)
+        output_panel.addWidget(tracks_group, 0, Qt.AlignTop)
 
         output_group = QGroupBox("Output Filename")
         output_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -3862,28 +4315,208 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_save_btn = QPushButton("Save Cropped")
         self.vid_prep_save_btn.setStyleSheet("QPushButton { background-color: #0078d4; color: white; font-weight: bold; padding: 8px 16px; }")
         self.vid_prep_save_btn.clicked.connect(self.save_vid_prep_output)
+        self.vid_prep_load_saved_btn = QPushButton("Load Saved...")
+        self.vid_prep_load_saved_btn.clicked.connect(self.load_vid_prep_saved_output_record)
         self.vid_prep_open_saved_btn = QPushButton("File Explorer")
         self.vid_prep_open_saved_btn.setEnabled(False)
         self.vid_prep_open_saved_btn.setToolTip("Enabled after a successful save")
         self.vid_prep_open_saved_btn.clicked.connect(self.open_vid_prep_saved_file_in_explorer)
         self.vid_prep_preview_params_btn.setMinimumHeight(34)
         self.vid_prep_save_btn.setMinimumHeight(34)
+        self.vid_prep_load_saved_btn.setMinimumHeight(34)
         self.vid_prep_open_saved_btn.setMinimumHeight(34)
         self.vid_prep_preview_params_btn.setMinimumWidth(120)
         self.vid_prep_save_btn.setMinimumWidth(120)
+        self.vid_prep_load_saved_btn.setMinimumWidth(120)
         self.vid_prep_open_saved_btn.setMinimumWidth(120)
         self.vid_prep_preview_params_btn.setMaximumWidth(160)
         self.vid_prep_save_btn.setMaximumWidth(160)
+        self.vid_prep_load_saved_btn.setMaximumWidth(160)
         self.vid_prep_open_saved_btn.setMaximumWidth(170)
         self.vid_prep_preview_params_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.vid_prep_save_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.vid_prep_load_saved_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.vid_prep_open_saved_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         right_actions_row = QHBoxLayout()
         right_actions_row.setContentsMargins(0, 0, 0, 0)
         right_actions_row.addWidget(self.vid_prep_preview_params_btn)
         right_actions_row.addWidget(self.vid_prep_save_btn)
+        right_actions_row.addWidget(self.vid_prep_load_saved_btn)
         right_actions_row.addWidget(self.vid_prep_open_saved_btn)
+
+        video_notes_group = QGroupBox("Video Notes")
+        video_notes_layout = QGridLayout(video_notes_group)
+        video_notes_layout.setContentsMargins(8, 8, 8, 8)
+        video_notes_layout.setHorizontalSpacing(6)
+        video_notes_layout.setVerticalSpacing(4)
+
+        video_notes_layout.addWidget(QLabel("Suggested Title:"), 0, 0)
+        self.vid_prep_video_title_input = QLineEdit()
+        self.vid_prep_video_title_input.setPlaceholderText("Suggested upload title")
+        self.vid_prep_video_title_input.textChanged.connect(self.on_vid_prep_video_notes_changed)
+        video_notes_layout.addWidget(self.vid_prep_video_title_input, 0, 1)
+
+        video_notes_layout.addWidget(QLabel("Suggested Description:"), 1, 0, Qt.AlignTop)
+        _desc_container = QWidget()
+        _desc_vbox = QVBoxLayout(_desc_container)
+        _desc_vbox.setContentsMargins(0, 0, 0, 0)
+        _desc_vbox.setSpacing(2)
+        _desc_toolbar = QHBoxLayout()
+        _desc_toolbar.setContentsMargins(0, 0, 0, 0)
+        _desc_toolbar.setSpacing(2)
+        self.vid_prep_desc_bold_btn = QPushButton("B")
+        self.vid_prep_desc_bold_btn.setFixedSize(22, 22)
+        self.vid_prep_desc_bold_btn.setCheckable(True)
+        self.vid_prep_desc_bold_btn.setStyleSheet("font-weight: bold; padding: 0px;")
+        self.vid_prep_desc_bold_btn.setToolTip("Bold (Ctrl+B)")
+        self.vid_prep_desc_italic_btn = QPushButton("I")
+        self.vid_prep_desc_italic_btn.setFixedSize(22, 22)
+        self.vid_prep_desc_italic_btn.setCheckable(True)
+        self.vid_prep_desc_italic_btn.setStyleSheet("font-style: italic; padding: 0px;")
+        self.vid_prep_desc_italic_btn.setToolTip("Italic (Ctrl+I)")
+        self.vid_prep_desc_underline_btn = QPushButton("U")
+        self.vid_prep_desc_underline_btn.setFixedSize(22, 22)
+        self.vid_prep_desc_underline_btn.setCheckable(True)
+        self.vid_prep_desc_underline_btn.setStyleSheet("text-decoration: underline; padding: 0px;")
+        self.vid_prep_desc_underline_btn.setToolTip("Underline (Ctrl+U)")
+        _desc_toolbar.addWidget(self.vid_prep_desc_bold_btn)
+        _desc_toolbar.addWidget(self.vid_prep_desc_italic_btn)
+        _desc_toolbar.addWidget(self.vid_prep_desc_underline_btn)
+        _desc_toolbar.addStretch()
+        _desc_vbox.addLayout(_desc_toolbar)
+        self.vid_prep_video_desc_input = QTextEdit()
+        self.vid_prep_video_desc_input.setAcceptRichText(True)
+        self.vid_prep_video_desc_input.setPlaceholderText("Suggested upload description (supports bold, italic, underline)")
+        self.vid_prep_video_desc_input.setMinimumHeight(84)
+        self.vid_prep_video_desc_input.textChanged.connect(self.on_vid_prep_video_notes_changed)
+        self.vid_prep_video_desc_input.currentCharFormatChanged.connect(self._sync_vid_prep_desc_toolbar)
+        self.vid_prep_desc_bold_btn.toggled.connect(lambda on: self._apply_vid_prep_desc_format('bold', on))
+        self.vid_prep_desc_italic_btn.toggled.connect(lambda on: self._apply_vid_prep_desc_format('italic', on))
+        self.vid_prep_desc_underline_btn.toggled.connect(lambda on: self._apply_vid_prep_desc_format('underline', on))
+        _desc_vbox.addWidget(self.vid_prep_video_desc_input)
+        video_notes_layout.addWidget(_desc_container, 1, 1)
+
+        video_notes_layout.addWidget(QLabel("Suggested Applications:"), 2, 0, Qt.AlignTop)
+        suggested_apps_widget = QWidget()
+        suggested_apps_layout = QVBoxLayout(suggested_apps_widget)
+        suggested_apps_layout.setContentsMargins(0, 0, 0, 0)
+        suggested_apps_layout.setSpacing(6)
+
+        apps_editor_layout = QGridLayout()
+        apps_editor_layout.setContentsMargins(0, 0, 0, 0)
+        apps_editor_layout.setHorizontalSpacing(6)
+        apps_editor_layout.setVerticalSpacing(6)
+
+        self.vid_prep_sport_combo = QComboBox()
+        self.vid_prep_sport_combo.currentIndexChanged.connect(self.on_vid_prep_sport_changed)
+        self.vid_prep_technique_class_combo = QComboBox()
+        self.vid_prep_technique_class_combo.currentIndexChanged.connect(self.on_vid_prep_technique_class_changed)
+        self.vid_prep_technique_type_combo = QComboBox()
+        self.vid_prep_technique_type_combo.currentIndexChanged.connect(self.on_vid_prep_technique_type_changed)
+        self.vid_prep_series_combo = QComboBox()
+        self.vid_prep_series_combo.currentIndexChanged.connect(lambda _idx: self.update_vid_prep_add_application_state())
+
+        apps_editor_layout.addWidget(self.vid_prep_sport_combo, 0, 0)
+        apps_editor_layout.addWidget(self.vid_prep_technique_class_combo, 0, 1)
+        apps_editor_layout.addWidget(self.vid_prep_technique_type_combo, 1, 0)
+        apps_editor_layout.addWidget(self.vid_prep_series_combo, 1, 1)
+
+        self.vid_prep_add_application_btn = QPushButton("Add")
+        self.vid_prep_add_application_btn.setEnabled(False)
+        self.vid_prep_add_application_btn.clicked.connect(self.on_vid_prep_add_application_clicked)
+        apps_editor_layout.addWidget(self.vid_prep_add_application_btn, 2, 1)
+
+        self.vid_prep_key_technique_check = QCheckBox("Key Technique")
+        self.vid_prep_key_technique_check.setChecked(False)
+        apps_editor_layout.addWidget(self.vid_prep_key_technique_check, 2, 0)
+
+        self.vid_prep_apps_loading_label = QLabel("")
+        self.vid_prep_apps_loading_label.setStyleSheet("color: #666666; font-size: 9pt;")
+        apps_editor_layout.addWidget(self.vid_prep_apps_loading_label, 3, 0, 1, 2)
+        suggested_apps_layout.addLayout(apps_editor_layout)
+
+        self.vid_prep_applications_table = QTableWidget(0, 7)
+        self.vid_prep_applications_table.setHorizontalHeaderLabels([
+            "#",
+            "SPORT",
+            "CLASS NAME",
+            "TECHNIQUE TYPE NAME",
+            "SERIES NAME",
+            "KEY",
+            "Delete",
+        ])
+        self.vid_prep_applications_table.verticalHeader().setVisible(False)
+        self.vid_prep_applications_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.vid_prep_applications_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.vid_prep_applications_table.setFocusPolicy(Qt.NoFocus)
+        self.vid_prep_applications_table.setMinimumHeight(170)
+        self.vid_prep_applications_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.vid_prep_applications_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.vid_prep_applications_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.vid_prep_applications_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.vid_prep_applications_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.vid_prep_applications_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.vid_prep_applications_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        suggested_apps_layout.addWidget(self.vid_prep_applications_table)
+
+        video_notes_layout.addWidget(suggested_apps_widget, 2, 1)
+
+        # === Suggested Nodes ===
+        video_notes_layout.addWidget(QLabel("Suggested Nodes:"), 3, 0, Qt.AlignTop)
+        _nodes_widget = QWidget()
+        _nodes_layout = QVBoxLayout(_nodes_widget)
+        _nodes_layout.setContentsMargins(0, 0, 0, 0)
+        _nodes_layout.setSpacing(6)
+
+        _nodes_form = QGridLayout()
+        _nodes_form.setContentsMargins(0, 0, 0, 0)
+        _nodes_form.setHorizontalSpacing(6)
+        _nodes_form.setVerticalSpacing(4)
+
+        _nodes_form.addWidget(QLabel("Flow ID:"), 0, 0)
+        self.vid_prep_node_flow_combo = QComboBox()
+        self.vid_prep_node_flow_combo.addItem("(No Flow)", -1)
+        self.vid_prep_node_flow_combo.setToolTip("Select a Flow (list will be populated later)")
+        _nodes_form.addWidget(self.vid_prep_node_flow_combo, 0, 1)
+
+        _nodes_form.addWidget(QLabel("Parent Node ID:"), 1, 0)
+        self.vid_prep_node_parent_id_input = QLineEdit()
+        self.vid_prep_node_parent_id_input.setPlaceholderText("Optional integer parent ID")
+        self.vid_prep_node_parent_id_input.setValidator(QIntValidator(0, 2147483647, self))
+        _nodes_form.addWidget(self.vid_prep_node_parent_id_input, 1, 1)
+
+        _nodes_form.addWidget(QLabel("Node Name:"), 2, 0)
+        self.vid_prep_node_name_input = QLineEdit()
+        self.vid_prep_node_name_input.setPlaceholderText("Node name (max 256 chars)")
+        self.vid_prep_node_name_input.setMaxLength(256)
+        _nodes_form.addWidget(self.vid_prep_node_name_input, 2, 1)
+
+        _nodes_form.addWidget(QLabel("Node Description:"), 3, 0, Qt.AlignTop)
+        self.vid_prep_node_description_input = QTextEdit()
+        self.vid_prep_node_description_input.setPlaceholderText("Node description")
+        self.vid_prep_node_description_input.setMinimumHeight(64)
+        _nodes_form.addWidget(self.vid_prep_node_description_input, 3, 1)
+
+        self.vid_prep_add_node_btn = QPushButton("Add Node")
+        self.vid_prep_add_node_btn.clicked.connect(self.on_vid_prep_add_node_clicked)
+        _nodes_form.addWidget(self.vid_prep_add_node_btn, 4, 1)
+        _nodes_layout.addLayout(_nodes_form)
+
+        self.vid_prep_nodes_table = QTableWidget(0, 5)
+        self.vid_prep_nodes_table.setHorizontalHeaderLabels(["#", "Flow", "Parent Node ID", "Node Name", "Delete"])
+        self.vid_prep_nodes_table.verticalHeader().setVisible(False)
+        self.vid_prep_nodes_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.vid_prep_nodes_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.vid_prep_nodes_table.setFocusPolicy(Qt.NoFocus)
+        self.vid_prep_nodes_table.setMinimumHeight(120)
+        self.vid_prep_nodes_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.vid_prep_nodes_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.vid_prep_nodes_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.vid_prep_nodes_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.vid_prep_nodes_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        _nodes_layout.addWidget(self.vid_prep_nodes_table)
+        video_notes_layout.addWidget(_nodes_widget, 3, 1)
 
         right_sidebar_widget = QWidget()
         right_sidebar_widget.setFixedWidth(680)
@@ -3896,6 +4529,7 @@ class InstagramDownloaderGUI(QMainWindow):
         right_sidebar.addWidget(background_group)
         right_sidebar.addWidget(audio_group)
         right_sidebar.addLayout(right_actions_row)
+        right_sidebar.addWidget(video_notes_group)
         right_sidebar.addStretch()
 
         right_sidebar_scroll = QScrollArea()
@@ -3945,28 +4579,33 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_trim_end_frame = 0
         self.vid_prep_saved_output_path = None
         self._set_vid_prep_output_preview_dirty(True)
+        self._refresh_vid_prep_audio_track_list()
+        self._set_vid_prep_audio_track_editor_enabled(False)
 
         self.update_vid_prep_resolution_ui()
         self.update_vid_prep_background_mode_ui()
         self.update_vid_prep_audio_mode_ui()
         self.refresh_vid_prep_audio_library_list()
+        self.refresh_vid_prep_sfx_library_list()
         self._load_vid_prep_ui_settings()
         self._enforce_vid_prep_equal_panel_widths()
         QTimer.singleShot(0, self._enforce_vid_prep_equal_panel_widths)
         self.on_vid_prep_output_folder_mode_changed(self.vid_prep_output_folder_mode_combo.currentText())
         self.update_vid_prep_output_filename_preview()
+        self.initialize_vid_prep_suggested_applications_editor()
+        self.refresh_vid_prep_suggested_nodes_table()
         self.tabs.addTab(tab, "Vid Prep")
 
     def update_vid_prep_audio_mode_ui(self):
         """Enable/disable MP3 controls based on selected audio mode."""
         use_mp3 = self.vid_prep_audio_replace_radio.isChecked() or self.vid_prep_audio_mix_radio.isChecked()
-        self.vid_prep_mp3_path.setEnabled(use_mp3)
         # Keep list enabled so drag/drop of MP3 files always works.
         self.vid_prep_audio_library_list.setEnabled(True)
+        self.vid_prep_sfx_library_list.setEnabled(True)
         self.vid_prep_audio_library_add_btn.setEnabled(use_mp3)
-        self.vid_prep_mp3_start.setEnabled(use_mp3)
-        self.vid_prep_mp3_end.setEnabled(use_mp3)
+        self.vid_prep_sfx_library_add_btn.setEnabled(use_mp3)
         self._update_vid_prep_audio_library_buttons()
+        self._update_vid_prep_sfx_library_buttons()
         self._save_vid_prep_ui_settings()
         self._set_vid_prep_output_preview_dirty(True)
 
@@ -4000,9 +4639,38 @@ class InstagramDownloaderGUI(QMainWindow):
             normalized_paths.append(normalized)
         return normalized_paths
 
+    def _load_vid_prep_sfx_library_setting(self):
+        """Load the saved sound effects list from global settings."""
+        raw_value = self.account_manager.get_setting('vid_prep_sfx_library', '[]')
+        try:
+            parsed = json.loads(raw_value)
+        except Exception:
+            logger.warning("Failed to parse vid_prep_sfx_library setting; resetting to empty list")
+            return []
+
+        if not isinstance(parsed, list):
+            return []
+
+        normalized_paths = []
+        seen_paths = set()
+        for value in parsed:
+            normalized = self._normalize_vid_prep_audio_path(value)
+            if not normalized:
+                continue
+            compare_value = os.path.normcase(normalized)
+            if compare_value in seen_paths:
+                continue
+            seen_paths.add(compare_value)
+            normalized_paths.append(normalized)
+        return normalized_paths
+
     def _save_vid_prep_audio_library_setting(self):
         """Persist the saved music list in global settings."""
         self.account_manager.set_setting('vid_prep_audio_library', json.dumps(self.vid_prep_audio_library))
+
+    def _save_vid_prep_sfx_library_setting(self):
+        """Persist the saved sound effects list in global settings."""
+        self.account_manager.set_setting('vid_prep_sfx_library', json.dumps(self.vid_prep_sfx_library))
 
     def _normalize_vid_prep_audio_path(self, file_path):
         """Normalize saved music paths for stable storage and comparison."""
@@ -4015,7 +4683,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if not hasattr(self, 'vid_prep_audio_library_list'):
             return
 
-        normalized_selected = self._normalize_vid_prep_audio_path(selected_path or self.vid_prep_mp3_path.text())
+        normalized_selected = self._normalize_vid_prep_audio_path(selected_path or self.vid_prep_selected_audio_path)
         selected_row = -1
         self.vid_prep_audio_library_list.clear()
 
@@ -4056,9 +4724,59 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_music_preview_player.stop()
             self.vid_prep_preview_audio_path = ''
 
+    def refresh_vid_prep_sfx_library_list(self, selected_path=None):
+        """Rebuild the saved sound effects list widget from persisted state."""
+        if not hasattr(self, 'vid_prep_sfx_library_list'):
+            return
+
+        normalized_selected = self._normalize_vid_prep_audio_path(selected_path or self.vid_prep_selected_audio_path)
+        selected_row = -1
+        self.vid_prep_sfx_library_list.clear()
+
+        for index, file_path in enumerate(self.vid_prep_sfx_library):
+            display_name = os.path.basename(file_path) or file_path
+            if not os.path.exists(file_path):
+                display_name = f"{display_name} (missing)"
+            item = QListWidgetItem(display_name)
+            item.setData(Qt.UserRole, file_path)
+            item.setToolTip(file_path)
+            self.vid_prep_sfx_library_list.addItem(item)
+            if os.path.normcase(file_path) == os.path.normcase(normalized_selected):
+                selected_row = index
+
+        if selected_row >= 0:
+            self.vid_prep_sfx_library_list.setCurrentRow(selected_row)
+
+        self._update_vid_prep_sfx_library_buttons()
+
+    def _get_selected_vid_prep_sfx_path(self):
+        """Return the currently selected sound effects path."""
+        if not hasattr(self, 'vid_prep_sfx_library_list'):
+            return ''
+        current_item = self.vid_prep_sfx_library_list.currentItem()
+        if not current_item:
+            return ''
+        return self._normalize_vid_prep_audio_path(current_item.data(Qt.UserRole))
+
+    def _update_vid_prep_sfx_library_buttons(self):
+        """Keep sound effects actions in sync with the current selection and mode."""
+        use_mp3 = self.vid_prep_audio_replace_radio.isChecked() or self.vid_prep_audio_mix_radio.isChecked()
+        has_selection = bool(self._get_selected_vid_prep_sfx_path())
+        self.vid_prep_sfx_library_use_btn.setEnabled(use_mp3 and has_selection)
+        self.vid_prep_sfx_library_remove_btn.setEnabled(use_mp3 and has_selection)
+        self.vid_prep_sfx_library_preview_btn.setEnabled(has_selection)
+
+        if not has_selection and hasattr(self, 'vid_prep_music_preview_player'):
+            self.vid_prep_music_preview_player.stop()
+            self.vid_prep_preview_audio_path = ''
+
     def on_vid_prep_audio_library_selection_changed(self, current, previous):
         """Refresh button state when the saved music selection changes."""
         self._update_vid_prep_audio_library_buttons()
+
+    def on_vid_prep_sfx_library_selection_changed(self, current, previous):
+        """Refresh button state when the sound effects selection changes."""
+        self._update_vid_prep_sfx_library_buttons()
 
     def on_vid_prep_music_preview_state_changed(self, state):
         """Update Preview button label based on current playback state."""
@@ -4066,9 +4784,15 @@ class InstagramDownloaderGUI(QMainWindow):
             return
 
         if state == QMediaPlayer.PlayingState:
-            self.vid_prep_audio_library_preview_btn.setText("⏹ Stop")
+            if hasattr(self, 'vid_prep_audio_library_preview_btn'):
+                self.vid_prep_audio_library_preview_btn.setText("⏹ Stop")
+            if hasattr(self, 'vid_prep_sfx_library_preview_btn'):
+                self.vid_prep_sfx_library_preview_btn.setText("⏹ Stop")
         else:
-            self.vid_prep_audio_library_preview_btn.setText("▶ Preview")
+            if hasattr(self, 'vid_prep_audio_library_preview_btn'):
+                self.vid_prep_audio_library_preview_btn.setText("▶ Preview")
+            if hasattr(self, 'vid_prep_sfx_library_preview_btn'):
+                self.vid_prep_sfx_library_preview_btn.setText("▶ Preview")
 
     def preview_selected_vid_prep_audio(self):
         """Preview/stop the currently selected saved music file."""
@@ -4160,7 +4884,8 @@ class InstagramDownloaderGUI(QMainWindow):
         if not selected_path:
             return
 
-        self.vid_prep_mp3_path.setText(selected_path)
+        self.vid_prep_selected_audio_path = selected_path
+        self.on_vid_prep_audio_tracks_dropped([selected_path])
         self.vid_prep_audio_replace_radio.setChecked(True)
         self.refresh_vid_prep_audio_library_list(selected_path)
         self.on_vid_prep_audio_setting_changed()
@@ -4178,6 +4903,1257 @@ class InstagramDownloaderGUI(QMainWindow):
         ]
         self._save_vid_prep_audio_library_setting()
         self.refresh_vid_prep_audio_library_list()
+
+    def preview_selected_vid_prep_sfx(self):
+        """Preview/stop the currently selected sound effects file."""
+        selected_path = self._get_selected_vid_prep_sfx_path()
+        if not selected_path:
+            return
+
+        if not os.path.exists(selected_path):
+            QMessageBox.warning(self, "Vid Prep", "Selected sound effect file does not exist on disk.")
+            return
+
+        current_state = self.vid_prep_music_preview_player.state()
+        if (
+            current_state == QMediaPlayer.PlayingState
+            and os.path.normcase(self.vid_prep_preview_audio_path) == os.path.normcase(selected_path)
+        ):
+            self.vid_prep_music_preview_player.stop()
+            self.vid_prep_preview_audio_path = ''
+            return
+
+        self.vid_prep_music_preview_player.stop()
+        self.vid_prep_preview_audio_path = selected_path
+        self.vid_prep_music_preview_player.setMedia(QMediaContent(QUrl.fromLocalFile(selected_path)))
+        self.vid_prep_music_preview_player.play()
+
+    def add_vid_prep_sfx_to_library(self, file_path, select_added=False):
+        """Add a sound effect file to the persistent saved list if it is not already present."""
+        normalized = self._normalize_vid_prep_audio_path(file_path)
+        if not normalized:
+            return False
+
+        compare_value = os.path.normcase(normalized)
+        if any(os.path.normcase(existing_path) == compare_value for existing_path in self.vid_prep_sfx_library):
+            if select_added:
+                self.refresh_vid_prep_sfx_library_list(normalized)
+            return False
+
+        self.vid_prep_sfx_library.append(normalized)
+        self._save_vid_prep_sfx_library_setting()
+        self.refresh_vid_prep_sfx_library_list(normalized if select_added else None)
+        return True
+
+    def add_vid_prep_sfx_files(self):
+        """Browse for one or more sound effect files to save for reuse."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add Sound Effects",
+            "",
+            "Audio Files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg);;All Files (*)"
+        )
+        last_added = ''
+        for file_path in file_paths:
+            normalized = self._normalize_vid_prep_audio_path(file_path)
+            if not normalized:
+                continue
+            self.add_vid_prep_sfx_to_library(normalized)
+            last_added = normalized
+
+        if last_added:
+            self.refresh_vid_prep_sfx_library_list(last_added)
+
+    def on_vid_prep_sfx_files_dropped(self, file_paths):
+        """Handle files dropped onto the sound effects list."""
+        if not file_paths:
+            return
+
+        last_added = ''
+        added_count = 0
+        for file_path in file_paths:
+            normalized = self._normalize_vid_prep_audio_path(file_path)
+            if not normalized or not os.path.exists(normalized):
+                continue
+            if self.add_vid_prep_sfx_to_library(normalized):
+                last_added = normalized
+                added_count += 1
+
+        if last_added:
+            self.refresh_vid_prep_sfx_library_list(last_added)
+
+        if hasattr(self, 'vid_prep_status'):
+            if added_count > 0:
+                self.vid_prep_status.setText(f"Added {added_count} file(s) to sound effects.")
+            else:
+                self.vid_prep_status.setText("No new sound effect files were added (already present or invalid).")
+
+    def use_selected_vid_prep_sfx(self):
+        """Apply the selected sound effect item to the current export audio file path."""
+        selected_path = self._get_selected_vid_prep_sfx_path()
+        if not selected_path:
+            return
+
+        self.vid_prep_selected_audio_path = selected_path
+        self.on_vid_prep_audio_tracks_dropped([selected_path])
+        self.vid_prep_audio_replace_radio.setChecked(True)
+        self.refresh_vid_prep_sfx_library_list(selected_path)
+        self.on_vid_prep_audio_setting_changed()
+
+    def remove_selected_vid_prep_sfx(self):
+        """Remove the selected saved sound effect from persistent storage."""
+        selected_path = self._get_selected_vid_prep_sfx_path()
+        if not selected_path:
+            return
+
+        compare_value = os.path.normcase(selected_path)
+        self.vid_prep_sfx_library = [
+            existing_path for existing_path in self.vid_prep_sfx_library
+            if os.path.normcase(existing_path) != compare_value
+        ]
+        self._save_vid_prep_sfx_library_setting()
+        self.refresh_vid_prep_sfx_library_list()
+
+    def _create_vid_prep_audio_track(self, file_path):
+        """Create a new in-memory track record with default settings."""
+        normalized = self._normalize_vid_prep_audio_path(file_path)
+        if not normalized:
+            return None
+
+        track_duration_s = max(0.0, float(self._get_vid_prep_audio_duration_seconds(normalized)))
+        end_frame = 0
+        if track_duration_s > 0 and float(self.vid_prep_fps or 0.0) > 0:
+            end_frame = int(round(track_duration_s * float(self.vid_prep_fps)))
+
+        if int(self.vid_prep_frame_count or 0) > 0:
+            max_frame = max(0, int(self.vid_prep_frame_count) - 1)
+            if end_frame <= 0:
+                end_frame = max_frame
+            end_frame = max(0, min(end_frame, max_frame))
+
+        track = {
+            'track_id': int(self.vid_prep_next_audio_track_id),
+            'track_path': normalized,
+            'track_name': os.path.basename(normalized) or normalized,
+            'volume_percent': 100.0,
+            'clip_start_seconds': 0.0,
+            'clip_end_seconds': float(track_duration_s),
+            'enter_frame': 0,
+            'exit_frame': int(end_frame),
+            'fade_in_seconds': 0.0,
+            'fade_out_seconds': 0.0,
+        }
+        self.vid_prep_next_audio_track_id += 1
+        return track
+
+    def _get_vid_prep_audio_duration_seconds(self, file_path):
+        """Best-effort duration probe for an audio file in seconds."""
+        normalized = self._normalize_vid_prep_audio_path(file_path)
+        if not normalized or not os.path.exists(normalized):
+            return 0.0
+
+        ffprobe_bin = shutil.which("ffprobe")
+        if ffprobe_bin:
+            try:
+                result = subprocess.run(
+                    [
+                        ffprobe_bin,
+                        "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        normalized,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    parsed = float((result.stdout or "").strip() or 0.0)
+                    if parsed > 0:
+                        return parsed
+            except Exception:
+                pass
+
+        # Wave fallback supports uncompressed WAV files without external tools.
+        if str(normalized).lower().endswith('.wav'):
+            try:
+                with wave.open(normalized, 'rb') as wav_file:
+                    frames = wav_file.getnframes()
+                    frame_rate = wav_file.getframerate()
+                if frame_rate > 0:
+                    return float(frames) / float(frame_rate)
+            except Exception:
+                pass
+
+        return 0.0
+
+    def _get_vid_prep_audio_track_by_id(self, track_id):
+        """Return a track record by track_id."""
+        for track in self.vid_prep_audio_tracks:
+            if int(track.get('track_id', -1)) == int(track_id):
+                return track
+        return None
+
+    def _selected_vid_prep_audio_track_id(self):
+        """Return currently selected track_id or None."""
+        if not hasattr(self, 'vid_prep_audio_track_list'):
+            return None
+
+        table = self.vid_prep_audio_track_list
+        current_row = int(table.currentRow())
+        if current_row < 0 and table.selectionModel() is not None:
+            selected_rows = table.selectionModel().selectedRows()
+            if selected_rows:
+                current_row = int(selected_rows[0].row())
+
+        if current_row < 0:
+            return None
+
+        # Column 0 is a QWidget (move controls). Track ID is stored on the file-name item in column 1.
+        track_item = table.item(current_row, 1)
+        if track_item is None:
+            return None
+
+        track_id = track_item.data(Qt.UserRole)
+        try:
+            return int(track_id)
+        except Exception:
+            return None
+
+    def _selected_vid_prep_audio_track_row(self):
+        """Return currently selected track row index or -1."""
+        if not hasattr(self, 'vid_prep_audio_track_list'):
+            return -1
+
+        table = self.vid_prep_audio_track_list
+        current_row = int(table.currentRow())
+        if current_row >= 0:
+            return current_row
+
+        if table.selectionModel() is not None:
+            selected_rows = table.selectionModel().selectedRows()
+            if selected_rows:
+                return int(selected_rows[0].row())
+
+        return -1
+
+    def _vid_prep_track_position_bounds(self):
+        """Return timeline range for track placement sliders."""
+        max_frame = max(0, int(self.vid_prep_frame_count or 0) - 1)
+        for track in self.vid_prep_audio_tracks:
+            try:
+                max_frame = max(max_frame, int(track.get('exit_frame') or 0))
+            except Exception:
+                continue
+        return 0, max(1, max_frame)
+
+    def _move_vid_prep_track(self, track_id, delta):
+        """Move a track up or down in the in-memory ordering."""
+        try:
+            track_id = int(track_id)
+            delta = int(delta)
+        except Exception:
+            return
+
+        index = next((i for i, track in enumerate(self.vid_prep_audio_tracks) if int(track.get('track_id', -1)) == track_id), None)
+        if index is None:
+            return
+
+        target_index = index + delta
+        if target_index < 0 or target_index >= len(self.vid_prep_audio_tracks):
+            return
+
+        self.vid_prep_audio_tracks[index], self.vid_prep_audio_tracks[target_index] = self.vid_prep_audio_tracks[target_index], self.vid_prep_audio_tracks[index]
+        self._refresh_vid_prep_audio_track_list(track_id)
+        self._set_vid_prep_output_preview_dirty(True)
+
+    def _remove_vid_prep_track_by_id(self, track_id):
+        """Remove a track by ID from the in-memory ordering."""
+        try:
+            track_id = int(track_id)
+        except Exception:
+            return
+
+        original_len = len(self.vid_prep_audio_tracks)
+        self.vid_prep_audio_tracks = [
+            track for track in self.vid_prep_audio_tracks
+            if int(track.get('track_id', -1)) != track_id
+        ]
+        if len(self.vid_prep_audio_tracks) == original_len:
+            return
+
+        self._refresh_vid_prep_audio_track_list()
+        self._set_vid_prep_output_preview_dirty(True)
+
+    def _apply_vid_prep_track_position(self, track_id, start_frame, end_frame):
+        """Update a track's timeline placement from the slider widget."""
+        track = self._get_vid_prep_audio_track_by_id(track_id)
+        if not track:
+            return
+
+        start_frame = int(start_frame)
+        end_frame = int(end_frame)
+        if start_frame > end_frame:
+            start_frame, end_frame = end_frame, start_frame
+
+        track['enter_frame'] = start_frame
+        track['exit_frame'] = end_frame
+        self._set_vid_prep_output_preview_dirty(True)
+
+    def _refresh_vid_prep_audio_track_list(self, selected_track_id=None):
+        """Repaint the track table from model state."""
+        if not hasattr(self, 'vid_prep_audio_track_list'):
+            return
+
+        if selected_track_id is None:
+            selected_track_id = self._selected_vid_prep_audio_track_id()
+
+        table = self.vid_prep_audio_track_list
+        table.blockSignals(True)
+        table.setRowCount(len(self.vid_prep_audio_tracks))
+        min_frame, max_frame = self._vid_prep_track_position_bounds()
+
+        for row_index, track in enumerate(self.vid_prep_audio_tracks):
+            track_id = int(track.get('track_id', 0))
+            track_name = track.get('track_name') or os.path.basename(track.get('track_path') or '') or 'Track'
+
+            number_widget = QWidget()
+            number_layout = QHBoxLayout(number_widget)
+            number_layout.setContentsMargins(0, 0, 0, 0)
+            number_layout.setSpacing(2)
+
+            up_btn = QPushButton("▲")
+            up_btn.setFixedWidth(22)
+            up_btn.setToolTip("Move track up")
+            up_btn.clicked.connect(lambda _checked=False, tid=track_id: self._move_vid_prep_track(tid, -1))
+            number_layout.addWidget(up_btn)
+
+            down_btn = QPushButton("▼")
+            down_btn.setFixedWidth(22)
+            down_btn.setToolTip("Move track down")
+            down_btn.clicked.connect(lambda _checked=False, tid=track_id: self._move_vid_prep_track(tid, 1))
+            number_layout.addWidget(down_btn)
+
+            row_label = QLabel(f"{row_index + 1}")
+            row_label.setAlignment(Qt.AlignCenter)
+            row_label.setMinimumWidth(18)
+            number_layout.addWidget(row_label)
+            number_layout.addStretch()
+            table.setCellWidget(row_index, 0, number_widget)
+
+            file_item = QTableWidgetItem(track_name)
+            file_item.setData(Qt.UserRole, track_id)
+            file_item.setToolTip(track.get('track_path') or '')
+            table.setItem(row_index, 1, file_item)
+
+            position_widget = QWidget()
+            position_layout = QVBoxLayout(position_widget)
+            position_layout.setContentsMargins(0, 0, 0, 0)
+            position_layout.setSpacing(2)
+
+            slider = TrackPositionSlider()
+            slider.setRange(min_frame, max_frame)
+            slider.setValues(int(track.get('enter_frame') or 0), int(track.get('exit_frame') or 0))
+            slider.activated.connect(lambda tid=track_id, row=row_index: self.vid_prep_audio_track_list.setCurrentCell(row, 1))
+            slider.range_changed.connect(lambda start, end, tid=track_id: self._apply_vid_prep_track_position(tid, start, end))
+            position_layout.addWidget(slider)
+
+            position_hint = QLabel(f"{int(track.get('enter_frame') or 0)} -> {int(track.get('exit_frame') or 0)}")
+            position_hint.setAlignment(Qt.AlignCenter)
+            position_hint.setStyleSheet("font-size: 8pt; color: #888;")
+            position_layout.addWidget(position_hint)
+            table.setCellWidget(row_index, 2, position_widget)
+
+            delete_btn = QPushButton("X")
+            delete_btn.setFixedWidth(22)
+            delete_btn.setToolTip("Delete this track")
+            delete_btn.clicked.connect(lambda _checked=False, tid=track_id: self._remove_vid_prep_track_by_id(tid))
+
+            delete_widget = QWidget()
+            delete_layout = QHBoxLayout(delete_widget)
+            delete_layout.setContentsMargins(0, 0, 0, 0)
+            delete_layout.setAlignment(Qt.AlignCenter)
+            delete_layout.addWidget(delete_btn)
+            table.setCellWidget(row_index, 3, delete_widget)
+
+            if selected_track_id is not None and track_id == int(selected_track_id):
+                table.selectRow(row_index)
+
+            table.setRowHeight(row_index, 42)
+
+        table.blockSignals(False)
+
+        has_tracks = bool(self.vid_prep_audio_tracks)
+        self.vid_prep_audio_track_remove_btn.setEnabled(has_tracks and self._selected_vid_prep_audio_track_id() is not None)
+        self.vid_prep_audio_track_clear_btn.setEnabled(has_tracks)
+        self._set_vid_prep_audio_track_editor_enabled(self._selected_vid_prep_audio_track_id() is not None)
+
+    def _set_vid_prep_audio_track_editor_enabled(self, enabled):
+        """Enable/disable per-track editor controls."""
+        controls = [
+            'vid_prep_track_volume_spin',
+            'vid_prep_track_clip_start_spin',
+            'vid_prep_track_clip_end_spin',
+            'vid_prep_track_enter_frame_spin',
+            'vid_prep_track_exit_frame_spin',
+            'vid_prep_track_fade_in_spin',
+            'vid_prep_track_fade_out_spin',
+        ]
+        for control_name in controls:
+            if hasattr(self, control_name):
+                getattr(self, control_name).setEnabled(bool(enabled))
+
+    def add_vid_prep_audio_tracks(self):
+        """Pick and append tracks to the audio track editor."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add Audio Tracks",
+            "",
+            "Audio Files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg);;All Files (*)"
+        )
+        self.on_vid_prep_audio_tracks_dropped(file_paths)
+
+    def on_vid_prep_audio_tracks_dropped(self, file_paths):
+        """Handle dropped track files."""
+        if not file_paths:
+            return
+
+        added_count = 0
+        selected_track_id = None
+        for file_path in file_paths:
+            normalized = self._normalize_vid_prep_audio_path(file_path)
+            if not normalized or not os.path.exists(normalized):
+                continue
+            track = self._create_vid_prep_audio_track(normalized)
+            if not track:
+                continue
+            self.vid_prep_audio_tracks.append(track)
+            selected_track_id = track['track_id']
+            added_count += 1
+
+        if added_count > 0:
+            self._refresh_vid_prep_audio_track_list(selected_track_id)
+            self._set_vid_prep_output_preview_dirty(True)
+            self.vid_prep_status.setText(f"Added {added_count} audio track(s) to track editor.")
+
+    def on_vid_prep_audio_track_selection_changed(self, *args):
+        """Load selected track values into the per-track editor controls."""
+        track_id = self._selected_vid_prep_audio_track_id()
+        track = self._get_vid_prep_audio_track_by_id(track_id) if track_id is not None else None
+        self.vid_prep_audio_track_remove_btn.setEnabled(track is not None)
+
+        self._vid_prep_audio_track_editor_updating = True
+        try:
+            if not track:
+                self._set_vid_prep_audio_track_editor_enabled(False)
+                return
+
+            self._set_vid_prep_audio_track_editor_enabled(True)
+            self.vid_prep_track_volume_spin.setValue(float(track.get('volume_percent') or 100.0))
+            self.vid_prep_track_clip_start_spin.setValue(float(track.get('clip_start_seconds') or 0.0))
+            self.vid_prep_track_clip_end_spin.setValue(float(track.get('clip_end_seconds') or 0.0))
+            self.vid_prep_track_enter_frame_spin.setValue(int(track.get('enter_frame') or 0))
+            self.vid_prep_track_exit_frame_spin.setValue(int(track.get('exit_frame') or 0))
+            self.vid_prep_track_fade_in_spin.setValue(float(track.get('fade_in_seconds') or 0.0))
+            self.vid_prep_track_fade_out_spin.setValue(float(track.get('fade_out_seconds') or 0.0))
+        finally:
+            self._vid_prep_audio_track_editor_updating = False
+
+    def on_vid_prep_audio_track_editor_changed(self, *args):
+        """Apply per-track editor values to selected track model."""
+        if self._vid_prep_audio_track_editor_updating:
+            return
+
+        track_id = self._selected_vid_prep_audio_track_id()
+        track = self._get_vid_prep_audio_track_by_id(track_id) if track_id is not None else None
+        if not track:
+            return
+
+        track['volume_percent'] = float(self.vid_prep_track_volume_spin.value())
+        track['clip_start_seconds'] = float(self.vid_prep_track_clip_start_spin.value())
+        track['clip_end_seconds'] = float(self.vid_prep_track_clip_end_spin.value())
+        track['enter_frame'] = int(self.vid_prep_track_enter_frame_spin.value())
+        track['exit_frame'] = int(self.vid_prep_track_exit_frame_spin.value())
+        track['fade_in_seconds'] = float(self.vid_prep_track_fade_in_spin.value())
+        track['fade_out_seconds'] = float(self.vid_prep_track_fade_out_spin.value())
+        self._set_vid_prep_output_preview_dirty(True)
+
+    def remove_selected_vid_prep_audio_track(self):
+        """Remove currently selected track from track editor."""
+        track_id = self._selected_vid_prep_audio_track_id()
+        if track_id is None:
+            return
+
+        self.vid_prep_audio_tracks = [
+            track for track in self.vid_prep_audio_tracks
+            if int(track.get('track_id', -1)) != int(track_id)
+        ]
+        self._refresh_vid_prep_audio_track_list()
+        self._set_vid_prep_output_preview_dirty(True)
+
+    def clear_vid_prep_audio_tracks(self):
+        """Remove all tracks from track editor."""
+        if not self.vid_prep_audio_tracks:
+            return
+
+        self.vid_prep_audio_tracks = []
+        self._refresh_vid_prep_audio_track_list()
+        self._set_vid_prep_output_preview_dirty(True)
+
+    def _current_vid_prep_audio_mode(self):
+        """Return canonical audio mode token."""
+        if self.vid_prep_audio_replace_radio.isChecked():
+            return 'replace'
+        if self.vid_prep_audio_maintain_radio.isChecked():
+            return 'maintain'
+        if self.vid_prep_audio_mix_radio.isChecked():
+            return 'mix'
+        return 'remove'
+
+    def _build_vid_prep_audio_track_payload(self):
+        """Build DB payload rows for VIDEO.AudioTracks."""
+        payload = []
+        for idx, track in enumerate(self.vid_prep_audio_tracks, start=1):
+            payload.append({
+                'track_order': idx,
+                'track_path': track.get('track_path'),
+                'track_name': track.get('track_name'),
+                'volume_percent': float(track.get('volume_percent') or 0.0),
+                'clip_start_seconds': float(track.get('clip_start_seconds') or 0.0),
+                'clip_end_seconds': float(track.get('clip_end_seconds') or 0.0),
+                'enter_frame': int(track.get('enter_frame') or 0),
+                'exit_frame': int(track.get('exit_frame') or 0),
+                'fade_in_seconds': float(track.get('fade_in_seconds') or 0.0),
+                'fade_out_seconds': float(track.get('fade_out_seconds') or 0.0),
+            })
+        return payload
+
+    def _get_vid_prep_primary_audio_path(self):
+        """Return the preferred music path for metadata persistence."""
+        selected = self._normalize_vid_prep_audio_path(getattr(self, 'vid_prep_selected_audio_path', ''))
+        if selected:
+            return selected
+        payload = self._build_vid_prep_audio_track_payload()
+        if payload:
+            return str(payload[0].get('track_path') or '').strip()
+        return ''
+
+    def _build_vid_prep_file_assembly_payload(self, output_path, ffmpeg_command=None):
+        """Build DB payload rows for VIDEO.FileAssembly."""
+        source_path = str(self.vid_prep_source_path or '')
+        track_payload = self._build_vid_prep_audio_track_payload()
+
+        command_line = ''
+        if ffmpeg_command:
+            try:
+                command_line = ' '.join(str(part) for part in ffmpeg_command)
+            except Exception:
+                command_line = str(ffmpeg_command)
+
+        return [{
+            'assembly_order': 1,
+            'assembly_stage': 'ffmpeg_export',
+            'input_path': source_path,
+            'output_path': str(output_path),
+            'tool_name': 'ffmpeg',
+            'command_line': command_line,
+            'assembly_payload': {
+                'audio_mode': self._current_vid_prep_audio_mode(),
+                'tracks': track_payload,
+                'trim_start_frame': int(self.vid_prep_trim_start_frame),
+                'trim_end_frame': int(self.vid_prep_trim_end_frame),
+                'fps': float(self.vid_prep_fps),
+            },
+        }]
+
+    def _build_vid_prep_video_output_payload(self, output_path):
+        """Build DB payload row for VIDEO.VideoOutput."""
+        crop = self.vid_prep_crop_rect or self.vid_prep_preview.get_crop_rect_source() or (0, 0, 0, 0)
+        crop_x, crop_y, crop_w, crop_h = crop
+
+        return {
+            'account_name': self.current_username or getattr(self.content_db.db, 'account_name', ''),
+            'output_path': str(output_path),
+            'output_file_name': os.path.basename(str(output_path)),
+            'video_file_title': (self.vid_prep_video_title_input.text() or '').strip(),
+            'video_file_desc': (self.vid_prep_video_desc_input.toHtml() or '').strip(),
+            'source_path': self.vid_prep_source_path,
+            'source_shortcode': self._extract_vid_prep_shortcode(self.vid_prep_source_path),
+            'selected_topic': (self.vid_prep_selected_topic_input.text() or '').strip(),
+            'file_prefix': (self.vid_prep_file_prefix_input.text() or '').strip(),
+            'file_index': self._current_vid_prep_file_index(),
+            'modifier': self._current_vid_prep_modifier(),
+            'separator': self._current_vid_prep_separator(),
+            'prepend_topic': self.vid_prep_prepend_topic_checkbox.isChecked(),
+            'output_folder_mode': self.vid_prep_output_folder_mode,
+            'output_folder_path': (self.vid_prep_output_folder_path_input.text() or '').strip(),
+            'codec_preset': self.vid_prep_codec_preset.currentText().strip(),
+            'crf': int(self.vid_prep_crf.value()),
+            'resolution_preset': self.vid_prep_output_resolution_combo.currentText(),
+            'output_width': int(self.vid_prep_output_width.value()),
+            'output_height': int(self.vid_prep_output_height.value()),
+            'background_mode': self.vid_prep_bg_mode.currentText(),
+            'background_color': str(getattr(self, 'vid_prep_bg_color', '')),
+            'background_image_path': (self.vid_prep_bg_image_path.text() or '').strip(),
+            'audio_mode': self._current_vid_prep_audio_mode(),
+            'audio_file_path': self._get_vid_prep_primary_audio_path(),
+            'audio_start_seconds': 0.0,
+            'audio_end_seconds': 0.0,
+            'crop_x': int(crop_x),
+            'crop_y': int(crop_y),
+            'crop_width': int(crop_w),
+            'crop_height': int(crop_h),
+            'trim_start_frame': int(self.vid_prep_trim_start_frame),
+            'trim_end_frame': int(self.vid_prep_trim_end_frame),
+            'source_frame_count': int(self.vid_prep_frame_count),
+            'source_fps': float(self.vid_prep_fps),
+            'source_duration_seconds': float(self.vid_prep_duration_s),
+        }
+
+    def persist_vid_prep_output_metadata(self, output_path, overwrite_existing, ffmpeg_command=None):
+        """Persist current Vid Prep save metadata to VIDEO.VideoOutput/AudioTracks/FileAssembly."""
+        if (not self.content_db or not getattr(self.content_db, 'db', None)) and self.current_username:
+            try:
+                self.content_db = ContentDatabaseManager(str(config.DATA_DIR), self.current_username)
+            except Exception:
+                pass
+
+        if not self.content_db or not self.content_db.db:
+            raise Exception("Content database is not available")
+
+        video_payload = self._build_vid_prep_video_output_payload(output_path)
+        tracks_payload = self._build_vid_prep_audio_track_payload()
+        assembly_payload = self._build_vid_prep_file_assembly_payload(output_path, ffmpeg_command=ffmpeg_command)
+        return self.content_db.db.save_video_output_record(
+            video_output=video_payload,
+            audio_tracks=tracks_payload,
+            file_assembly=assembly_payload,
+            delete_existing=bool(overwrite_existing),
+        )
+
+    def initialize_vid_prep_suggested_applications_editor(self):
+        """Initialize Suggested Applications controls beneath Suggested Description."""
+        self.vid_prep_suggested_applications = []
+        self.vid_prep_suggested_applications_dirty = False
+        self._set_vid_prep_combo_placeholder(self.vid_prep_sport_combo, "Select Sport")
+        self._set_vid_prep_combo_placeholder(self.vid_prep_technique_class_combo, "Select Technique Class")
+        self._set_vid_prep_combo_placeholder(self.vid_prep_technique_type_combo, "Select Technique Type")
+        self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Select Technique Application Series")
+        self.refresh_vid_prep_suggested_applications_table()
+        self.load_vid_prep_sports()
+        self.update_vid_prep_add_application_state()
+
+    def _set_vid_prep_combo_placeholder(self, combo, placeholder_text):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(placeholder_text, -1)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _set_vid_prep_apps_loading(self, loading_text=''):
+        """Show a lightweight loading indicator for Suggested Applications fetches."""
+        if hasattr(self, 'vid_prep_apps_loading_label'):
+            self.vid_prep_apps_loading_label.setText(loading_text or '')
+        QApplication.processEvents()
+
+    def _ensure_vid_prep_content_db(self):
+        """Ensure content DB manager exists for current account."""
+        if self.content_db and getattr(self.content_db, 'db', None):
+            return True
+        if not self.current_username:
+            return False
+        try:
+            self.content_db = ContentDatabaseManager(str(config.DATA_DIR), self.current_username)
+            return bool(self.content_db and self.content_db.db)
+        except Exception as e:
+            logger.error("Failed to initialize content DB for suggested applications: %s", e)
+            return False
+
+    def load_vid_prep_sports(self):
+        """Load Sports dropdown values from soccr API."""
+        if self.soccr_api_client_mode == 'off':
+            self._set_vid_prep_combo_placeholder(self.vid_prep_sport_combo, "Soccr API Off")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_technique_class_combo, "Select Technique Class")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_technique_type_combo, "Select Technique Type")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Select Technique Application Series")
+            self.vid_prep_add_application_btn.setEnabled(False)
+            self._set_vid_prep_apps_loading('')
+            return
+
+        try:
+            self._set_vid_prep_apps_loading("Loading sports...")
+            from soccr_api_client import ApiClient
+            from soccr_api_client.api.techniques_api import TechniquesApi
+
+            configuration = self.get_soccr_api_client_configuration()
+            with ApiClient(configuration) as api_client:
+                techniques_api = TechniquesApi(api_client)
+                sports = techniques_api.sports_select_all(include_any=False, _request_timeout=(3, 15)) or []
+
+            self.vid_prep_sport_combo.blockSignals(True)
+            self.vid_prep_sport_combo.clear()
+            self.vid_prep_sport_combo.addItem("Select Sport", -1)
+
+            target_index = 0
+            for sport in sports:
+                raw_sport_id = getattr(sport, 'sport_id', None)
+                if raw_sport_id is None:
+                    continue
+                sport_id = int(raw_sport_id)
+                sport_name = (getattr(sport, 'sport_name', '') or f"Sport {sport_id}").strip()
+                self.vid_prep_sports_cache[sport_id] = sport_name
+                self.vid_prep_sport_combo.addItem(sport_name, sport_id)
+                if sport_id == 1:
+                    target_index = self.vid_prep_sport_combo.count() - 1
+
+            if self.vid_prep_sport_combo.count() > 1:
+                self.vid_prep_sport_combo.setCurrentIndex(target_index if target_index > 0 else 1)
+            else:
+                self.vid_prep_sport_combo.setCurrentIndex(0)
+            self.vid_prep_sport_combo.blockSignals(False)
+            self.on_vid_prep_sport_changed(self.vid_prep_sport_combo.currentIndex())
+        except Exception as e:
+            logger.error("Failed to load sports for suggested applications: %s", e)
+            self._set_vid_prep_combo_placeholder(self.vid_prep_sport_combo, "Failed to load sports")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_technique_class_combo, "Select Technique Class")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_technique_type_combo, "Select Technique Type")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Select Technique Application Series")
+            self.vid_prep_add_application_btn.setEnabled(False)
+        finally:
+            self._set_vid_prep_apps_loading('')
+
+    def on_vid_prep_sport_changed(self, _index):
+        """Cascade sport selection to technique classes."""
+        sport_id = self.vid_prep_sport_combo.currentData()
+        sport_id = int(sport_id) if sport_id is not None else -1
+
+        self._set_vid_prep_combo_placeholder(self.vid_prep_technique_class_combo, "Select Technique Class")
+        self._set_vid_prep_combo_placeholder(self.vid_prep_technique_type_combo, "Select Technique Type")
+        self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Select Technique Application Series")
+        if sport_id < 0:
+            self.update_vid_prep_add_application_state()
+            return
+
+        try:
+            self._set_vid_prep_apps_loading("Loading technique classes...")
+            from soccr_api_client import ApiClient
+            from soccr_api_client.api.techniques_api import TechniquesApi
+
+            configuration = self.get_soccr_api_client_configuration()
+            with ApiClient(configuration) as api_client:
+                techniques_api = TechniquesApi(api_client)
+                classes = techniques_api.technique_classes_select_sport(sport_id=sport_id, _request_timeout=(3, 15)) or []
+
+            self.vid_prep_technique_class_combo.blockSignals(True)
+            self.vid_prep_technique_class_combo.clear()
+            self.vid_prep_technique_class_combo.addItem("Select Technique Class", -1)
+            for cls in classes:
+                raw_class_id = getattr(cls, 'technique_class_id', None)
+                if raw_class_id is None:
+                    continue
+                class_id = int(raw_class_id)
+                class_name = (getattr(cls, 'technique_class_name', '') or f"Class {class_id}").strip()
+                self.vid_prep_technique_class_cache[class_id] = {
+                    'name': class_name,
+                    'sport_id': sport_id,
+                    'sport_name': (getattr(cls, 'sport_name', '') or self.vid_prep_sports_cache.get(sport_id, '')).strip(),
+                }
+                self.vid_prep_technique_class_combo.addItem(class_name, class_id)
+            if self.vid_prep_technique_class_combo.count() > 1:
+                self.vid_prep_technique_class_combo.setCurrentIndex(1)
+            self.vid_prep_technique_class_combo.blockSignals(False)
+            self.on_vid_prep_technique_class_changed(self.vid_prep_technique_class_combo.currentIndex())
+        except Exception as e:
+            logger.error("Failed to load technique classes for sport %s: %s", sport_id, e)
+            self._set_vid_prep_combo_placeholder(self.vid_prep_technique_class_combo, "Failed to load classes")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_technique_type_combo, "Select Technique Type")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Select Technique Application Series")
+            self.update_vid_prep_add_application_state()
+        finally:
+            self._set_vid_prep_apps_loading('')
+
+    def on_vid_prep_technique_class_changed(self, _index):
+        """Cascade class selection to technique types."""
+        class_id = self.vid_prep_technique_class_combo.currentData()
+        class_id = int(class_id) if class_id is not None else -1
+
+        self._set_vid_prep_combo_placeholder(self.vid_prep_technique_type_combo, "Select Technique Type")
+        self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Select Technique Application Series")
+        if class_id < 0:
+            self.update_vid_prep_add_application_state()
+            return
+
+        try:
+            self._set_vid_prep_apps_loading("Loading technique types...")
+            from soccr_api_client import ApiClient
+            from soccr_api_client.api.techniques_api import TechniquesApi
+
+            configuration = self.get_soccr_api_client_configuration()
+            with ApiClient(configuration) as api_client:
+                techniques_api = TechniquesApi(api_client)
+                technique_types = techniques_api.technique_types_select_active(
+                    technique_class_id=class_id,
+                    _request_timeout=(3, 15),
+                ) or []
+
+            self.vid_prep_technique_type_combo.blockSignals(True)
+            self.vid_prep_technique_type_combo.clear()
+            self.vid_prep_technique_type_combo.addItem("Select Technique Type", -1)
+            for technique_type in technique_types:
+                raw_type_id = getattr(technique_type, 'technique_type_id', None)
+                if raw_type_id is None:
+                    continue
+                type_id = int(raw_type_id)
+                type_name = (getattr(technique_type, 'technique_type_name', '') or f"Type {type_id}").strip()
+                self.vid_prep_technique_type_cache[type_id] = {
+                    'name': type_name,
+                    'technique_class_id': class_id,
+                }
+                self.vid_prep_technique_type_combo.addItem(type_name, type_id)
+            if self.vid_prep_technique_type_combo.count() > 1:
+                self.vid_prep_technique_type_combo.setCurrentIndex(1)
+            self.vid_prep_technique_type_combo.blockSignals(False)
+            self.on_vid_prep_technique_type_changed(self.vid_prep_technique_type_combo.currentIndex())
+        except Exception as e:
+            logger.error("Failed to load technique types for class %s: %s", class_id, e)
+            self._set_vid_prep_combo_placeholder(self.vid_prep_technique_type_combo, "Failed to load types")
+            self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Select Technique Application Series")
+            self.update_vid_prep_add_application_state()
+        finally:
+            self._set_vid_prep_apps_loading('')
+
+    def on_vid_prep_technique_type_changed(self, _index):
+        """Cascade technique type selection to application series."""
+        type_id = self.vid_prep_technique_type_combo.currentData()
+        type_id = int(type_id) if type_id is not None else -1
+
+        self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Select Technique Application Series")
+        if type_id < 0:
+            self.update_vid_prep_add_application_state()
+            return
+
+        try:
+            self._set_vid_prep_apps_loading("Loading application series...")
+            from soccr_api_client import ApiClient
+            from soccr_api_client.api.technique_series_api import TechniqueSeriesApi
+
+            configuration = self.get_soccr_api_client_configuration()
+            with ApiClient(configuration) as api_client:
+                series_api = TechniqueSeriesApi(api_client)
+                series_items = series_api.technique_application_series_for_application(
+                    technique_type_id=type_id,
+                    _request_timeout=(3, 15),
+                ) or []
+
+            self.vid_prep_series_combo.blockSignals(True)
+            self.vid_prep_series_combo.clear()
+            self.vid_prep_series_combo.addItem("Select Technique Application Series", -1)
+            for series in series_items:
+                raw_tsid = getattr(series, 'tsid', None)
+                if raw_tsid is None:
+                    continue
+                tsid = int(raw_tsid)
+                series_name = (getattr(series, 'technique_series_name', '') or f"Series {tsid}").strip()
+                self.vid_prep_series_cache[tsid] = {
+                    'name': series_name,
+                    'technique_type_id': type_id,
+                }
+                self.vid_prep_series_combo.addItem(series_name, tsid)
+            if self.vid_prep_series_combo.count() > 1:
+                self.vid_prep_series_combo.setCurrentIndex(1)
+            self.vid_prep_series_combo.blockSignals(False)
+        except Exception as e:
+            logger.error("Failed to load technique application series for type %s: %s", type_id, e)
+            self._set_vid_prep_combo_placeholder(self.vid_prep_series_combo, "Failed to load series")
+        finally:
+            self._set_vid_prep_apps_loading('')
+
+        self.update_vid_prep_add_application_state()
+
+    def update_vid_prep_add_application_state(self):
+        """Enable Add when all dropdown values and VidID are present."""
+        sport_id = self.vid_prep_sport_combo.currentData() if hasattr(self, 'vid_prep_sport_combo') else -1
+        class_id = self.vid_prep_technique_class_combo.currentData() if hasattr(self, 'vid_prep_technique_class_combo') else -1
+        type_id = self.vid_prep_technique_type_combo.currentData() if hasattr(self, 'vid_prep_technique_type_combo') else -1
+        tsid = self.vid_prep_series_combo.currentData() if hasattr(self, 'vid_prep_series_combo') else -1
+
+        complete_selection = all([
+            sport_id is not None and int(sport_id) >= 0,
+            class_id is not None and int(class_id) >= 0,
+            type_id is not None and int(type_id) >= 0,
+            tsid is not None and int(tsid) >= 0,
+        ])
+        can_add = bool(complete_selection)
+        self.vid_prep_add_application_btn.setEnabled(can_add)
+        self.vid_prep_add_application_btn.setToolTip("Stage selected application mapping (saved to SQL when video is saved)")
+
+    def on_vid_prep_add_application_clicked(self):
+        """Stage selected Suggested Application row (persisted on video save)."""
+        sport_id = self.vid_prep_sport_combo.currentData()
+        class_id = self.vid_prep_technique_class_combo.currentData()
+        type_id = self.vid_prep_technique_type_combo.currentData()
+        tsid = self.vid_prep_series_combo.currentData()
+        if any(v is None or int(v) < 0 for v in [sport_id, class_id, type_id, tsid]):
+            QMessageBox.warning(self, "Suggested Applications", "Select Sport, Class, Technique Type, and Series before adding.")
+            return
+
+        sport_id = int(sport_id)
+        class_id = int(class_id)
+        type_id = int(type_id)
+        tsid = int(tsid)
+        key_technique = bool(self.vid_prep_key_technique_check.isChecked())
+
+        duplicate_exists = any(
+            int(row.get('TechniqueClassID') or -1) == class_id and
+            int(row.get('TechniqueTypeID') or -1) == type_id and
+            int(row.get('TSID') or -1) == tsid
+            for row in self.vid_prep_suggested_applications
+        )
+        if duplicate_exists:
+            QMessageBox.information(
+                self,
+                "Suggested Applications",
+                "That application mapping is already staged for this video."
+            )
+            return
+
+        self.vid_prep_suggested_applications.append({
+            'VidAID': None,
+            'VidID': self.vid_prep_current_vid_id,
+            'SportID': sport_id,
+            'TechniqueClassID': class_id,
+            'TechniqueTypeID': type_id,
+            'TSID': tsid,
+            'KeyTechnique': key_technique,
+            'SportName': (self.vid_prep_sports_cache.get(sport_id, self.vid_prep_sport_combo.currentText()) or '').strip(),
+            'TechniqueClassName': (self.vid_prep_technique_class_cache.get(class_id, {}).get('name', self.vid_prep_technique_class_combo.currentText()) or '').strip(),
+            'TechniqueTypeName': (self.vid_prep_technique_type_cache.get(type_id, {}).get('name', self.vid_prep_technique_type_combo.currentText()) or '').strip(),
+            'TechniqueSeriesName': (self.vid_prep_series_cache.get(tsid, {}).get('name', self.vid_prep_series_combo.currentText()) or '').strip(),
+        })
+        self.vid_prep_suggested_applications_dirty = True
+        self.refresh_vid_prep_suggested_applications_table()
+        self.vid_prep_status.setText("Suggested application staged (will save with video).")
+
+    def refresh_vid_prep_suggested_applications_table(self):
+        """Rebuild Suggested Applications list table."""
+        table = self.vid_prep_applications_table
+        table.setRowCount(len(self.vid_prep_suggested_applications))
+
+        for row_index, row in enumerate(self.vid_prep_suggested_applications):
+            table.setItem(row_index, 0, QTableWidgetItem(f"{row_index + 1}."))
+            table.setItem(row_index, 1, QTableWidgetItem(str(row.get('SportName') or f"Sport {row.get('SportID') or ''}")))
+            table.setItem(row_index, 2, QTableWidgetItem(str(row.get('TechniqueClassName') or f"Class {row.get('TechniqueClassID') or ''}")))
+            table.setItem(row_index, 3, QTableWidgetItem(str(row.get('TechniqueTypeName') or f"Type {row.get('TechniqueTypeID') or ''}")))
+            table.setItem(row_index, 4, QTableWidgetItem(str(row.get('TechniqueSeriesName') or f"Series {row.get('TSID') or ''}")))
+            table.setItem(row_index, 5, QTableWidgetItem("Yes" if bool(row.get('KeyTechnique')) else "No"))
+
+            delete_btn = QPushButton("X")
+            delete_btn.setFixedWidth(34)
+            delete_btn.clicked.connect(lambda _checked=False, idx=row_index: self.on_vid_prep_delete_application_by_index(idx))
+            table.setCellWidget(row_index, 6, delete_btn)
+
+    def load_vid_prep_video_applications(self, vid_id=None, preloaded_rows=None):
+        """Load VIDEO.Applications rows for current VidID and render the table."""
+        if vid_id is not None:
+            try:
+                self.vid_prep_current_vid_id = int(vid_id) if vid_id else None
+            except Exception:
+                self.vid_prep_current_vid_id = None
+
+        if not self.vid_prep_current_vid_id:
+            self.vid_prep_suggested_applications = []
+            self.vid_prep_suggested_applications_dirty = False
+            self.refresh_vid_prep_suggested_applications_table()
+            self.update_vid_prep_add_application_state()
+            return
+
+        if preloaded_rows is not None:
+            rows = preloaded_rows
+        else:
+            if not self._ensure_vid_prep_content_db():
+                self.vid_prep_suggested_applications = []
+                self.refresh_vid_prep_suggested_applications_table()
+                self.update_vid_prep_add_application_state()
+                return
+            rows = self.content_db.db.get_video_applications(int(self.vid_prep_current_vid_id))
+
+        resolved_rows = []
+        for row in rows or []:
+            resolved_rows.append(self._resolve_vid_prep_application_row_display(row))
+
+        self.vid_prep_suggested_applications = resolved_rows
+        self.vid_prep_suggested_applications_dirty = False
+        self.refresh_vid_prep_suggested_applications_table()
+        self.update_vid_prep_add_application_state()
+
+    def _resolve_vid_prep_application_row_display(self, row):
+        """Resolve row display fields for Suggested Applications table."""
+        class_id = int(row.get('TechniqueClassID') or 0)
+        type_id = int(row.get('TechniqueTypeID') or 0)
+        tsid = int(row.get('TSID') or 0)
+        sport_id = int(row.get('SportID') or 0)
+
+        class_name = self.vid_prep_technique_class_cache.get(class_id, {}).get('name', '')
+        sport_name = self.vid_prep_technique_class_cache.get(class_id, {}).get('sport_name', '')
+        cached_sport_id = self.vid_prep_technique_class_cache.get(class_id, {}).get('sport_id')
+        if cached_sport_id and not sport_id:
+            sport_id = int(cached_sport_id)
+        type_name = self.vid_prep_technique_type_cache.get(type_id, {}).get('name', '')
+        series_name = self.vid_prep_series_cache.get(tsid, {}).get('name', '')
+
+        if self.soccr_api_client_mode != 'off':
+            try:
+                from soccr_api_client import ApiClient
+                from soccr_api_client.api.techniques_api import TechniquesApi
+                from soccr_api_client.api.technique_series_api import TechniqueSeriesApi
+
+                configuration = self.get_soccr_api_client_configuration()
+                with ApiClient(configuration) as api_client:
+                    techniques_api = TechniquesApi(api_client)
+                    series_api = TechniqueSeriesApi(api_client)
+
+                    if class_id and not class_name:
+                        class_item = techniques_api.technique_classes_select_item(
+                            technique_class_id=class_id,
+                            _request_timeout=(3, 10),
+                        )
+                        class_name = (getattr(class_item, 'technique_class_name', '') or f"Class {class_id}").strip()
+                        resolved_sport_id = int(getattr(class_item, 'sport_id', 0) or 0)
+                        sport_id = resolved_sport_id or sport_id
+                        sport_name = (getattr(class_item, 'sport_name', '') or sport_name).strip()
+                        self.vid_prep_technique_class_cache[class_id] = {
+                            'name': class_name,
+                            'sport_id': sport_id,
+                            'sport_name': sport_name,
+                        }
+
+                    if type_id and not type_name:
+                        type_item = techniques_api.technique_types_select_item(
+                            technique_type_id=type_id,
+                            _request_timeout=(3, 10),
+                        )
+                        type_name = (getattr(type_item, 'technique_type_name', '') or f"Type {type_id}").strip()
+                        self.vid_prep_technique_type_cache[type_id] = {
+                            'name': type_name,
+                            'technique_class_id': int(getattr(type_item, 'technique_class_id', 0) or class_id or 0),
+                        }
+
+                    if tsid and not series_name:
+                        series_item = series_api.technique_application_series_detail_for_edit(
+                            tsid=tsid,
+                            _request_timeout=(3, 10),
+                        )
+                        series_name = (getattr(series_item, 'technique_series_name', '') or f"Series {tsid}").strip()
+                        self.vid_prep_series_cache[tsid] = {
+                            'name': series_name,
+                            'technique_type_id': type_id,
+                        }
+            except Exception as e:
+                logger.warning("Could not fully resolve suggested application names for VidAID=%s: %s", row.get('VidAID'), e)
+
+        if sport_id and not sport_name:
+            sport_name = self.vid_prep_sports_cache.get(sport_id, '')
+
+        return {
+            'VidAID': row.get('VidAID'),
+            'VidID': row.get('VidID'),
+            'SportID': sport_id or None,
+            'TechniqueClassID': class_id or None,
+            'TechniqueTypeID': type_id or None,
+            'TSID': tsid or None,
+            'KeyTechnique': bool(row.get('KeyTechnique')) if row.get('KeyTechnique') is not None else False,
+            'SportName': (sport_name or f"Sport {sport_id}" if sport_id else "").strip(),
+            'TechniqueClassName': (class_name or f"Class {class_id}" if class_id else "").strip(),
+            'TechniqueTypeName': (type_name or f"Type {type_id}" if type_id else "").strip(),
+            'TechniqueSeriesName': (series_name or f"Series {tsid}" if tsid else "").strip(),
+        }
+
+    def on_vid_prep_delete_application_by_index(self, row_index):
+        """Remove a Suggested Application row from the staged list by visible row index."""
+        if row_index is None:
+            return
+        if row_index < 0 or row_index >= len(self.vid_prep_suggested_applications):
+            return
+        self.vid_prep_suggested_applications.pop(int(row_index))
+
+        self.vid_prep_suggested_applications_dirty = True
+        self.refresh_vid_prep_suggested_applications_table()
+        self.vid_prep_status.setText("Suggested application removed (pending save).")
+
+    def persist_vid_prep_video_applications(self, vid_id):
+        """Persist currently staged Suggested Applications rows for a VidID."""
+        if vid_id is None:
+            return
+        if not self._ensure_vid_prep_content_db():
+            raise Exception("Database manager is not available")
+
+        payload_rows = []
+        for row in self.vid_prep_suggested_applications:
+            payload_rows.append({
+                'TechniqueClassID': int(row.get('TechniqueClassID')),
+                'TechniqueTypeID': int(row.get('TechniqueTypeID')),
+                'TSID': int(row.get('TSID')) if row.get('TSID') is not None else None,
+                'KeyTechnique': bool(row.get('KeyTechnique')),
+            })
+
+        self.content_db.db.replace_video_applications(int(vid_id), payload_rows)
+        self.load_vid_prep_video_applications(vid_id=vid_id)
+
+    def on_vid_prep_video_notes_changed(self):
+        """Mark output preview stale when Suggested Title/Description changes."""
+        self._set_vid_prep_output_preview_dirty(True)
+
+    def _apply_vid_prep_desc_format(self, fmt_type: str, on: bool):
+        """Apply a bold/italic/underline format toggle to the desc editor selection."""
+        editor = self.vid_prep_video_desc_input
+        fmt = QTextCharFormat()
+        if fmt_type == 'bold':
+            fmt.setFontWeight(QFont.Bold if on else QFont.Normal)
+        elif fmt_type == 'italic':
+            fmt.setFontItalic(on)
+        elif fmt_type == 'underline':
+            fmt.setFontUnderline(on)
+        editor.mergeCurrentCharFormat(fmt)
+        editor.setFocus()
+
+    def _sync_vid_prep_desc_toolbar(self, char_fmt: QTextCharFormat):
+        """Keep the B/I/U toolbar buttons in sync with the cursor's format."""
+        if not hasattr(self, 'vid_prep_desc_bold_btn'):
+            return
+        self.vid_prep_desc_bold_btn.blockSignals(True)
+        self.vid_prep_desc_italic_btn.blockSignals(True)
+        self.vid_prep_desc_underline_btn.blockSignals(True)
+        self.vid_prep_desc_bold_btn.setChecked(char_fmt.fontWeight() >= QFont.Bold)
+        self.vid_prep_desc_italic_btn.setChecked(char_fmt.fontItalic())
+        self.vid_prep_desc_underline_btn.setChecked(char_fmt.fontUnderline())
+        self.vid_prep_desc_bold_btn.blockSignals(False)
+        self.vid_prep_desc_italic_btn.blockSignals(False)
+        self.vid_prep_desc_underline_btn.blockSignals(False)
+
+    # ── Suggested Nodes ─────────────────────────────────────────────────────
+
+    def refresh_vid_prep_suggested_nodes_table(self):
+        """Rebuild the staged Suggested Nodes list table."""
+        if not hasattr(self, 'vid_prep_nodes_table'):
+            return
+        table = self.vid_prep_nodes_table
+        table.setRowCount(len(self.vid_prep_suggested_nodes))
+        for row_idx, node in enumerate(self.vid_prep_suggested_nodes):
+            flow_id = node.get('FlowID')
+            flow_label = node.get('FlowName') or (str(flow_id) if flow_id not in (None, -1) else '')
+            parent_id = node.get('ParentNodeID')
+            parent_label = str(parent_id) if parent_id is not None else ''
+            table.setItem(row_idx, 0, QTableWidgetItem(f"{row_idx + 1}."))
+            table.setItem(row_idx, 1, QTableWidgetItem(flow_label))
+            table.setItem(row_idx, 2, QTableWidgetItem(parent_label))
+            table.setItem(row_idx, 3, QTableWidgetItem(node.get('NodeName') or ''))
+            del_btn = QPushButton("X")
+            del_btn.setFixedWidth(28)
+            del_btn.clicked.connect(lambda _checked=False, idx=row_idx: self.on_vid_prep_delete_node_by_index(idx))
+            table.setCellWidget(row_idx, 4, del_btn)
+
+    def on_vid_prep_add_node_clicked(self):
+        """Stage a Suggested Node row (persisted to VIDEO.NodeOutput on video save)."""
+        node_name = (self.vid_prep_node_name_input.text() or '').strip()
+        if not node_name:
+            QMessageBox.warning(self, "Suggested Nodes", "Node Name is required.")
+            return
+
+        flow_id = self.vid_prep_node_flow_combo.currentData()
+        flow_id = int(flow_id) if flow_id is not None and int(flow_id) >= 0 else None
+        flow_name = self.vid_prep_node_flow_combo.currentText() if flow_id is not None else ''
+
+        parent_id_text = (self.vid_prep_node_parent_id_input.text() or '').strip()
+        try:
+            parent_id = int(parent_id_text) if parent_id_text else None
+        except ValueError:
+            parent_id = None
+
+        node_desc = (self.vid_prep_node_description_input.toPlainText() or '').strip()
+
+        self.vid_prep_suggested_nodes.append({
+            'FlowID': flow_id,
+            'FlowName': flow_name,
+            'ParentNodeID': parent_id,
+            'NodeName': node_name,
+            'NodeDescription': node_desc,
+        })
+        self.vid_prep_suggested_nodes_dirty = True
+        self.refresh_vid_prep_suggested_nodes_table()
+
+        # Clear the form inputs ready for next entry
+        self.vid_prep_node_parent_id_input.clear()
+        self.vid_prep_node_name_input.clear()
+        self.vid_prep_node_description_input.clear()
+        self.vid_prep_status.setText("Suggested node staged (will save with video).")
+
+    def on_vid_prep_delete_node_by_index(self, row_index):
+        """Remove a staged Suggested Node by visible row index."""
+        if row_index is None or row_index < 0 or row_index >= len(self.vid_prep_suggested_nodes):
+            return
+        self.vid_prep_suggested_nodes.pop(int(row_index))
+        self.vid_prep_suggested_nodes_dirty = True
+        self.refresh_vid_prep_suggested_nodes_table()
+        self.vid_prep_status.setText("Suggested node removed (pending save).")
+
+    def load_vid_prep_video_nodes(self, vid_id=None, preloaded_rows=None):
+        """Load VIDEO.NodeOutput rows for current VidID and render the table."""
+        if vid_id is not None:
+            try:
+                self.vid_prep_current_vid_id = int(vid_id) if vid_id else None
+            except Exception:
+                pass
+
+        if not self.vid_prep_current_vid_id:
+            self.vid_prep_suggested_nodes = []
+            self.vid_prep_suggested_nodes_dirty = False
+            self.refresh_vid_prep_suggested_nodes_table()
+            return
+
+        if preloaded_rows is not None:
+            rows = preloaded_rows
+        else:
+            if not self._ensure_vid_prep_content_db():
+                self.vid_prep_suggested_nodes = []
+                self.refresh_vid_prep_suggested_nodes_table()
+                return
+            try:
+                rows = self.content_db.db.get_video_nodes(int(self.vid_prep_current_vid_id))
+            except Exception as e:
+                logger.error("Failed to load video nodes: %s", e)
+                rows = []
+
+        self.vid_prep_suggested_nodes = [
+            {
+                'FlowID': row.get('FlowID'),
+                'FlowName': str(row.get('FlowID') or '') if row.get('FlowID') else '',
+                'ParentNodeID': row.get('ParentNodeID'),
+                'NodeName': row.get('NodeName') or '',
+                'NodeDescription': row.get('NodeDescription') or '',
+            }
+            for row in (rows or [])
+        ]
+        self.vid_prep_suggested_nodes_dirty = False
+        self.refresh_vid_prep_suggested_nodes_table()
+
+    def persist_vid_prep_video_nodes(self, vid_id):
+        """Persist staged Suggested Nodes to VIDEO.NodeOutput for a VidID."""
+        if vid_id is None:
+            return
+        if not self._ensure_vid_prep_content_db():
+            raise Exception("Database manager not available for node persistence")
+
+        payload = [
+            {
+                'FlowID': node.get('FlowID'),
+                'ParentNodeID': node.get('ParentNodeID'),
+                'NodeName': node.get('NodeName'),
+                'NodeDescription': node.get('NodeDescription'),
+            }
+            for node in self.vid_prep_suggested_nodes
+        ]
+        self.content_db.db.replace_video_nodes(int(vid_id), payload)
+        self.load_vid_prep_video_nodes(vid_id=vid_id)
 
     def _enforce_vid_prep_equal_panel_widths(self, *args):
         """Keep source/output preview panes equal width."""
@@ -4212,9 +6188,7 @@ class InstagramDownloaderGUI(QMainWindow):
         else:
             audio_mode = 'remove'
         self.save_ui_setting('vid_prep_audio_mode', audio_mode)
-        self.save_ui_setting('vid_prep_mp3_path', self.vid_prep_mp3_path.text().strip())
-        self.save_ui_setting('vid_prep_mp3_start', f"{self.vid_prep_mp3_start.value():.3f}")
-        self.save_ui_setting('vid_prep_mp3_end', f"{self.vid_prep_mp3_end.value():.3f}")
+        self.save_ui_setting('vid_prep_mp3_path', self._get_vid_prep_primary_audio_path())
         self.save_ui_setting('vid_prep_selected_topic', (self.vid_prep_selected_topic_input.text() or '').strip())
         self.save_ui_setting('vid_prep_file_prefix', (self.vid_prep_file_prefix_input.text() or '').strip())
         self.save_ui_setting('vid_prep_file_index', self._current_vid_prep_file_index())
@@ -4271,13 +6245,11 @@ class InstagramDownloaderGUI(QMainWindow):
         else:
             self.vid_prep_audio_remove_radio.setChecked(True)
 
-        self.vid_prep_mp3_path.setText(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_mp3_path', self.vid_prep_mp3_path.text()))
-        try:
-            self.vid_prep_mp3_start.setValue(float(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_mp3_start', f"{self.vid_prep_mp3_start.value():.3f}")))
-            self.vid_prep_mp3_end.setValue(float(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_mp3_end', f"{self.vid_prep_mp3_end.value():.3f}")))
-        except Exception:
-            pass
-        self.refresh_vid_prep_audio_library_list(self.vid_prep_mp3_path.text())
+        self.vid_prep_selected_audio_path = self._normalize_vid_prep_audio_path(
+            self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_mp3_path', getattr(self, 'vid_prep_selected_audio_path', ''))
+        )
+        self.refresh_vid_prep_audio_library_list(self.vid_prep_selected_audio_path)
+        self.refresh_vid_prep_sfx_library_list(self.vid_prep_selected_audio_path)
 
         self.vid_prep_selected_topic_input.setText(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_selected_topic', self.vid_prep_selected_topic_input.text()))
         self.vid_prep_file_prefix_input.setText(self.account_manager.get_account_setting(self.current_username, 'ui_vid_prep_file_prefix', self.vid_prep_file_prefix_input.text()))
@@ -4434,7 +6406,7 @@ class InstagramDownloaderGUI(QMainWindow):
             self._set_vid_prep_output_preview_dirty(True)
 
     def browse_vid_prep_mp3(self):
-        """Browse for replacement audio."""
+        """Browse for replacement audio tracks."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Music File",
@@ -4443,8 +6415,9 @@ class InstagramDownloaderGUI(QMainWindow):
         )
         if file_path:
             normalized = self._normalize_vid_prep_audio_path(file_path)
-            self.vid_prep_mp3_path.setText(normalized)
+            self.vid_prep_selected_audio_path = normalized
             self.add_vid_prep_audio_to_library(normalized, select_added=True)
+            self.on_vid_prep_audio_tracks_dropped([normalized])
             self.vid_prep_audio_replace_radio.setChecked(True)
             self.refresh_vid_prep_audio_library_list(normalized)
             self.on_vid_prep_audio_setting_changed()
@@ -4981,6 +6954,12 @@ class InstagramDownloaderGUI(QMainWindow):
         if self.vid_prep_play_timer.isActive():
             return
 
+        source_end = max(0, self.vid_prep_frame_count - 1)
+        current_frame = int(self.vid_prep_scrubber.value())
+        # If the marker is at the end, Play should restart from the beginning.
+        if self.vid_prep_frame_count > 0 and current_frame >= source_end:
+            self.reset_vid_prep_source_to_first_frame()
+
         interval_ms = max(15, int(1000 / max(1.0, self.vid_prep_fps)))
         self.vid_prep_play_start_time = time.monotonic()
         self.vid_prep_play_start_frame = int(self.vid_prep_scrubber.value())
@@ -5014,6 +6993,12 @@ class InstagramDownloaderGUI(QMainWindow):
             self.on_vid_prep_scrubber_changed(0)
         self.vid_prep_status.setText("Source playback stopped.")
 
+    def on_vid_prep_source_loop_toggled(self, enabled):
+        """Enable/disable source playback loop behavior."""
+        self.vid_prep_source_loop_enabled = bool(enabled)
+        self.vid_prep_source_loop_btn.setText("🔁 Loop On" if enabled else "🔁 Loop Off")
+        self.vid_prep_status.setText("Source loop enabled." if enabled else "Source loop disabled.")
+
     def _advance_vid_prep_source_frame(self):
         """Advance the source viewer by one frame during playback."""
         if self.vid_prep_cap is None:
@@ -5023,10 +7008,26 @@ class InstagramDownloaderGUI(QMainWindow):
         next_frame = int(self.vid_prep_scrubber.value()) + 1
         source_end = max(0, self.vid_prep_frame_count - 1)
         if next_frame > source_end:
-            self.vid_prep_play_timer.stop()
-            if self.vid_prep_input_audio_player is not None:
-                self.vid_prep_input_audio_player.pause()
-            self.vid_prep_status.setText("Reached end of source video.")
+            if self.vid_prep_source_loop_enabled and self.vid_prep_frame_count > 0:
+                cv2 = self._get_cv2_for_vid_prep()
+                if cv2 is None:
+                    self.stop_vid_prep_source()
+                    return
+                self.vid_prep_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = self.vid_prep_cap.read()
+                if not ok or frame is None:
+                    self.stop_vid_prep_source()
+                    return
+                self.vid_prep_play_start_time = time.monotonic()
+                self.vid_prep_play_start_frame = 0
+                if self.vid_prep_input_audio_player is not None:
+                    self.vid_prep_input_audio_player.setPosition(0)
+                    self.vid_prep_input_audio_player.play()
+                self._update_vid_prep_source_preview_frame(0, frame, sync_audio=False)
+                return
+
+            # End-of-playback should behave the same as pressing Stop.
+            self.stop_vid_prep_source()
             return
 
         ok, frame = self.vid_prep_cap.read()
@@ -5054,6 +7055,10 @@ class InstagramDownloaderGUI(QMainWindow):
     def on_vid_prep_file_dropped(self, file_path):
         """Handle video file dropped onto Vid Prep preview."""
         self._reset_vid_prep_filename_parts_for_new_source()
+        if hasattr(self, 'vid_prep_video_title_input'):
+            self.vid_prep_video_title_input.clear()
+        if hasattr(self, 'vid_prep_video_desc_input'):
+            self.vid_prep_video_desc_input.clear()
         cv2 = self._get_cv2_for_vid_prep()
         if cv2 is None:
             self._release_vid_prep_capture()
@@ -5074,6 +7079,7 @@ class InstagramDownloaderGUI(QMainWindow):
             if self.vid_prep_input_audio_player is not None:
                 self.vid_prep_input_audio_player.stop()
             self.vid_prep_saved_output_path = None
+            self.load_vid_prep_video_applications(vid_id=None)
             self.vid_prep_open_saved_btn.setEnabled(False)
             self._set_vid_prep_output_media(None)
             self._set_vid_prep_output_preview_dirty(True)
@@ -5128,6 +7134,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.regenerate_vid_prep_output_filename()
         self.update_vid_prep_output_filename_preview()
         self.vid_prep_saved_output_path = None
+        self.load_vid_prep_video_applications(vid_id=None)
         self.vid_prep_open_saved_btn.setEnabled(False)
         self._set_vid_prep_output_media(None)
         self._set_vid_prep_output_preview_dirty(True)
@@ -5255,6 +7262,185 @@ class InstagramDownloaderGUI(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Vid Prep", f"Failed to open File Explorer:\n{e}")
 
+    def load_vid_prep_saved_output_record(self):
+        """Load a previously saved Vid Prep record and repopulate controls."""
+        if not self.content_db or not self.content_db.db:
+            QMessageBox.information(self, "Vid Prep", "Video output database is not available.")
+            return
+
+        start_folder = self.vid_prep_output_folder_path_input.text().strip() if hasattr(self, 'vid_prep_output_folder_path_input') else ''
+        if not start_folder:
+            start_folder = self.vid_prep_output_folder_path or ''
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Saved Vid Prep Output",
+            start_folder,
+            "Video Files (*.mp4 *.mov *.mkv *.m4v *.webm);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            bundle = self.content_db.db.get_video_output_bundle(file_path, account_name=self.current_username)
+        except Exception as e:
+            QMessageBox.warning(self, "Vid Prep", f"Failed to load saved output record:\n{e}")
+            return
+
+        if not bundle:
+            QMessageBox.information(self, "Vid Prep", "No saved output record was found for that file.")
+            return
+
+        self._apply_vid_prep_loaded_output_bundle(bundle)
+
+    def _apply_vid_prep_loaded_output_bundle(self, bundle):
+        """Apply saved Vid Prep database state to the current UI."""
+        source_path = bundle.get('SourcePath') or ''
+        if source_path and os.path.exists(source_path):
+            self.on_vid_prep_file_dropped(source_path)
+        else:
+            self.vid_prep_source_path = source_path or self.vid_prep_source_path
+            if hasattr(self, 'vid_prep_file_label'):
+                self.vid_prep_file_label.setText(f"File: {self.vid_prep_source_path or '(missing source)'}")
+
+        crop_x = bundle.get('CropX')
+        crop_y = bundle.get('CropY')
+        crop_w = bundle.get('CropWidth')
+        crop_h = bundle.get('CropHeight')
+        if None not in (crop_x, crop_y, crop_w, crop_h):
+            self.vid_prep_crop_rect = (int(crop_x), int(crop_y), int(crop_w), int(crop_h))
+            self.vid_prep_crop_label.setText(
+                f"Crop: x={int(crop_x)}, y={int(crop_y)}, w={int(crop_w)}, h={int(crop_h)}"
+            )
+
+        try:
+            self.vid_prep_trim_start_frame = int(bundle.get('TrimStartFrame') or 0)
+            self.vid_prep_trim_end_frame = int(bundle.get('TrimEndFrame') or 0)
+            if hasattr(self, 'vid_prep_trim_slider'):
+                self.vid_prep_trim_slider.setValues(self.vid_prep_trim_start_frame, self.vid_prep_trim_end_frame)
+            self.update_vid_prep_trim_label()
+        except Exception:
+            pass
+
+        if bundle.get('SourceFrameCount') is not None:
+            try:
+                self.vid_prep_frame_count = int(bundle.get('SourceFrameCount') or 0)
+                self.vid_prep_fps = float(bundle.get('SourceFps') or self.vid_prep_fps or 30.0)
+                self.vid_prep_duration_s = float(bundle.get('SourceDurationSeconds') or self.vid_prep_duration_s or 0.0)
+            except Exception:
+                pass
+
+        if bundle.get('OutputPath'):
+            self.vid_prep_saved_output_path = bundle.get('OutputPath')
+            self.vid_prep_last_output_path = bundle.get('OutputPath')
+            self.vid_prep_open_saved_btn.setEnabled(True)
+
+        self.load_vid_prep_video_applications(vid_id=bundle.get('VidID'), preloaded_rows=bundle.get('applications'))
+        self.load_vid_prep_video_nodes(vid_id=bundle.get('VidID'), preloaded_rows=bundle.get('nodes'))
+
+        output_file_name = bundle.get('OutputFileName') or ''
+        if output_file_name and hasattr(self, 'vid_prep_output_filename_input'):
+            self.vid_prep_output_filename_input.setText(output_file_name)
+
+        if hasattr(self, 'vid_prep_video_title_input'):
+            self.vid_prep_video_title_input.setText(bundle.get('VideoFileTitle') or '')
+        if hasattr(self, 'vid_prep_video_desc_input'):
+            desc_val = bundle.get('VideoFileDesc') or ''
+            if desc_val.strip().startswith('<'):
+                self.vid_prep_video_desc_input.setHtml(desc_val)
+            else:
+                self.vid_prep_video_desc_input.setPlainText(desc_val)
+
+        self.vid_prep_selected_topic_input.setText(bundle.get('SelectedTopic') or '')
+        self.vid_prep_file_prefix_input.setText(bundle.get('FilePrefix') or '')
+
+        saved_index = bundle.get('FileIndex') or '01'
+        if saved_index in [self.vid_prep_file_index_combo.itemText(i) for i in range(self.vid_prep_file_index_combo.count())]:
+            self.vid_prep_file_index_combo.setCurrentText(saved_index)
+
+        saved_modifier = bundle.get('Modifier') or '[NOTHING]'
+        if saved_modifier in [self.vid_prep_modifier_combo.itemText(i) for i in range(self.vid_prep_modifier_combo.count())]:
+            self.vid_prep_modifier_combo.setCurrentText(saved_modifier)
+
+        saved_separator = bundle.get('Separator') or '.'
+        if saved_separator in [self.vid_prep_separator_combo.itemText(i) for i in range(self.vid_prep_separator_combo.count())]:
+            self.vid_prep_separator_combo.setCurrentText(saved_separator)
+
+        self.vid_prep_prepend_topic_checkbox.setChecked(bool(bundle.get('PrependTopic')))
+
+        saved_folder_mode = bundle.get('OutputFolderMode') or 'same_as_input'
+        mode_text_map = {
+            'same_as_input': 'Same as input',
+            'user_specified': 'User specified',
+            'default_video_output': 'Default Video Output',
+            'dvo_topic': 'DVO/Topic',
+        }
+        self.vid_prep_output_folder_mode_combo.setCurrentText(mode_text_map.get(saved_folder_mode, 'Same as input'))
+        self.vid_prep_output_folder_path_input.setText(bundle.get('OutputFolderPath') or '')
+
+        if bundle.get('CodecPreset') in [self.vid_prep_codec_preset.itemText(i) for i in range(self.vid_prep_codec_preset.count())]:
+            self.vid_prep_codec_preset.setCurrentText(bundle.get('CodecPreset'))
+        try:
+            self.vid_prep_crf.setValue(int(bundle.get('CRF') or self.vid_prep_crf.value()))
+        except Exception:
+            pass
+
+        if bundle.get('ResolutionPreset') in [self.vid_prep_output_resolution_combo.itemText(i) for i in range(self.vid_prep_output_resolution_combo.count())]:
+            self.vid_prep_output_resolution_combo.setCurrentText(bundle.get('ResolutionPreset'))
+        try:
+            if bundle.get('OutputWidth') is not None:
+                self.vid_prep_output_width.setValue(int(bundle.get('OutputWidth')))
+            if bundle.get('OutputHeight') is not None:
+                self.vid_prep_output_height.setValue(int(bundle.get('OutputHeight')))
+        except Exception:
+            pass
+
+        if bundle.get('BackgroundMode') in [self.vid_prep_bg_mode.itemText(i) for i in range(self.vid_prep_bg_mode.count())]:
+            self.vid_prep_bg_mode.setCurrentText(bundle.get('BackgroundMode'))
+        if bundle.get('BackgroundColor'):
+            self.vid_prep_bg_color = QColor(str(bundle.get('BackgroundColor')))
+        self.vid_prep_bg_image_path.setText(bundle.get('BackgroundImagePath') or '')
+
+        audio_mode = bundle.get('AudioMode') or 'remove'
+        if audio_mode == 'replace':
+            self.vid_prep_audio_replace_radio.setChecked(True)
+        elif audio_mode == 'maintain':
+            self.vid_prep_audio_maintain_radio.setChecked(True)
+        elif audio_mode == 'mix':
+            self.vid_prep_audio_mix_radio.setChecked(True)
+        else:
+            self.vid_prep_audio_remove_radio.setChecked(True)
+
+        self.vid_prep_selected_audio_path = self._normalize_vid_prep_audio_path(bundle.get('AudioFilePath') or '')
+
+        self.vid_prep_audio_tracks = []
+        for track in bundle.get('audio_tracks') or []:
+            self.vid_prep_audio_tracks.append({
+                'track_id': int(track.get('AudioTrackID') or track.get('track_id') or self.vid_prep_next_audio_track_id),
+                'track_path': track.get('TrackPath') or track.get('track_path') or '',
+                'track_name': track.get('TrackName') or track.get('track_name') or '',
+                'volume_percent': float(track.get('VolumePercent') if track.get('VolumePercent') is not None else track.get('volume_percent') or 100.0),
+                'clip_start_seconds': float(track.get('ClipStartSeconds') if track.get('ClipStartSeconds') is not None else track.get('clip_start_seconds') or 0.0),
+                'clip_end_seconds': float(track.get('ClipEndSeconds') if track.get('ClipEndSeconds') is not None else track.get('clip_end_seconds') or 0.0),
+                'enter_frame': int(track.get('EnterFrame') if track.get('EnterFrame') is not None else track.get('enter_frame') or 0),
+                'exit_frame': int(track.get('ExitFrame') if track.get('ExitFrame') is not None else track.get('exit_frame') or 0),
+                'fade_in_seconds': float(track.get('FadeInSeconds') if track.get('FadeInSeconds') is not None else track.get('fade_in_seconds') or 0.0),
+                'fade_out_seconds': float(track.get('FadeOutSeconds') if track.get('FadeOutSeconds') is not None else track.get('fade_out_seconds') or 0.0),
+            })
+
+        if self.vid_prep_audio_tracks:
+            max_track_id = max(int(track.get('track_id', 0)) for track in self.vid_prep_audio_tracks)
+            self.vid_prep_next_audio_track_id = max_track_id + 1
+        else:
+            self.vid_prep_next_audio_track_id = 1
+
+        self._refresh_vid_prep_audio_track_list(self.vid_prep_audio_tracks[0]['track_id'] if self.vid_prep_audio_tracks else None)
+        self._set_vid_prep_output_media(self.vid_prep_saved_output_path)
+        if self.vid_prep_saved_output_path and os.path.exists(self.vid_prep_saved_output_path):
+            self.vid_prep_output_preview_dirty = False
+        self.update_vid_prep_output_filename_preview()
+        self.vid_prep_status.setText(f"Loaded saved Vid Prep record from {bundle.get('OutputPath')}")
+
     def _get_vid_prep_output_dimensions(self, crop_w, crop_h):
         """Resolve the target output dimensions from the current resolution preset."""
         preset = self.vid_prep_output_resolution_combo.currentText()
@@ -5312,88 +7498,125 @@ class InstagramDownloaderGUI(QMainWindow):
 
         base_video_filter = f"crop={w}:{h}:{x}:{y},scale={target_w}:{target_h}:force_original_aspect_ratio=decrease"
 
-        audio_remove = self.vid_prep_audio_remove_radio.isChecked()
-        audio_replace = self.vid_prep_audio_replace_radio.isChecked()
-        audio_mix = self.vid_prep_audio_mix_radio.isChecked()
-        needs_music_input = audio_replace or audio_mix
+        audio_mode = self._current_vid_prep_audio_mode()
+        include_source_audio = audio_mode in ('maintain', 'mix')
+        include_music_audio = audio_mode in ('replace', 'mix')
+        track_payloads = self._build_vid_prep_audio_track_payload()
+        active_track_payloads = track_payloads if include_music_audio else []
 
-        mp3_path = None
-        mp3_start_s = 0.0
-        if needs_music_input:
-            mp3_path = self.vid_prep_mp3_path.text().strip()
-            if not mp3_path or not os.path.exists(mp3_path):
-                raise ValueError("Choose a valid audio file for Music/Mix audio mode.")
-
-            mp3_start_s = float(self.vid_prep_mp3_start.value())
-            mp3_end_s = float(self.vid_prep_mp3_end.value())
-            if mp3_end_s <= mp3_start_s:
-                raise ValueError("Replacement audio end time must be greater than start time.")
+        if include_music_audio and not active_track_payloads:
+            raise ValueError("Add at least one audio track for Music/Mix audio mode.")
 
         cmd = [ffmpeg_bin, "-y", "-ss", f"{trim_start_s:.3f}", "-to", f"{trim_end_s:.3f}", "-i", self.vid_prep_source_path]
+
+        next_input_index = 1
+        bg_input_index = None
+        track_input_indices = []
 
         if bg_mode == "Image File":
             bg_image_path = self.vid_prep_bg_image_path.text().strip()
             if not bg_image_path or not os.path.exists(bg_image_path):
                 raise ValueError("Choose a valid background image file or pick a different background mode.")
             cmd.extend(["-loop", "1", "-i", bg_image_path])
-            if mp3_path:
-                cmd.extend(["-ss", f"{mp3_start_s:.3f}", "-t", f"{trim_duration:.3f}", "-i", mp3_path])
-            filter_complex = (
+            bg_input_index = next_input_index
+            next_input_index += 1
+
+        for track in active_track_payloads:
+            track_path = str(track.get('track_path') or '').strip()
+            if not track_path or not os.path.exists(track_path):
+                raise ValueError(f"Audio track file is missing: {track_path or '(empty)'}")
+            cmd.extend(["-i", track_path])
+            track_input_indices.append(next_input_index)
+            next_input_index += 1
+
+        def _track_filter_chain(track_data, input_index, output_label):
+            clip_start = max(0.0, float(track_data.get('clip_start_seconds') or 0.0))
+            clip_end = float(track_data.get('clip_end_seconds') or 0.0)
+            enter_frame = int(track_data.get('enter_frame') or 0)
+            exit_frame = int(track_data.get('exit_frame') or 0)
+            volume_percent = float(track_data.get('volume_percent') or 100.0)
+            fade_in_seconds = max(0.0, float(track_data.get('fade_in_seconds') or 0.0))
+            fade_out_seconds = max(0.0, float(track_data.get('fade_out_seconds') or 0.0))
+
+            timeline_duration = None
+            if exit_frame > enter_frame:
+                timeline_duration = max(0.0, (exit_frame - enter_frame) / max(1.0, self.vid_prep_fps or 30.0))
+
+            clip_duration = None
+            if clip_end > clip_start:
+                clip_duration = clip_end - clip_start
+
+            end_time = None
+            if clip_duration is not None:
+                end_time = clip_end
+            if timeline_duration is not None:
+                timeline_end = clip_start + timeline_duration
+                end_time = timeline_end if end_time is None else min(end_time, timeline_end)
+
+            track_duration = None
+            if end_time is not None and end_time > clip_start:
+                track_duration = end_time - clip_start
+
+            start_offset_frames = max(0, -enter_frame)
+            source_start = clip_start + (start_offset_frames / max(1.0, self.vid_prep_fps or 30.0))
+            source_end = None
+            if clip_end > clip_start:
+                source_end = clip_end + (start_offset_frames / max(1.0, self.vid_prep_fps or 30.0))
+
+            parts = [f"[{input_index}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"]
+            if source_end is not None and source_end > source_start:
+                parts.append(f"atrim=start={source_start:.3f}:end={source_end:.3f}")
+            elif source_start > 0:
+                parts.append(f"atrim=start={source_start:.3f}")
+            parts.append("asetpts=PTS-STARTPTS")
+            if abs(volume_percent - 100.0) > 0.01:
+                parts.append(f"volume={volume_percent / 100.0:.3f}")
+            if fade_in_seconds > 0:
+                parts.append(f"afade=t=in:st=0:d={fade_in_seconds:.3f}")
+            if fade_out_seconds > 0 and track_duration is not None:
+                fade_out_start = max(0.0, track_duration - fade_out_seconds)
+                parts.append(f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_seconds:.3f}")
+            if enter_frame > 0:
+                delay_ms = int(round((enter_frame / max(1.0, self.vid_prep_fps or 30.0)) * 1000.0))
+                parts.append(f"adelay={delay_ms}|{delay_ms}")
+            parts.append("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo")
+            return f"{','.join(parts)}[{output_label}]"
+
+        if bg_mode == "Image File":
+            video_filter = (
                 f"[0:v]{base_video_filter}[fg];"
-                f"[1:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}[bg];"
+                f"[{bg_input_index}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}[bg];"
                 f"[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
             )
-            if audio_mix:
-                filter_complex += ";[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[srca];[2:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mixa];[srca][mixa]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-            cmd.extend(["-filter_complex", filter_complex, "-map", "[v]"])
-            if audio_mix:
-                cmd.extend(["-map", "[aout]"])
-            elif audio_replace:
-                cmd.extend(["-map", "2:a:0"])
-            elif not audio_remove:
-                cmd.extend(["-map", "0:a:0?"])
         elif bg_mode == "Zoom Source":
-            if mp3_path:
-                cmd.extend(["-ss", f"{mp3_start_s:.3f}", "-t", f"{trim_duration:.3f}", "-i", mp3_path])
-            filter_complex = (
+            video_filter = (
                 f"[0:v]split=2[bgsrc][fgsrc];"
                 f"[bgsrc]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},boxblur=10:1[bg];"
                 f"[fgsrc]{base_video_filter}[fg];"
                 f"[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
             )
-            if audio_mix:
-                filter_complex += ";[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[srca];[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mixa];[srca][mixa]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-            cmd.extend(["-filter_complex", filter_complex, "-map", "[v]"])
-            if audio_mix:
-                cmd.extend(["-map", "[aout]"])
-            elif audio_replace:
-                cmd.extend(["-map", "1:a:0"])
-            elif not audio_remove:
-                cmd.extend(["-map", "0:a:0?"])
         else:
-            if audio_mix:
-                cmd.extend(["-ss", f"{mp3_start_s:.3f}", "-t", f"{trim_duration:.3f}", "-i", mp3_path])
-                filter_complex = (
-                    f"[0:v]{base_video_filter},pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color={bg_color},format=yuv420p[v];"
-                    f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[srca];"
-                    f"[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mixa];"
-                    f"[srca][mixa]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-                )
-                cmd.extend(["-filter_complex", filter_complex, "-map", "[v]", "-map", "[aout]"])
-            elif audio_replace:
-                cmd.extend(["-ss", f"{mp3_start_s:.3f}", "-t", f"{trim_duration:.3f}", "-i", mp3_path])
-                cmd.extend(["-map", "0:v:0", "-map", "1:a:0"])
-            elif not audio_remove:
-                cmd.extend(["-map", "0:v:0", "-map", "0:a:0?"])
-            if not audio_mix:
-                cmd.extend(["-vf", f"{base_video_filter},pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color={bg_color},format=yuv420p"])
+            video_filter = (
+                f"[0:v]{base_video_filter},pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color={bg_color},format=yuv420p[v]"
+            )
 
-        if audio_remove:
-            cmd.extend(["-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf)])
-        elif audio_replace or audio_mix:
-            cmd.extend(["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-c:a", "aac", "-shortest"])
+        audio_filters = []
+        audio_labels = []
+
+        if include_source_audio:
+            audio_filters.append("[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[srca]")
+            audio_labels.append("[srca]")
+
+        for idx, track in zip(track_input_indices, active_track_payloads):
+            label = f"trk{len(audio_labels)}"
+            audio_filters.append(_track_filter_chain(track, idx, label))
+            audio_labels.append(f"[{label}]")
+
+        if audio_labels:
+            audio_filters.append(f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=2[aout]")
+            cmd.extend(["-filter_complex", ";".join([video_filter] + audio_filters), "-map", "[v]", "-map", "[aout]", "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-c:a", "aac", "-shortest"])
         else:
-            cmd.extend(["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-c:a", "aac"])
+            cmd.extend(["-filter_complex", video_filter, "-map", "[v]", "-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf)])
 
         cmd.append(str(output_path))
         return cmd
@@ -5435,8 +7658,9 @@ class InstagramDownloaderGUI(QMainWindow):
     def save_vid_prep_output(self):
         """Process and save cropped video with selected audio mode."""
         output_path = self._build_vid_prep_output_path(self.vid_prep_source_path)
+        overwrite_existing = output_path.exists()
 
-        if output_path.exists():
+        if overwrite_existing:
             overwrite = QMessageBox.question(
                 self,
                 "Vid Prep",
@@ -5468,6 +7692,16 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_status.setText("Export failed.")
             return
 
+        metadata_warning = ''
+        try:
+            vid_id = self.persist_vid_prep_output_metadata(output_path, overwrite_existing, ffmpeg_command=cmd)
+            self.persist_vid_prep_video_applications(vid_id)
+            self.persist_vid_prep_video_nodes(vid_id)
+            logger.info(f"Persisted Vid Prep metadata to VIDEO.VideoOutput VidID={vid_id}")
+        except Exception as e:
+            metadata_warning = str(e)
+            logger.error(f"Failed to persist Vid Prep metadata: {e}")
+
         self.vid_prep_last_output_path = str(output_path)
         self.vid_prep_saved_output_path = str(output_path)
         self.vid_prep_open_saved_btn.setEnabled(True)
@@ -5478,7 +7712,15 @@ class InstagramDownloaderGUI(QMainWindow):
         self._set_vid_prep_output_preview_dirty(False)
         self._increment_vid_prep_file_index()
         self.regenerate_vid_prep_output_filename()
-        QMessageBox.information(self, "Vid Prep", f"Saved output:\n{output_path}")
+        if metadata_warning:
+            self.vid_prep_status.setText(f"Saved: {output_path} (metadata save failed)")
+            QMessageBox.warning(
+                self,
+                "Vid Prep",
+                f"Saved output:\n{output_path}\n\nMetadata/applications persistence failed:\n{metadata_warning}",
+            )
+        else:
+            QMessageBox.information(self, "Vid Prep", f"Saved output:\n{output_path}")
     
     def create_topics_tab(self):
         """Create the Topics management tab"""
@@ -5689,6 +7931,28 @@ class InstagramDownloaderGUI(QMainWindow):
         self.settings_stop_duplicate_check.stateChanged.connect(self.toggle_stop_at_duplicate_from_settings)
         self.settings_stop_duplicate_check.setToolTip("Stop loading new posts from Instagram when encountering a post already in database")
         app_layout.addWidget(self.settings_stop_duplicate_check)
+
+        # Soccr API client mode
+        soccr_api_mode_row = QHBoxLayout()
+        soccr_api_mode_row.addWidget(QLabel("Soccr API Client:"))
+        self.settings_soccr_api_mode_combo = QComboBox()
+        self.settings_soccr_api_mode_combo.addItem("Off (Not configured)", 'off')
+        self.settings_soccr_api_mode_combo.addItem("Dev (http://localhost:1761)", 'dev')
+        self.settings_soccr_api_mode_combo.addItem("Prod (https://www.soccr.org)", 'prod')
+        selected_idx = self.settings_soccr_api_mode_combo.findData(self.soccr_api_client_mode)
+        self.settings_soccr_api_mode_combo.setCurrentIndex(selected_idx if selected_idx >= 0 else 1)
+        self.settings_soccr_api_mode_combo.currentIndexChanged.connect(self.change_soccr_api_mode_from_settings)
+        self.settings_soccr_api_mode_combo.setToolTip(
+            "Choose how qs.api.client.soccr.io.python is configured: Off, Dev localhost, or Prod soccr.org"
+        )
+        soccr_api_mode_row.addWidget(self.settings_soccr_api_mode_combo)
+        self.settings_soccr_test_button = QPushButton("Test Client")
+        self.settings_soccr_test_button.setEnabled(self.soccr_api_client_mode != 'off')
+        self.settings_soccr_test_button.setToolTip("Call techniques service test endpoint (/api/v1/Techniques/test)")
+        self.settings_soccr_test_button.clicked.connect(self.test_soccr_client_from_settings)
+        soccr_api_mode_row.addWidget(self.settings_soccr_test_button)
+        soccr_api_mode_row.addStretch()
+        app_layout.addLayout(soccr_api_mode_row)
         
         app_group.setLayout(app_layout)
         settings_layout.addWidget(app_group)
@@ -5884,6 +8148,91 @@ class InstagramDownloaderGUI(QMainWindow):
         self.auto_fetch_new_thumbnails = (state == Qt.Checked)
         self.account_manager.set_setting('auto_fetch_new_thumbnails', 'true' if self.auto_fetch_new_thumbnails else 'false')
         logger.info(f"Auto-fetch new thumbnails: {self.auto_fetch_new_thumbnails}")
+
+    def change_soccr_api_mode_from_settings(self, index):
+        """Persist Soccr API client mode and host target from Settings tab."""
+        if not hasattr(self, 'settings_soccr_api_mode_combo'):
+            return
+
+        previous_mode = getattr(self, 'soccr_api_client_mode', 'dev')
+        selected_mode = self.settings_soccr_api_mode_combo.itemData(index)
+        self.soccr_api_client_mode = config.normalize_soccr_api_client_mode(selected_mode)
+        self.account_manager.set_setting('soccr_api_client_mode', self.soccr_api_client_mode)
+        if hasattr(self, 'settings_soccr_test_button'):
+            self.settings_soccr_test_button.setEnabled(self.soccr_api_client_mode != 'off')
+
+        if self.soccr_api_client_mode == 'prod' and previous_mode != 'prod':
+            QMessageBox.warning(
+                self,
+                "Production API Selected",
+                "Soccr API client is now set to PROD (https://www.soccr.org).\n\n"
+                "You are now calling the production environment."
+            )
+
+        host = config.get_soccr_api_client_host(self.soccr_api_client_mode)
+        if host:
+            logger.info("Soccr API client mode set to %s (%s)", self.soccr_api_client_mode, host)
+            if hasattr(self, 'settings_status'):
+                self.settings_status.setText(f"Soccr API client set to {self.soccr_api_client_mode.upper()} ({host})")
+        else:
+            logger.info("Soccr API client mode set to OFF")
+            if hasattr(self, 'settings_status'):
+                self.settings_status.setText("Soccr API client set to OFF (Not configured)")
+
+    def test_soccr_client_from_settings(self):
+        """Call techniques test endpoint using current soccr_api_client mode."""
+        if self.soccr_api_client_mode == 'off':
+            self.settings_status.setText("Soccr API client is OFF. Select Dev or Prod to test.")
+            return
+
+        if self.soccr_client_test_thread and self.soccr_client_test_thread.isRunning():
+            self.settings_status.setText("Soccr API client test already running...")
+            return
+
+        host = self.get_soccr_api_client_host()
+        self.settings_status.setText(f"Testing Soccr API client against {host}...")
+        if hasattr(self, 'settings_soccr_test_button'):
+            self.settings_soccr_test_button.setEnabled(False)
+            self.settings_soccr_test_button.setText("Testing...")
+
+        self.soccr_client_test_thread = SoccrTechniquesTestThread(self.get_soccr_api_client_configuration)
+        self.soccr_client_test_thread.test_completed.connect(self.on_soccr_client_test_completed)
+        self.soccr_client_test_thread.start()
+
+    def on_soccr_client_test_completed(self, success, result_text, elapsed_s):
+        """Handle completion of techniques test endpoint call."""
+        if hasattr(self, 'settings_soccr_test_button'):
+            self.settings_soccr_test_button.setText("Test Client")
+            self.settings_soccr_test_button.setEnabled(self.soccr_api_client_mode != 'off')
+
+        host = self.get_soccr_api_client_host() or "OFF"
+        elapsed_label = f"{elapsed_s:.2f}s"
+        if success:
+            self.settings_status.setText(f"Soccr test OK ({host}) in {elapsed_label}: {result_text}")
+            logger.info("Soccr techniques test succeeded for host %s in %s: %s", host, elapsed_label, result_text)
+        else:
+            self.settings_status.setText(f"Soccr test FAILED ({host}) in {elapsed_label}: {result_text}")
+            logger.error("Soccr techniques test failed for host %s in %s: %s", host, elapsed_label, result_text)
+            is_timeout = 'timeout' in (result_text or '').lower()
+            guidance = (
+                "The API might be off, warming up, or the OpenAPI API implementation is broken.\n\n"
+                "Timeout detected while waiting for response."
+                if is_timeout else
+                "The API might be off, warming up, or the OpenAPI API implementation is broken."
+            )
+            QMessageBox.warning(
+                self,
+                "Soccr API Test Failed",
+                f"{guidance}\n\nDetails: {result_text}"
+            )
+
+    def get_soccr_api_client_host(self):
+        """Get active Soccr API host from current Settings mode."""
+        return config.get_soccr_api_client_host(self.soccr_api_client_mode)
+
+    def get_soccr_api_client_configuration(self):
+        """Get soccr_api_client Configuration instance for current mode, or None when off."""
+        return config.create_soccr_api_client_configuration(self.soccr_api_client_mode)
     
     def change_theme_from_settings(self, theme_text):
         """Change theme from settings dropdown"""
@@ -7356,6 +9705,7 @@ class InstagramDownloaderGUI(QMainWindow):
         # Run in background thread
         self.load_thread = LoadSavedThread(self.instagram_manager, self.content_db, self.stop_at_first_duplicate, existing_shortcodes)
         self.load_thread.post_loaded.connect(self.add_post_to_list)
+        self.load_thread.duplicate_post_loaded.connect(self.add_duplicate_post_to_list)
         self.load_thread.progress.connect(self.update_load_progress)
         self.load_thread.finished.connect(self.load_posts_finished)
         self.load_thread.error.connect(self.load_posts_error)
@@ -7621,6 +9971,103 @@ class InstagramDownloaderGUI(QMainWindow):
                 self.stop_thumbnails_btn.setVisible(True)
         
         self.browse_status.setText(f"Loaded {len(self.saved_posts)} posts...")
+    
+    def add_duplicate_post_to_list(self, post):
+        """Add a duplicate post to the browse table with bright green color and skip mark.
+        
+        Args:
+            post: Post dictionary that already exists in the database
+        """
+        logger.debug(f"add_duplicate_post_to_list called for {post.get('shortcode', 'unknown')}")
+        self.saved_posts.append(post)
+        
+        # Temporarily disable sorting for faster insertion
+        was_sorting = self.posts_table.isSortingEnabled()
+        self.posts_table.setSortingEnabled(False)
+        
+        # Add row to table
+        row = self.posts_table.rowCount()
+        self.posts_table.insertRow(row)
+        
+        # Column 0: Thumbnail
+        shortcode = post.get('shortcode', 'unknown')
+        thumbnail_label = self.create_thumbnail_widget(shortcode, post)
+        self.posts_table.setCellWidget(row, 0, thumbnail_label)
+        
+        # Bright green color for duplicates
+        bright_green = QColor(34, 177, 76)  # Bright green
+        
+        # Column 1: Row Number from database
+        row_number = post.get('row_number', 0)
+        row_item = QTableWidgetItem()
+        row_item.setData(Qt.DisplayRole, row_number)
+        row_item.setForeground(bright_green)
+        row_item.setFont(self._get_bold_font())
+        self.posts_table.setItem(row, 1, row_item)
+        
+        # Column 2: Shortcode with SKIP mark
+        shortcode_text = "⊘ SKIP: " + shortcode
+        id_item = QTableWidgetItem(shortcode_text)
+        id_item.setForeground(bright_green)
+        id_item.setFont(self._get_bold_font())
+        self.posts_table.setItem(row, 2, id_item)
+        
+        # Column 3: Account
+        account_item = QTableWidgetItem(post['owner_username'])
+        account_item.setForeground(bright_green)
+        account_item.setFont(self._get_bold_font())
+        self.posts_table.setItem(row, 3, account_item)
+        
+        # Column 4: Caption
+        caption = post['caption'][:100] + "..." if len(post['caption']) > 100 else post['caption']
+        caption_item = QTableWidgetItem(caption)
+        caption_item.setData(Qt.UserRole, post)
+        caption_item.setForeground(bright_green)
+        caption_item.setFont(self._get_bold_font())
+        self.posts_table.setItem(row, 4, caption_item)
+        
+        # Column 5: Type
+        if post['typename'] == "GraphImage":
+            type_text = "📸 POST"
+        elif post['typename'] == "GraphVideo":
+            type_text = "🎥 VIDEO"
+        else:
+            type_text = "📸 CAROUSEL"
+        type_item = QTableWidgetItem(type_text)
+        type_item.setForeground(bright_green)
+        type_item.setFont(self._get_bold_font())
+        self.posts_table.setItem(row, 5, type_item)
+        
+        # Column 6: Status - mark as "In Database" (skipped from processing)
+        status_text = "✓ In Database (Skip)"
+        status_item = QTableWidgetItem(status_text)
+        status_item.setForeground(bright_green)
+        status_item.setFont(self._get_bold_font())
+        self.posts_table.setItem(row, 6, status_item)
+        
+        # Light green background for all columns
+        light_green_bg = QColor(200, 255, 200)  # Light green background
+        for col in range(self.posts_table.columnCount()):
+            item = self.posts_table.item(row, col)
+            if item:
+                item.setBackground(light_green_bg)
+        
+        # Column 7: Info button explaining it's being skipped
+        info_btn = QPushButton("ℹ️ Already Saved")
+        info_btn.setMaximumWidth(100)
+        info_btn.setStyleSheet("QPushButton { background-color: #22B14C; color: white; font-weight: bold; }")
+        info_btn.setToolTip("This post is already in your database - skipping download to avoid duplicates")
+        self.posts_table.setCellWidget(row, 7, info_btn)
+        
+        # Re-enable sorting if it was enabled before
+        if was_sorting:
+            self.posts_table.setSortingEnabled(True)
+    
+    def _get_bold_font(self):
+        """Get a bold font for highlighting"""
+        font = QFont()
+        font.setBold(True)
+        return font
     
     def update_load_progress(self, total_fetched, new_count, existing_count, current_shortcode):
         """Update Process Manager with loading progress"""
@@ -10125,8 +12572,24 @@ class InstagramDownloaderGUI(QMainWindow):
                 self._save_topic_tree_expansion_state(topic_tree)
                 self._save_topic_tree_scroll_position(topic_tree)
             dialog.finished.connect(save_all_state)
+
+            def scroll_tree_to_top(tree_widget):
+                tree_widget.verticalScrollBar().setValue(tree_widget.verticalScrollBar().minimum())
+
+            def scroll_tree_to_bottom(tree_widget):
+                tree_widget.verticalScrollBar().setValue(tree_widget.verticalScrollBar().maximum())
+
+            existing_scroll_buttons = QHBoxLayout()
+            existing_scroll_buttons.addStretch()
+            existing_scroll_top_btn = QPushButton("Scroll to Top")
+            existing_scroll_top_btn.clicked.connect(lambda: scroll_tree_to_top(topic_tree))
+            existing_scroll_buttons.addWidget(existing_scroll_top_btn)
+            existing_scroll_bottom_btn = QPushButton("Scroll to Bottom")
+            existing_scroll_bottom_btn.clicked.connect(lambda: scroll_tree_to_bottom(topic_tree))
+            existing_scroll_buttons.addWidget(existing_scroll_bottom_btn)
+            existing_layout.addLayout(existing_scroll_buttons)
             
-            existing_layout.addWidget(topic_tree)
+            existing_layout.addWidget(topic_tree, 1)
             
             layout.addWidget(existing_panel)
             
@@ -10213,7 +12676,7 @@ class InstagramDownloaderGUI(QMainWindow):
             
             parent_tree = QTreeWidget()
             parent_tree.setHeaderLabels(["Topic Name"])
-            parent_tree.setMaximumHeight(350)
+            parent_tree.setMinimumHeight(420)
             parent_tree.setSelectionMode(QTreeWidget.SingleSelection)
             
             # Add Root node
@@ -10250,9 +12713,18 @@ class InstagramDownloaderGUI(QMainWindow):
             def on_parent_changed():
                 update_path_from_parent()
             parent_tree.itemSelectionChanged.connect(on_parent_changed)
+
+            new_scroll_buttons = QHBoxLayout()
+            new_scroll_buttons.addStretch()
+            new_scroll_top_btn = QPushButton("Scroll to Top")
+            new_scroll_top_btn.clicked.connect(lambda: scroll_tree_to_top(parent_tree))
+            new_scroll_buttons.addWidget(new_scroll_top_btn)
+            new_scroll_bottom_btn = QPushButton("Scroll to Bottom")
+            new_scroll_bottom_btn.clicked.connect(lambda: scroll_tree_to_bottom(parent_tree))
+            new_scroll_buttons.addWidget(new_scroll_bottom_btn)
+            new_layout.addLayout(new_scroll_buttons)
             
-            new_layout.addWidget(parent_tree)
-            new_layout.addStretch()
+            new_layout.addWidget(parent_tree, 1)
             
             new_panel.setVisible(False)  # Hidden by default
             layout.addWidget(new_panel)
@@ -18924,6 +21396,9 @@ class InstagramDownloaderGUI(QMainWindow):
     def resizeEvent(self, event):
         """Handle window resize - debounce and refresh tiles"""
         super().resizeEvent(event)
+
+        if hasattr(self, 'vid_prep_preview_splitter'):
+            self._enforce_vid_prep_equal_panel_widths()
         
         # Only refresh tiles if in tile view mode
         if self.current_view_mode == 'tiles':
