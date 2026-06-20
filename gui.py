@@ -1506,6 +1506,23 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_technique_class_cache = {}
         self.vid_prep_technique_type_cache = {}
         self.vid_prep_series_cache = {}
+
+        # FrameVid state
+        self.framevid_source_items = []
+        self.framevid_audio_tracks = []
+        self.framevid_next_audio_track_id = 1
+        self._framevid_audio_track_editor_updating = False
+        self.framevid_last_preview_path = None
+
+        # Extract Audio state
+        self.audio_extract_source_path = None
+        self.audio_extract_cap = None
+        self.audio_extract_frame_count = 0
+        self.audio_extract_fps = 30.0
+        self.audio_extract_duration_s = 0.0
+        self.audio_extract_trim_start_frame = 0
+        self.audio_extract_trim_end_frame = 0
+        self.audio_extract_repeat_enabled = False
         
         # Load settings BEFORE init_ui (which creates the checkboxes)
         self.auto_load_at_startup = self.account_manager.get_setting('auto_load_at_startup', 'true') == 'true'
@@ -1550,6 +1567,8 @@ class InstagramDownloaderGUI(QMainWindow):
         self.create_download_tab()
         self.create_content_tab()
         self.create_vid_prep_tab()
+        self.create_extract_audio_tab()
+        self.create_framevid_tab()
         self.create_topics_tab()
         self.create_settings_tab()
         self.create_account_tab()
@@ -3343,9 +3362,7 @@ class InstagramDownloaderGUI(QMainWindow):
             for idx, post in enumerate(page_posts):
                 row = idx // columns
                 col = idx % columns
-                db_row_number = post.get('row_number')
-                if db_row_number is None:
-                    db_row_number = start + idx + 1
+                db_row_number = self._resolve_tile_row_number(post)
                 tile = self.create_tile_widget(post, row_number=db_row_number, open_explorer_target='topic')
                 self.content_tiles_grid.addWidget(tile, row, col)
 
@@ -4609,6 +4626,1914 @@ class InstagramDownloaderGUI(QMainWindow):
         self._save_vid_prep_ui_settings()
         self._set_vid_prep_output_preview_dirty(True)
 
+    def create_extract_audio_tab(self):
+        """Create tab for extracting audio from video sources."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        instructions = QLabel(
+            "Load a source video, set audio trim start/end in frames, preview audio, then save the extracted audio file."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Source Video:"))
+        self.audio_extract_source_input = QLineEdit()
+        self.audio_extract_source_input.setReadOnly(True)
+        self.audio_extract_source_input.setPlaceholderText("No source video selected")
+        source_row.addWidget(self.audio_extract_source_input, 1)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self.on_audio_extract_browse_video)
+        source_row.addWidget(browse_btn)
+        layout.addLayout(source_row)
+
+        self.audio_extract_video_widget = QVideoWidget()
+        self.audio_extract_video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.audio_extract_video_widget.setStyleSheet(
+            "QVideoWidget { background-color: #111; border: 1px solid #3a3a3a; }"
+        )
+        layout.addWidget(self.audio_extract_video_widget, 1)
+
+        layout.addWidget(QLabel("Audio Trim Range (Frames)"))
+        self.audio_extract_trim_slider = VideoTrimRangeSlider()
+        self.audio_extract_trim_slider.setRange(0, 0)
+        self.audio_extract_trim_slider.setValues(0, 0)
+        self.audio_extract_trim_slider.range_changed.connect(self.on_audio_extract_trim_changed)
+        layout.addWidget(self.audio_extract_trim_slider)
+
+        self.audio_extract_trim_label = QLabel("Trim: 00:00.000 -> 00:00.000")
+        layout.addWidget(self.audio_extract_trim_label)
+
+        trim_adjust_row = QHBoxLayout()
+        trim_adjust_row.setContentsMargins(0, 0, 0, 0)
+        trim_adjust_row.setSpacing(4)
+        trim_adjust_row.addWidget(QLabel("Start:"))
+        start_minus_btn = QPushButton("-1f")
+        start_minus_btn.setFixedHeight(24)
+        start_minus_btn.clicked.connect(lambda: self.step_audio_extract_trim('start', -1))
+        trim_adjust_row.addWidget(start_minus_btn)
+        start_plus_btn = QPushButton("+1f")
+        start_plus_btn.setFixedHeight(24)
+        start_plus_btn.clicked.connect(lambda: self.step_audio_extract_trim('start', 1))
+        trim_adjust_row.addWidget(start_plus_btn)
+        trim_adjust_row.addSpacing(10)
+        trim_adjust_row.addWidget(QLabel("End:"))
+        end_minus_btn = QPushButton("-1f")
+        end_minus_btn.setFixedHeight(24)
+        end_minus_btn.clicked.connect(lambda: self.step_audio_extract_trim('end', -1))
+        trim_adjust_row.addWidget(end_minus_btn)
+        end_plus_btn = QPushButton("+1f")
+        end_plus_btn.setFixedHeight(24)
+        end_plus_btn.clicked.connect(lambda: self.step_audio_extract_trim('end', 1))
+        trim_adjust_row.addWidget(end_plus_btn)
+        trim_adjust_row.addStretch(1)
+        layout.addLayout(trim_adjust_row)
+
+        preview_controls = QHBoxLayout()
+        preview_controls.setContentsMargins(0, 0, 0, 0)
+        preview_controls.setSpacing(4)
+        self.audio_extract_start_btn = QPushButton("Start")
+        self.audio_extract_start_btn.setFixedHeight(24)
+        self.audio_extract_start_btn.clicked.connect(self.seek_audio_extract_to_start)
+        preview_controls.addWidget(self.audio_extract_start_btn)
+        self.audio_extract_play_btn = QPushButton("Play")
+        self.audio_extract_play_btn.setFixedHeight(24)
+        self.audio_extract_play_btn.clicked.connect(self.play_audio_extract_preview)
+        preview_controls.addWidget(self.audio_extract_play_btn)
+        self.audio_extract_pause_btn = QPushButton("Pause")
+        self.audio_extract_pause_btn.setFixedHeight(24)
+        self.audio_extract_pause_btn.clicked.connect(self.pause_audio_extract_preview)
+        preview_controls.addWidget(self.audio_extract_pause_btn)
+        self.audio_extract_end_btn = QPushButton("End")
+        self.audio_extract_end_btn.setFixedHeight(24)
+        self.audio_extract_end_btn.clicked.connect(self.seek_audio_extract_to_end)
+        preview_controls.addWidget(self.audio_extract_end_btn)
+        self.audio_extract_repeat_btn = QPushButton("Repeat Off")
+        self.audio_extract_repeat_btn.setFixedHeight(24)
+        self.audio_extract_repeat_btn.setCheckable(True)
+        self.audio_extract_repeat_btn.toggled.connect(self.on_audio_extract_repeat_toggled)
+        preview_controls.addWidget(self.audio_extract_repeat_btn)
+        preview_controls.addStretch(1)
+        layout.addLayout(preview_controls)
+
+        self.audio_extract_position_slider = QSlider(Qt.Horizontal)
+        self.audio_extract_position_slider.setRange(0, 0)
+        self.audio_extract_position_slider.sliderMoved.connect(self.seek_audio_extract_preview)
+        layout.addWidget(self.audio_extract_position_slider)
+
+        self.audio_extract_time_label = QLabel("00:00.000 / 00:00.000")
+        layout.addWidget(self.audio_extract_time_label)
+
+        export_row = QHBoxLayout()
+        export_row.addWidget(QLabel("Format:"))
+        self.audio_extract_format_combo = QComboBox()
+        self.audio_extract_format_combo.addItems(["mp3", "m4a", "wav"])
+        export_row.addWidget(self.audio_extract_format_combo)
+        self.audio_extract_save_btn = QPushButton("Save Audio...")
+        self.audio_extract_save_btn.clicked.connect(self.save_extracted_audio)
+        export_row.addWidget(self.audio_extract_save_btn)
+        self.audio_extract_save_music_btn = QPushButton("Save and Add to Music")
+        self.audio_extract_save_music_btn.clicked.connect(self.save_and_add_extracted_audio_to_music)
+        export_row.addWidget(self.audio_extract_save_music_btn)
+        self.audio_extract_save_effects_btn = QPushButton("Save and Add to Effects")
+        self.audio_extract_save_effects_btn.clicked.connect(self.save_and_add_extracted_audio_to_effects)
+        export_row.addWidget(self.audio_extract_save_effects_btn)
+        export_row.addStretch(1)
+        layout.addLayout(export_row)
+
+        self.audio_extract_status_label = QLabel("Load a video to start audio extraction.")
+        layout.addWidget(self.audio_extract_status_label)
+
+        layout.addStretch(0)
+
+        self.audio_extract_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
+        self.audio_extract_player.setVideoOutput(self.audio_extract_video_widget)
+        self.audio_extract_player.positionChanged.connect(self.on_audio_extract_position_changed)
+        self.audio_extract_player.durationChanged.connect(self.on_audio_extract_duration_changed)
+
+        self.audio_extract_preview_timer = QTimer(self)
+        self.audio_extract_preview_timer.setInterval(50)
+        self.audio_extract_preview_timer.timeout.connect(self._enforce_audio_extract_trim_boundaries)
+
+        self.tabs.addTab(tab, "Extract Audio")
+
+    def create_framevid_tab(self):
+        """Create tab for assembling image/video frames into a preview/export video."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        layout.addWidget(QLabel("FrameVid builds a video from ordered image/video inputs, with optional music/effects tracks and a large preview on the right."))
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
+        source_group = QGroupBox("File List | Image & Video Input Preview")
+        source_layout = QVBoxLayout(source_group)
+        source_layout.setContentsMargins(8, 8, 8, 8)
+        source_layout.setSpacing(6)
+
+        source_top = QHBoxLayout()
+        source_top.setSpacing(6)
+
+        source_list_box = QVBoxLayout()
+        source_actions = QHBoxLayout()
+        self.framevid_add_sources_btn = QPushButton("Add Files...")
+        self.framevid_add_sources_btn.clicked.connect(self.add_framevid_source_files)
+        source_actions.addWidget(self.framevid_add_sources_btn)
+        self.framevid_paste_image_btn = QPushButton("Paste Image")
+        self.framevid_paste_image_btn.clicked.connect(self.paste_framevid_image_from_clipboard)
+        source_actions.addWidget(self.framevid_paste_image_btn)
+        self.framevid_paste_video_btn = QPushButton("Paste Video")
+        self.framevid_paste_video_btn.clicked.connect(self.paste_framevid_video_from_clipboard)
+        source_actions.addWidget(self.framevid_paste_video_btn)
+        self.framevid_remove_source_btn = QPushButton("Remove Selected")
+        self.framevid_remove_source_btn.clicked.connect(self.remove_selected_framevid_source)
+        source_actions.addWidget(self.framevid_remove_source_btn)
+        self.framevid_source_up_btn = QPushButton("▲ Up")
+        self.framevid_source_up_btn.clicked.connect(lambda: self.move_selected_framevid_source(-1))
+        source_actions.addWidget(self.framevid_source_up_btn)
+        self.framevid_source_down_btn = QPushButton("▼ Down")
+        self.framevid_source_down_btn.clicked.connect(lambda: self.move_selected_framevid_source(1))
+        source_actions.addWidget(self.framevid_source_down_btn)
+        self.framevid_source_top_btn = QPushButton("⏫ Top")
+        self.framevid_source_top_btn.clicked.connect(self.move_selected_framevid_source_top)
+        source_actions.addWidget(self.framevid_source_top_btn)
+        self.framevid_source_bottom_btn = QPushButton("⏬ Bottom")
+        self.framevid_source_bottom_btn.clicked.connect(self.move_selected_framevid_source_bottom)
+        source_actions.addWidget(self.framevid_source_bottom_btn)
+        self.framevid_clear_sources_btn = QPushButton("Clear")
+        self.framevid_clear_sources_btn.clicked.connect(self.clear_framevid_sources)
+        source_actions.addWidget(self.framevid_clear_sources_btn)
+        self.framevid_reset_imagery_btn = QPushButton("Reset Imagery")
+        self.framevid_reset_imagery_btn.clicked.connect(self.reset_framevid_imagery)
+        source_actions.addWidget(self.framevid_reset_imagery_btn)
+        self.framevid_reset_all_btn = QPushButton("Reset All")
+        self.framevid_reset_all_btn.clicked.connect(self.reset_framevid_all)
+        source_actions.addWidget(self.framevid_reset_all_btn)
+        source_actions.addStretch(1)
+        source_list_box.addLayout(source_actions)
+
+        self.framevid_source_list = QListWidget()
+        self.framevid_source_list.setAcceptDrops(True)
+        self.framevid_source_list.setDragEnabled(True)
+        self.framevid_source_list.setDropIndicatorShown(True)
+        self.framevid_source_list.setDefaultDropAction(Qt.MoveAction)
+        self.framevid_source_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.framevid_source_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.framevid_source_list.currentItemChanged.connect(self.on_framevid_source_selection_changed)
+        self.framevid_source_list.setMinimumHeight(220)
+        self.framevid_source_list.setToolTip("Drop image/video files here. Reorder by dragging or using move buttons. Supports multi-select actions.")
+        source_list_box.addWidget(self.framevid_source_list, 1)
+
+        source_editor = QGridLayout()
+        source_editor.setHorizontalSpacing(6)
+        source_editor.setVerticalSpacing(4)
+        source_editor.addWidget(QLabel("Duration (s):"), 0, 0)
+        self.framevid_source_duration_spin = QDoubleSpinBox()
+        self.framevid_source_duration_spin.setRange(0.1, 600.0)
+        self.framevid_source_duration_spin.setDecimals(2)
+        self.framevid_source_duration_spin.setSingleStep(0.5)
+        self.framevid_source_duration_spin.valueChanged.connect(self.on_framevid_source_editor_changed)
+        source_editor.addWidget(self.framevid_source_duration_spin, 0, 1)
+        source_editor.addWidget(QLabel("Fade In (s):"), 0, 2)
+        self.framevid_source_fade_in_spin = QDoubleSpinBox()
+        self.framevid_source_fade_in_spin.setRange(0.0, 60.0)
+        self.framevid_source_fade_in_spin.setDecimals(2)
+        self.framevid_source_fade_in_spin.setSingleStep(0.25)
+        self.framevid_source_fade_in_spin.valueChanged.connect(self.on_framevid_source_editor_changed)
+        source_editor.addWidget(self.framevid_source_fade_in_spin, 0, 3)
+        source_editor.addWidget(QLabel("Fade Out (s):"), 0, 4)
+        self.framevid_source_fade_out_spin = QDoubleSpinBox()
+        self.framevid_source_fade_out_spin.setRange(0.0, 60.0)
+        self.framevid_source_fade_out_spin.setDecimals(2)
+        self.framevid_source_fade_out_spin.setSingleStep(0.25)
+        self.framevid_source_fade_out_spin.valueChanged.connect(self.on_framevid_source_editor_changed)
+        source_editor.addWidget(self.framevid_source_fade_out_spin, 0, 5)
+        source_editor.addWidget(QLabel("Order Note:"), 1, 0)
+        self.framevid_source_note = QLabel("Use drag/drop or Up/Down to reorder frames.")
+        source_editor.addWidget(self.framevid_source_note, 1, 1, 1, 5)
+        self.framevid_apply_timing_this_btn = QPushButton("Apply to This Frame")
+        self.framevid_apply_timing_this_btn.clicked.connect(self.apply_framevid_timing_to_current_source)
+        source_editor.addWidget(self.framevid_apply_timing_this_btn, 2, 0, 1, 3)
+        self.framevid_apply_timing_all_btn = QPushButton("Apply Frame Timing to All")
+        self.framevid_apply_timing_all_btn.clicked.connect(self.apply_framevid_timing_to_all_sources)
+        source_editor.addWidget(self.framevid_apply_timing_all_btn, 2, 3, 1, 3)
+        source_list_box.addLayout(source_editor)
+
+        self.framevid_input_preview_stack = QStackedWidget()
+        self.framevid_input_preview_stack.setMinimumSize(320, 240)
+        self.framevid_input_preview_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.framevid_input_preview_placeholder = QLabel("Select a source file to preview it here")
+        self.framevid_input_preview_placeholder.setAlignment(Qt.AlignCenter)
+        self.framevid_input_preview_placeholder.setStyleSheet("QLabel { border: 1px dashed #666; background: #101010; color: #bbb; }")
+        self.framevid_input_preview_image = QLabel()
+        self.framevid_input_preview_image.setAlignment(Qt.AlignCenter)
+        self.framevid_input_preview_image.setStyleSheet("QLabel { border: 1px solid #666; background: #111; }")
+        self.framevid_input_preview_image.setScaledContents(True)
+        self.framevid_input_preview_video_widget = QVideoWidget()
+        self.framevid_input_preview_video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.framevid_input_preview_video_widget.setStyleSheet("QVideoWidget { background-color: #111; border: 1px solid #3a3a3a; }")
+        self.framevid_input_preview_stack.addWidget(self.framevid_input_preview_placeholder)
+        self.framevid_input_preview_stack.addWidget(self.framevid_input_preview_image)
+        self.framevid_input_preview_stack.addWidget(self.framevid_input_preview_video_widget)
+        self.framevid_input_preview_stack.setCurrentWidget(self.framevid_input_preview_placeholder)
+        self.framevid_input_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
+        self.framevid_input_player.setVideoOutput(self.framevid_input_preview_video_widget)
+        source_top.addLayout(source_list_box, 2)
+        source_top.addWidget(self.framevid_input_preview_stack, 2)
+        source_layout.addLayout(source_top)
+        left_layout.addWidget(source_group)
+
+        library_group = QGroupBox("Music Selections | Effect Selections")
+        library_layout = QHBoxLayout(library_group)
+        library_layout.setContentsMargins(8, 8, 8, 8)
+        library_layout.setSpacing(8)
+
+        music_box = QVBoxLayout()
+        music_box.addWidget(QLabel("Music Selections"))
+        music_actions = QHBoxLayout()
+        self.framevid_music_add_btn = QPushButton("Add Files...")
+        self.framevid_music_add_btn.clicked.connect(self.add_framevid_music_files)
+        music_actions.addWidget(self.framevid_music_add_btn)
+        self.framevid_music_remove_btn = QPushButton("Remove")
+        self.framevid_music_remove_btn.clicked.connect(self.remove_selected_framevid_music_file)
+        music_actions.addWidget(self.framevid_music_remove_btn)
+        music_actions.addStretch(1)
+        music_box.addLayout(music_actions)
+        self.framevid_music_list = Mp3DropListWidget()
+        self.framevid_music_list.setMinimumHeight(160)
+        self.framevid_music_list.setToolTip("Music selections. Drag items to Used Track List.")
+        self.framevid_music_list.files_dropped.connect(self.on_framevid_music_files_dropped)
+        self.framevid_music_list.currentItemChanged.connect(self.on_framevid_music_selection_changed)
+        music_box.addWidget(self.framevid_music_list)
+        library_layout.addLayout(music_box, 1)
+
+        effect_box = QVBoxLayout()
+        effect_box.addWidget(QLabel("Effect Selections"))
+        effect_actions = QHBoxLayout()
+        self.framevid_effect_add_btn = QPushButton("Add Files...")
+        self.framevid_effect_add_btn.clicked.connect(self.add_framevid_effect_files)
+        effect_actions.addWidget(self.framevid_effect_add_btn)
+        self.framevid_effect_remove_btn = QPushButton("Remove")
+        self.framevid_effect_remove_btn.clicked.connect(self.remove_selected_framevid_effect_file)
+        effect_actions.addWidget(self.framevid_effect_remove_btn)
+        effect_actions.addStretch(1)
+        effect_box.addLayout(effect_actions)
+        self.framevid_effect_list = Mp3DropListWidget()
+        self.framevid_effect_list.setMinimumHeight(160)
+        self.framevid_effect_list.setToolTip("Effect selections. Drag items to Used Track List.")
+        self.framevid_effect_list.files_dropped.connect(self.on_framevid_effect_files_dropped)
+        self.framevid_effect_list.currentItemChanged.connect(self.on_framevid_effect_selection_changed)
+        effect_box.addWidget(self.framevid_effect_list)
+        library_layout.addLayout(effect_box, 1)
+
+        left_layout.addWidget(library_group)
+
+        tracks_group = QGroupBox("Used Track List")
+        tracks_layout = QVBoxLayout(tracks_group)
+        tracks_layout.setContentsMargins(8, 8, 8, 8)
+        tracks_layout.setSpacing(6)
+
+        tracks_info = QLabel("Drag music or effect files into the used track list, then reorder them here.")
+        tracks_info.setWordWrap(True)
+        tracks_layout.addWidget(tracks_info)
+
+        track_actions = QHBoxLayout()
+        self.framevid_audio_add_btn = QPushButton("Add Tracks...")
+        self.framevid_audio_add_btn.clicked.connect(self.add_framevid_audio_tracks)
+        track_actions.addWidget(self.framevid_audio_add_btn)
+        self.framevid_audio_remove_btn = QPushButton("Remove Selected")
+        self.framevid_audio_remove_btn.clicked.connect(self.remove_selected_framevid_audio_track)
+        track_actions.addWidget(self.framevid_audio_remove_btn)
+        self.framevid_audio_up_btn = QPushButton("▲ Up")
+        self.framevid_audio_up_btn.clicked.connect(lambda: self.move_selected_framevid_audio_track(-1))
+        track_actions.addWidget(self.framevid_audio_up_btn)
+        self.framevid_audio_down_btn = QPushButton("▼ Down")
+        self.framevid_audio_down_btn.clicked.connect(lambda: self.move_selected_framevid_audio_track(1))
+        track_actions.addWidget(self.framevid_audio_down_btn)
+        self.framevid_audio_clear_btn = QPushButton("Clear")
+        self.framevid_audio_clear_btn.clicked.connect(self.clear_framevid_audio_tracks)
+        track_actions.addWidget(self.framevid_audio_clear_btn)
+        track_actions.addStretch(1)
+        tracks_layout.addLayout(track_actions)
+
+        self.framevid_audio_track_list = AudioTrackEditorListWidget()
+        self.framevid_audio_track_list.setMinimumHeight(180)
+        self.framevid_audio_track_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.framevid_audio_track_list.itemSelectionChanged.connect(self.on_framevid_audio_track_selection_changed)
+        self.framevid_audio_track_list.files_dropped.connect(self.on_framevid_audio_tracks_dropped)
+        self.framevid_audio_track_list.setToolTip("Used track list. Drag items here and reorder them.")
+        tracks_layout.addWidget(self.framevid_audio_track_list)
+
+        framevid_track_editor = QGridLayout()
+        framevid_track_editor.setHorizontalSpacing(6)
+        framevid_track_editor.setVerticalSpacing(4)
+        framevid_track_editor.addWidget(QLabel("Volume (%):"), 0, 0)
+        self.framevid_track_volume_spin = QDoubleSpinBox()
+        self.framevid_track_volume_spin.setRange(0.0, 400.0)
+        self.framevid_track_volume_spin.setDecimals(1)
+        self.framevid_track_volume_spin.setSingleStep(5.0)
+        self.framevid_track_volume_spin.setValue(100.0)
+        self.framevid_track_volume_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
+        framevid_track_editor.addWidget(self.framevid_track_volume_spin, 0, 1)
+        framevid_track_editor.addWidget(QLabel("Clip Start (s):"), 0, 2)
+        self.framevid_track_clip_start_spin = QDoubleSpinBox()
+        self.framevid_track_clip_start_spin.setRange(0.0, 86400.0)
+        self.framevid_track_clip_start_spin.setDecimals(2)
+        self.framevid_track_clip_start_spin.setSingleStep(0.25)
+        self.framevid_track_clip_start_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
+        framevid_track_editor.addWidget(self.framevid_track_clip_start_spin, 0, 3)
+        framevid_track_editor.addWidget(QLabel("Clip End (s):"), 0, 4)
+        self.framevid_track_clip_end_spin = QDoubleSpinBox()
+        self.framevid_track_clip_end_spin.setRange(0.0, 86400.0)
+        self.framevid_track_clip_end_spin.setDecimals(2)
+        self.framevid_track_clip_end_spin.setSingleStep(0.25)
+        self.framevid_track_clip_end_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
+        framevid_track_editor.addWidget(self.framevid_track_clip_end_spin, 0, 5)
+        framevid_track_editor.addWidget(QLabel("Enter Frame:"), 1, 0)
+        self.framevid_track_enter_frame_spin = QSpinBox()
+        self.framevid_track_enter_frame_spin.setRange(0, 2147483647)
+        self.framevid_track_enter_frame_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
+        framevid_track_editor.addWidget(self.framevid_track_enter_frame_spin, 1, 1)
+        framevid_track_editor.addWidget(QLabel("Exit Frame:"), 1, 2)
+        self.framevid_track_exit_frame_spin = QSpinBox()
+        self.framevid_track_exit_frame_spin.setRange(0, 2147483647)
+        self.framevid_track_exit_frame_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
+        framevid_track_editor.addWidget(self.framevid_track_exit_frame_spin, 1, 3)
+        framevid_track_editor.addWidget(QLabel("Fade In (s):"), 1, 4)
+        self.framevid_track_fade_in_spin = QDoubleSpinBox()
+        self.framevid_track_fade_in_spin.setRange(0.0, 60.0)
+        self.framevid_track_fade_in_spin.setDecimals(2)
+        self.framevid_track_fade_in_spin.setSingleStep(0.25)
+        self.framevid_track_fade_in_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
+        framevid_track_editor.addWidget(self.framevid_track_fade_in_spin, 1, 5)
+        framevid_track_editor.addWidget(QLabel("Fade Out (s):"), 2, 0)
+        self.framevid_track_fade_out_spin = QDoubleSpinBox()
+        self.framevid_track_fade_out_spin.setRange(0.0, 60.0)
+        self.framevid_track_fade_out_spin.setDecimals(2)
+        self.framevid_track_fade_out_spin.setSingleStep(0.25)
+        self.framevid_track_fade_out_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
+        framevid_track_editor.addWidget(self.framevid_track_fade_out_spin, 2, 1)
+        tracks_layout.addLayout(framevid_track_editor)
+
+        self.framevid_status_label = QLabel("Ready.")
+        tracks_layout.addWidget(self.framevid_status_label)
+        left_layout.addWidget(tracks_group, 1)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        preview_group = QGroupBox("Video Preview | Save Options")
+        preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_layout.setSpacing(6)
+
+        self.framevid_video_widget = QVideoWidget()
+        self.framevid_video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.framevid_video_widget.setMinimumHeight(620)
+        self.framevid_video_widget.setStyleSheet("QVideoWidget { background-color: #111; border: 1px solid #3a3a3a; }")
+        preview_layout.addWidget(self.framevid_video_widget, 1)
+
+        preview_controls = QHBoxLayout()
+        self.framevid_preview_btn = QPushButton("Preview")
+        self.framevid_preview_btn.clicked.connect(self.preview_framevid_video)
+        preview_controls.addWidget(self.framevid_preview_btn)
+        self.framevid_stop_btn = QPushButton("Stop")
+        self.framevid_stop_btn.clicked.connect(self.stop_framevid_preview)
+        preview_controls.addWidget(self.framevid_stop_btn)
+        self.framevid_save_btn = QPushButton("Save Video...")
+        self.framevid_save_btn.clicked.connect(self.save_framevid_video)
+        preview_controls.addWidget(self.framevid_save_btn)
+        self.framevid_render_progress = QProgressBar()
+        self.framevid_render_progress.setMinimumWidth(220)
+        self.framevid_render_progress.setMaximumWidth(320)
+        self.framevid_render_progress.setTextVisible(True)
+        self.framevid_render_progress.setVisible(False)
+        self.framevid_render_progress.setFormat("%p%")
+        preview_controls.addWidget(self.framevid_render_progress)
+        preview_controls.addStretch(1)
+        preview_layout.addLayout(preview_controls)
+
+        self.framevid_time_label = QLabel("00:00.000 / 00:00.000")
+        preview_layout.addWidget(self.framevid_time_label)
+
+        self.framevid_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
+        self.framevid_player.setVideoOutput(self.framevid_video_widget)
+        self.framevid_player.positionChanged.connect(self.on_framevid_position_changed)
+        self.framevid_player.durationChanged.connect(self.on_framevid_duration_changed)
+        right_layout.addWidget(preview_group, 1)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setWidget(left_panel)
+
+        splitter.addWidget(left_scroll)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([560, 820])
+        layout.addWidget(splitter, 1)
+
+        self.tabs.addTab(tab, "FrameVid")
+
+        self._framevid_input_preview_placeholder()
+        self.framevid_source_list.setCurrentRow(-1)
+        self.framevid_status_text("Ready.")
+        self._refresh_framevid_library_lists_from_vid_prep()
+        QTimer.singleShot(0, self._refresh_framevid_library_lists_from_vid_prep)
+
+    def _framevid_input_preview_placeholder(self):
+        """Show placeholder in the FrameVid input preview area."""
+        if hasattr(self, 'framevid_input_preview_stack'):
+            self.framevid_input_preview_stack.setCurrentWidget(self.framevid_input_preview_placeholder)
+        if hasattr(self, 'framevid_input_player'):
+            self.framevid_input_player.stop()
+
+    def _framevid_show_image_preview(self, image_path):
+        """Display an image file in the FrameVid input preview."""
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            self._framevid_input_preview_placeholder()
+            return
+        target = pixmap.scaled(
+            self.framevid_input_preview_image.size() if hasattr(self, 'framevid_input_preview_image') else QSize(640, 480),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.framevid_input_preview_image.setPixmap(target)
+        self.framevid_input_preview_stack.setCurrentWidget(self.framevid_input_preview_image)
+
+    def _framevid_show_video_preview(self, video_path):
+        """Display a video file in the FrameVid input preview."""
+        if not hasattr(self, 'framevid_input_player'):
+            return
+        self.framevid_input_player.stop()
+        self.framevid_input_player.setMedia(QMediaContent(QUrl.fromLocalFile(video_path)))
+        self.framevid_input_preview_stack.setCurrentWidget(self.framevid_input_preview_video_widget)
+
+    def _framevid_update_input_preview(self, file_path, file_type):
+        """Refresh the selected source preview based on file type."""
+        if not file_path or not os.path.exists(file_path):
+            self._framevid_input_preview_placeholder()
+            return
+        if file_type == 'image':
+            self._framevid_show_image_preview(file_path)
+        elif file_type == 'video':
+            self._framevid_show_video_preview(file_path)
+        else:
+            self._framevid_input_preview_placeholder()
+
+    def _framevid_audio_selection_items(self, list_widget):
+        """Return normalized local file paths from a selection list."""
+        paths = []
+        if not list_widget:
+            return paths
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if not item:
+                continue
+            path = item.data(Qt.UserRole) or item.toolTip() or item.text()
+            if path and os.path.exists(path):
+                paths.append(path)
+        return paths
+
+    def _framevid_list_item_path(self, item):
+        """Resolve a file path stored in a list item."""
+        if not item:
+            return ''
+        data = item.data(Qt.UserRole)
+        if isinstance(data, str) and data:
+            return data
+        if isinstance(data, dict):
+            for key in ('path', 'track_path', 'file_path'):
+                value = data.get(key)
+                if value:
+                    return str(value)
+        tool_tip = item.toolTip() or ''
+        if tool_tip:
+            return tool_tip
+        return item.text() or ''
+
+    def _framevid_add_list_item(self, list_widget, file_path, item_role_key='path', require_exists=True):
+        """Add a file to a simple selection list used by FrameVid music/effects."""
+        if list_widget is None or not file_path:
+            return False
+        if require_exists and not os.path.exists(file_path):
+            return False
+        normalized = os.path.normpath(file_path)
+        for i in range(list_widget.count()):
+            existing_item = list_widget.item(i)
+            if existing_item and os.path.normcase(self._framevid_list_item_path(existing_item)) == os.path.normcase(normalized):
+                return False
+        display_name = os.path.basename(normalized) or normalized
+        if not os.path.exists(normalized):
+            display_name = f"{display_name} (missing)"
+        item = QListWidgetItem(display_name)
+        item.setToolTip(normalized)
+        item.setData(Qt.UserRole, normalized)
+        list_widget.addItem(item)
+        return True
+
+    def _vid_prep_library_paths_from_widget(self, list_widget):
+        """Read saved library paths from an existing Vid Prep list widget."""
+        paths = []
+        if not list_widget:
+            return paths
+        for index in range(list_widget.count()):
+            item = list_widget.item(index)
+            path = self._framevid_list_item_path(item)
+            if path:
+                paths.append(path)
+        return paths
+
+    def _refresh_framevid_library_lists_from_vid_prep(self):
+        """Mirror Vid Prep's saved libraries into FrameVid's selection lists."""
+        music_paths = self._vid_prep_library_paths_from_widget(getattr(self, 'vid_prep_audio_library_list', None))
+        if not music_paths:
+            music_paths = list(getattr(self, 'vid_prep_audio_library', []))
+
+        effect_paths = self._vid_prep_library_paths_from_widget(getattr(self, 'vid_prep_sfx_library_list', None))
+        if not effect_paths:
+            effect_paths = list(getattr(self, 'vid_prep_sfx_library', []))
+
+        if hasattr(self, 'framevid_music_list') and self.framevid_music_list is not None:
+            selected_music = self._framevid_list_item_path(self.framevid_music_list.currentItem())
+            self.framevid_music_list.clear()
+            for file_path in music_paths:
+                self._framevid_add_list_item(self.framevid_music_list, file_path, 'path', require_exists=False)
+            if selected_music:
+                for index in range(self.framevid_music_list.count()):
+                    item = self.framevid_music_list.item(index)
+                    if item and os.path.normcase(self._framevid_list_item_path(item)) == os.path.normcase(selected_music):
+                        self.framevid_music_list.setCurrentRow(index)
+                        break
+
+        if hasattr(self, 'framevid_effect_list') and self.framevid_effect_list is not None:
+            selected_effect = self._framevid_list_item_path(self.framevid_effect_list.currentItem())
+            self.framevid_effect_list.clear()
+            for file_path in effect_paths:
+                self._framevid_add_list_item(self.framevid_effect_list, file_path, 'path', require_exists=False)
+            if selected_effect:
+                for index in range(self.framevid_effect_list.count()):
+                    item = self.framevid_effect_list.item(index)
+                    if item and os.path.normcase(self._framevid_list_item_path(item)) == os.path.normcase(selected_effect):
+                        self.framevid_effect_list.setCurrentRow(index)
+                        break
+
+        logger.info(
+            "FrameVid library sync: music=%s effects=%s",
+            self.framevid_music_list.count() if hasattr(self, 'framevid_music_list') and self.framevid_music_list is not None else 0,
+            self.framevid_effect_list.count() if hasattr(self, 'framevid_effect_list') and self.framevid_effect_list is not None else 0,
+        )
+
+
+
+
+
+    def _framevid_add_audio_library_files(self, list_widget, dialog_title):
+        """Browse for audio files to add to a simple FrameVid library list."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            dialog_title,
+            "",
+            "Audio Files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg);;All Files (*)"
+        )
+        if not file_paths:
+            return
+        added = 0
+        for file_path in file_paths:
+            if list_widget is self.framevid_music_list:
+                if self.add_vid_prep_audio_to_library(file_path):
+                    added += 1
+            elif list_widget is self.framevid_effect_list:
+                if self.add_vid_prep_sfx_to_library(file_path):
+                    added += 1
+            elif self._framevid_add_list_item(list_widget, file_path, 'path'):
+                added += 1
+        if added and list_widget.count() > 0 and list_widget.currentRow() < 0:
+            list_widget.setCurrentRow(0)
+        self.framevid_status_text(f"Added {added} file(s) to {dialog_title.lower()}.")
+
+    def _remove_vid_prep_audio_library_path(self, file_path):
+        """Remove a path from saved music library and persist settings."""
+        normalized = self._normalize_vid_prep_audio_path(file_path)
+        if not normalized:
+            return False
+        compare_value = os.path.normcase(normalized)
+        original_count = len(self.vid_prep_audio_library)
+        self.vid_prep_audio_library = [
+            existing_path for existing_path in self.vid_prep_audio_library
+            if os.path.normcase(existing_path) != compare_value
+        ]
+        if len(self.vid_prep_audio_library) == original_count:
+            return False
+        self._save_vid_prep_audio_library_setting()
+        self.refresh_vid_prep_audio_library_list()
+        return True
+
+    def _remove_vid_prep_sfx_library_path(self, file_path):
+        """Remove a path from saved sound effects library and persist settings."""
+        normalized = self._normalize_vid_prep_audio_path(file_path)
+        if not normalized:
+            return False
+        compare_value = os.path.normcase(normalized)
+        original_count = len(self.vid_prep_sfx_library)
+        self.vid_prep_sfx_library = [
+            existing_path for existing_path in self.vid_prep_sfx_library
+            if os.path.normcase(existing_path) != compare_value
+        ]
+        if len(self.vid_prep_sfx_library) == original_count:
+            return False
+        self._save_vid_prep_sfx_library_setting()
+        self.refresh_vid_prep_sfx_library_list()
+        return True
+
+    def add_framevid_music_files(self):
+        """Add music files to the FrameVid music selection list."""
+        self._framevid_add_audio_library_files(self.framevid_music_list, "Add FrameVid Music")
+
+    def on_framevid_music_files_dropped(self, file_paths):
+        """Handle music files dropped onto the FrameVid music list."""
+        if not file_paths:
+            return
+        added = 0
+        for file_path in file_paths:
+            if self.add_vid_prep_audio_to_library(file_path):
+                added += 1
+        if added and self.framevid_music_list.count() > 0 and self.framevid_music_list.currentRow() < 0:
+            self.framevid_music_list.setCurrentRow(0)
+        if added:
+            self.framevid_status_text(f"Added {added} music file(s).")
+
+    def remove_selected_framevid_music_file(self):
+        """Remove the selected music file from the FrameVid music list."""
+        item = self.framevid_music_list.currentItem()
+        if not item:
+            return
+        path = self._framevid_list_item_path(item)
+        if self._remove_vid_prep_audio_library_path(path):
+            self.framevid_status_text("Removed selected music file.")
+
+    def on_framevid_music_selection_changed(self, current, previous):
+        """Update status for the selected music file."""
+        item = current or self.framevid_music_list.currentItem()
+        if not item:
+            return
+        path = self._framevid_list_item_path(item)
+        if path:
+            self.framevid_status_text(f"Music selected: {os.path.basename(path)}")
+
+    def add_framevid_effect_files(self):
+        """Add effect files to the FrameVid effect selection list."""
+        self._framevid_add_audio_library_files(self.framevid_effect_list, "Add FrameVid Effects")
+
+    def on_framevid_effect_files_dropped(self, file_paths):
+        """Handle effect files dropped onto the FrameVid effect list."""
+        if not file_paths:
+            return
+        added = 0
+        for file_path in file_paths:
+            if self.add_vid_prep_sfx_to_library(file_path):
+                added += 1
+        if added and self.framevid_effect_list.count() > 0 and self.framevid_effect_list.currentRow() < 0:
+            self.framevid_effect_list.setCurrentRow(0)
+        if added:
+            self.framevid_status_text(f"Added {added} effect file(s).")
+
+    def remove_selected_framevid_effect_file(self):
+        """Remove the selected effect file from the FrameVid effect list."""
+        item = self.framevid_effect_list.currentItem()
+        if not item:
+            return
+        path = self._framevid_list_item_path(item)
+        if self._remove_vid_prep_sfx_library_path(path):
+            self.framevid_status_text("Removed selected effect file.")
+
+    def on_framevid_effect_selection_changed(self, current, previous):
+        """Update status for the selected effect file."""
+        item = current or self.framevid_effect_list.currentItem()
+        if not item:
+            return
+        path = self._framevid_list_item_path(item)
+        if path:
+            self.framevid_status_text(f"Effect selected: {os.path.basename(path)}")
+
+    def _framevid_file_type(self, file_path):
+        """Classify a FrameVid source file."""
+        if self._is_image_file_path(file_path):
+            return 'image'
+        if self._is_video_file_path(file_path):
+            return 'video'
+        return 'unknown'
+
+    def _is_image_file_path(self, file_path):
+        return str(file_path).lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff'))
+
+    def _is_video_file_path(self, file_path):
+        return str(file_path).lower().endswith(('.mp4', '.mov', '.mkv', '.m4v', '.webm', '.avi', '.flv'))
+
+    def _save_framevid_state_setting(self):
+        """Persist FrameVid source/audio track state for the current account."""
+        if not self.current_username:
+            return
+        try:
+            source_items = []
+            for i in range(self.framevid_source_list.count()):
+                item = self.framevid_source_list.item(i)
+                if not item:
+                    continue
+                data = item.data(Qt.UserRole) or {}
+                path = str(data.get('path') or '').strip()
+                if not path:
+                    continue
+                file_type = str(data.get('type') or self._framevid_file_type(path))
+                if file_type not in ('image', 'video'):
+                    continue
+                source_items.append({
+                    'path': path,
+                    'type': file_type,
+                    'duration_seconds': float(data.get('duration_seconds') or 3.0),
+                    'fade_in_seconds': float(data.get('fade_in_seconds') or 0.25),
+                    'fade_out_seconds': float(data.get('fade_out_seconds') or 0.25),
+                })
+
+            audio_tracks = []
+            for i in range(self.framevid_audio_track_list.count()):
+                item = self.framevid_audio_track_list.item(i)
+                if not item:
+                    continue
+                data = item.data(Qt.UserRole) or {}
+                track_path = str(data.get('track_path') or '').strip()
+                if not track_path:
+                    continue
+                audio_tracks.append({
+                    'track_id': int(data.get('track_id') or 0),
+                    'track_path': track_path,
+                    'track_name': str(data.get('track_name') or os.path.basename(track_path)),
+                    'volume_percent': float(data.get('volume_percent') or 100.0),
+                    'clip_start_seconds': float(data.get('clip_start_seconds') or 0.0),
+                    'clip_end_seconds': float(data.get('clip_end_seconds') or 0.0),
+                    'enter_frame': int(data.get('enter_frame') or 0),
+                    'exit_frame': int(data.get('exit_frame') or 0),
+                    'fade_in_seconds': float(data.get('fade_in_seconds') or 0.0),
+                    'fade_out_seconds': float(data.get('fade_out_seconds') or 0.0),
+                })
+
+            state_payload = {
+                'source_items': source_items,
+                'audio_tracks': audio_tracks,
+                'source_current_row': int(self.framevid_source_list.currentRow()),
+                'audio_current_row': int(self.framevid_audio_track_list.currentRow()),
+            }
+            self.save_ui_setting('framevid_state', json.dumps(state_payload))
+        except Exception as e:
+            logger.debug(f"Failed to save FrameVid state: {e}")
+
+    def _load_framevid_state_setting(self):
+        """Restore persisted FrameVid source/audio track state for the current account."""
+        if not self.current_username:
+            return
+        raw_state = self.account_manager.get_account_setting(self.current_username, 'ui_framevid_state', '')
+        if not raw_state:
+            return
+
+        try:
+            parsed = json.loads(raw_state)
+        except Exception as e:
+            logger.debug(f"Failed to parse FrameVid state: {e}")
+            return
+
+        if not isinstance(parsed, dict):
+            return
+
+        self.framevid_source_list.clear()
+        self.framevid_audio_track_list.clear()
+
+        source_items = parsed.get('source_items') or []
+        for entry in source_items:
+            if not isinstance(entry, dict):
+                continue
+            file_path = str(entry.get('path') or '').strip()
+            if not file_path:
+                continue
+            file_type = str(entry.get('type') or self._framevid_file_type(file_path))
+            if file_type not in ('image', 'video'):
+                continue
+
+            item = QListWidgetItem(os.path.basename(file_path) or file_path)
+            item.setToolTip(file_path)
+            item.setData(Qt.UserRole, {
+                'path': file_path,
+                'type': file_type,
+                'duration_seconds': float(entry.get('duration_seconds') or 3.0),
+                'fade_in_seconds': float(entry.get('fade_in_seconds') or 0.25),
+                'fade_out_seconds': float(entry.get('fade_out_seconds') or 0.25),
+            })
+            self.framevid_source_list.addItem(item)
+
+        audio_tracks = parsed.get('audio_tracks') or []
+        max_track_id = 0
+        for entry in audio_tracks:
+            if not isinstance(entry, dict):
+                continue
+            track_path = str(entry.get('track_path') or '').strip()
+            if not track_path:
+                continue
+
+            track_id = int(entry.get('track_id') or 0)
+            max_track_id = max(max_track_id, track_id)
+            display_name = str(entry.get('track_name') or os.path.basename(track_path) or track_path)
+            item = QListWidgetItem(display_name)
+            item.setToolTip(track_path)
+            item.setData(Qt.UserRole, {
+                'track_id': track_id,
+                'track_path': track_path,
+                'track_name': display_name,
+                'volume_percent': float(entry.get('volume_percent') or 100.0),
+                'clip_start_seconds': float(entry.get('clip_start_seconds') or 0.0),
+                'clip_end_seconds': float(entry.get('clip_end_seconds') or 0.0),
+                'enter_frame': int(entry.get('enter_frame') or 0),
+                'exit_frame': int(entry.get('exit_frame') or 0),
+                'fade_in_seconds': float(entry.get('fade_in_seconds') or 0.0),
+                'fade_out_seconds': float(entry.get('fade_out_seconds') or 0.0),
+            })
+            self.framevid_audio_track_list.addItem(item)
+
+        self.framevid_next_audio_track_id = max(1, max_track_id + 1)
+
+        source_row = int(parsed.get('source_current_row') or -1)
+        if self.framevid_source_list.count() > 0:
+            source_row = max(0, min(source_row, self.framevid_source_list.count() - 1))
+            self.framevid_source_list.setCurrentRow(source_row)
+        else:
+            self.framevid_source_list.setCurrentRow(-1)
+            self._framevid_input_preview_placeholder()
+
+        audio_row = int(parsed.get('audio_current_row') or -1)
+        if self.framevid_audio_track_list.count() > 0:
+            audio_row = max(0, min(audio_row, self.framevid_audio_track_list.count() - 1))
+            self.framevid_audio_track_list.setCurrentRow(audio_row)
+        else:
+            self.framevid_audio_track_list.setCurrentRow(-1)
+
+        self.framevid_status_text(
+            f"FrameVid state restored ({self.framevid_source_list.count()} source(s), {self.framevid_audio_track_list.count()} track(s))."
+        )
+
+    def _extract_local_file_paths_from_clipboard(self):
+        """Extract local filesystem paths from clipboard MIME/text payloads."""
+        clipboard = QApplication.clipboard()
+        mime_data = clipboard.mimeData()
+        if not mime_data:
+            return []
+
+        paths = []
+
+        if mime_data.hasUrls():
+            for url in mime_data.urls():
+                if url.isLocalFile():
+                    local_path = os.path.normpath(url.toLocalFile())
+                    if local_path:
+                        paths.append(local_path)
+
+        if mime_data.hasText():
+            raw_text = (mime_data.text() or '').strip()
+            if raw_text:
+                for token in re.split(r'[\r\n]+', raw_text):
+                    candidate = token.strip().strip('"')
+                    if not candidate:
+                        continue
+                    if candidate.startswith('file:///'):
+                        candidate = QUrl(candidate).toLocalFile()
+                    candidate = os.path.normpath(candidate)
+                    if candidate:
+                        paths.append(candidate)
+
+        unique_paths = []
+        seen = set()
+        for path in paths:
+            key = os.path.normcase(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_paths.append(path)
+        return unique_paths
+
+    def _framevid_clipboard_images_dir(self):
+        """Return/create app-local directory for pasted FrameVid clipboard images."""
+        base_dir = Path(config.DATA_DIR) / 'framevid_clipboard'
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir
+
+    def _save_framevid_clipboard_image(self, image):
+        """Save a clipboard image payload to disk and return its path."""
+        if image is None or image.isNull():
+            return ''
+
+        output_dir = self._framevid_clipboard_images_dir()
+        timestamp_ms = int(time.time() * 1000)
+        output_path = output_dir / f"clipboard_image_{timestamp_ms}.png"
+        if not image.save(str(output_path), 'PNG'):
+            return ''
+        return str(output_path)
+
+    def paste_framevid_image_from_clipboard(self):
+        """Paste clipboard image data or image file path(s) into FrameVid sources."""
+        clipboard = QApplication.clipboard()
+        mime_data = clipboard.mimeData()
+
+        # Prefer raw image payloads copied from external apps.
+        if mime_data and mime_data.hasImage():
+            image = clipboard.image()
+            saved_path = self._save_framevid_clipboard_image(image)
+            if not saved_path:
+                pixmap = clipboard.pixmap()
+                if pixmap and not pixmap.isNull():
+                    saved_path = self._save_framevid_clipboard_image(pixmap.toImage())
+
+            if saved_path:
+                self.on_framevid_source_files_dropped([saved_path])
+                return
+
+        # Fallback: clipboard might contain copied image file path(s).
+        clipboard_paths = self._extract_local_file_paths_from_clipboard()
+        image_paths = [path for path in clipboard_paths if self._is_image_file_path(path)]
+        if image_paths:
+            self.on_framevid_source_files_dropped(image_paths)
+            return
+
+        QMessageBox.information(
+            self,
+            "FrameVid",
+            "Clipboard does not contain image data or local image file paths.\n\n"
+            "Copy an image (bitmap) or image file(s), then try Paste Image again."
+        )
+
+    def paste_framevid_video_from_clipboard(self):
+        """Paste copied video file path(s) from clipboard into FrameVid sources."""
+        clipboard_paths = self._extract_local_file_paths_from_clipboard()
+        if not clipboard_paths:
+            QMessageBox.information(
+                self,
+                "FrameVid",
+                "Clipboard does not contain a local file path.\n\n"
+                "Copy one or more video files in File Explorer, then try Paste Video again."
+            )
+            return
+
+        video_paths = [path for path in clipboard_paths if self._is_video_file_path(path)]
+        if not video_paths:
+            QMessageBox.information(
+                self,
+                "FrameVid",
+                "Clipboard file paths were found, but no supported video files were detected."
+            )
+            return
+
+        self.on_framevid_source_files_dropped(video_paths)
+
+    def _framevid_add_source_item(self, file_path):
+        """Add a file path to the FrameVid source list if valid."""
+        if not file_path or not os.path.exists(file_path):
+            return False
+        file_type = self._framevid_file_type(file_path)
+        if file_type == 'unknown':
+            return False
+
+        item = QListWidgetItem(os.path.basename(file_path))
+        item.setToolTip(file_path)
+        item.setData(Qt.UserRole, {
+            'path': file_path,
+            'type': file_type,
+            'duration_seconds': 3.0,
+            'fade_in_seconds': 0.25,
+            'fade_out_seconds': 0.25,
+        })
+        self.framevid_source_list.addItem(item)
+        return True
+
+    def add_framevid_source_files(self):
+        """Browse for image/video files to add to FrameVid."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add FrameVid Sources",
+            "",
+            "Media Files (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff *.mp4 *.mov *.mkv *.m4v *.webm *.avi *.flv);;All Files (*)"
+        )
+        self.on_framevid_source_files_dropped(file_paths)
+
+    def on_framevid_source_files_dropped(self, file_paths):
+        """Handle media files dropped into FrameVid source list."""
+        if not file_paths:
+            return
+        added = 0
+        for file_path in file_paths:
+            if self._framevid_add_source_item(file_path):
+                added += 1
+        if added:
+            if self.framevid_source_list.count() == added:
+                self.framevid_source_list.setCurrentRow(0)
+            self.framevid_status_text(f"Added {added} source file(s).")
+            self._save_framevid_state_setting()
+
+    def remove_selected_framevid_source(self):
+        selected_items = self.framevid_source_list.selectedItems()
+        if not selected_items:
+            return
+        selected_rows = sorted(self.framevid_source_list.row(item) for item in selected_items)
+        removed_count = 0
+        for row in reversed(selected_rows):
+            item = self.framevid_source_list.takeItem(row)
+            if item is not None:
+                del item
+                removed_count += 1
+        self.framevid_status_text(f"Removed {removed_count} selected source(s).")
+        self._save_framevid_state_setting()
+
+    def clear_framevid_sources(self):
+        self.framevid_source_list.clear()
+        self.framevid_status_text("Cleared all sources.")
+        self._save_framevid_state_setting()
+
+    def reset_framevid_imagery(self):
+        """Remove image entries from FrameVid sources while keeping video/audio state."""
+        removed = 0
+        for i in range(self.framevid_source_list.count() - 1, -1, -1):
+            item = self.framevid_source_list.item(i)
+            if not item:
+                continue
+            data = item.data(Qt.UserRole) or {}
+            path = str(data.get('path') or '')
+            file_type = str(data.get('type') or self._framevid_file_type(path))
+            if file_type == 'image':
+                removed_item = self.framevid_source_list.takeItem(i)
+                del removed_item
+                removed += 1
+
+        if self.framevid_source_list.count() == 0:
+            self.framevid_source_list.setCurrentRow(-1)
+            self._framevid_input_preview_placeholder()
+        elif self.framevid_source_list.currentRow() < 0:
+            self.framevid_source_list.setCurrentRow(0)
+
+        self.framevid_status_text(f"Reset imagery: removed {removed} image source(s).")
+        self._save_framevid_state_setting()
+
+    def reset_framevid_all(self):
+        """Clear all FrameVid sources and used audio tracks."""
+        source_count = self.framevid_source_list.count()
+        track_count = self.framevid_audio_track_list.count()
+        self.framevid_player.stop()
+        self._framevid_input_preview_placeholder()
+        self.framevid_source_list.clear()
+        self.framevid_audio_track_list.clear()
+        self.framevid_source_list.setCurrentRow(-1)
+        self.framevid_audio_track_list.setCurrentRow(-1)
+        self.framevid_status_text(f"Reset all: removed {source_count} source(s) and {track_count} track(s).")
+        self._save_framevid_state_setting()
+
+    def move_selected_framevid_source(self, step):
+        selected_items = self.framevid_source_list.selectedItems()
+        count = self.framevid_source_list.count()
+        if not selected_items or count < 2:
+            return
+
+        selected_rows = sorted(self.framevid_source_list.row(item) for item in selected_items)
+        delta = -1 if int(step) < 0 else 1
+
+        if delta < 0 and selected_rows[0] <= 0:
+            return
+        if delta > 0 and selected_rows[-1] >= count - 1:
+            return
+
+        row_iter = selected_rows if delta < 0 else list(reversed(selected_rows))
+        for row in row_iter:
+            item = self.framevid_source_list.takeItem(row)
+            self.framevid_source_list.insertItem(row + delta, item)
+
+        self.framevid_source_list.clearSelection()
+        for item in selected_items:
+            item.setSelected(True)
+        if selected_items:
+            self.framevid_source_list.setCurrentItem(selected_items[0])
+
+        self._save_framevid_state_setting()
+
+    def move_selected_framevid_source_top(self):
+        """Move selected source items to the top while preserving their order."""
+        selected_items = self.framevid_source_list.selectedItems()
+        if not selected_items:
+            return
+        selected_rows = sorted(self.framevid_source_list.row(item) for item in selected_items)
+        if selected_rows and selected_rows[0] == 0:
+            return
+
+        moved_items = []
+        for offset, row in enumerate(selected_rows):
+            moved_items.append(self.framevid_source_list.takeItem(row - offset))
+
+        for index, item in enumerate(moved_items):
+            self.framevid_source_list.insertItem(index, item)
+
+        self.framevid_source_list.clearSelection()
+        for item in moved_items:
+            item.setSelected(True)
+        if moved_items:
+            self.framevid_source_list.setCurrentItem(moved_items[0])
+
+        self._save_framevid_state_setting()
+
+    def move_selected_framevid_source_bottom(self):
+        """Move selected source items to the bottom while preserving their order."""
+        selected_items = self.framevid_source_list.selectedItems()
+        if not selected_items:
+            return
+
+        count = self.framevid_source_list.count()
+        selected_rows = sorted(self.framevid_source_list.row(item) for item in selected_items)
+        if selected_rows and selected_rows[-1] == count - 1:
+            return
+
+        moved_items = []
+        for row in reversed(selected_rows):
+            moved_items.append(self.framevid_source_list.takeItem(row))
+        moved_items.reverse()
+
+        for item in moved_items:
+            self.framevid_source_list.addItem(item)
+
+        self.framevid_source_list.clearSelection()
+        for item in moved_items:
+            item.setSelected(True)
+        if moved_items:
+            self.framevid_source_list.setCurrentItem(moved_items[0])
+
+        self._save_framevid_state_setting()
+
+    def on_framevid_source_selection_changed(self, current, previous):
+        item = current or self.framevid_source_list.currentItem()
+        self._framevid_source_editor_updating = True
+        try:
+            if not item:
+                self.framevid_source_duration_spin.setValue(3.0)
+                self.framevid_source_fade_in_spin.setValue(0.25)
+                self.framevid_source_fade_out_spin.setValue(0.25)
+                self._framevid_input_preview_placeholder()
+                return
+            data = item.data(Qt.UserRole) or {}
+            self.framevid_source_duration_spin.setValue(float(data.get('duration_seconds') or 3.0))
+            self.framevid_source_fade_in_spin.setValue(float(data.get('fade_in_seconds') or 0.25))
+            self.framevid_source_fade_out_spin.setValue(float(data.get('fade_out_seconds') or 0.25))
+            file_path = str(data.get('path') or '')
+            file_type = str(data.get('type') or self._framevid_file_type(file_path))
+            self._framevid_update_input_preview(file_path, file_type)
+        finally:
+            self._framevid_source_editor_updating = False
+
+    def on_framevid_source_editor_changed(self, *args):
+        if getattr(self, '_framevid_source_editor_updating', False):
+            return
+        self.apply_framevid_timing_to_current_source(show_status=False)
+
+    def apply_framevid_timing_to_current_source(self, show_status=True):
+        """Apply current timing editor values to the active FrameVid source item."""
+        item = self.framevid_source_list.currentItem()
+        if not item:
+            return
+        data = item.data(Qt.UserRole) or {}
+        data['duration_seconds'] = float(self.framevid_source_duration_spin.value())
+        data['fade_in_seconds'] = float(self.framevid_source_fade_in_spin.value())
+        data['fade_out_seconds'] = float(self.framevid_source_fade_out_spin.value())
+        item.setData(Qt.UserRole, data)
+        if show_status:
+            label = item.text() or os.path.basename(str(data.get('path') or '')) or 'selected frame'
+            self.framevid_status_text(f"Applied timing to: {label}")
+        self._save_framevid_state_setting()
+
+    def apply_framevid_timing_to_all_sources(self):
+        """Apply current source timing editor values to all FrameVid sources."""
+        total = self.framevid_source_list.count()
+        if total <= 0:
+            return
+
+        duration_seconds = float(self.framevid_source_duration_spin.value())
+        fade_in_seconds = float(self.framevid_source_fade_in_spin.value())
+        fade_out_seconds = float(self.framevid_source_fade_out_spin.value())
+
+        updated = 0
+        for i in range(total):
+            item = self.framevid_source_list.item(i)
+            if not item:
+                continue
+            data = item.data(Qt.UserRole) or {}
+            data['duration_seconds'] = duration_seconds
+            data['fade_in_seconds'] = fade_in_seconds
+            data['fade_out_seconds'] = fade_out_seconds
+            item.setData(Qt.UserRole, data)
+            updated += 1
+
+        self.framevid_status_text(f"Applied frame timing to {updated} source(s).")
+        self._save_framevid_state_setting()
+
+    def add_framevid_audio_tracks(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add FrameVid Audio Tracks",
+            "",
+            "Audio Files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg);;All Files (*)"
+        )
+        self.on_framevid_audio_tracks_dropped(file_paths)
+
+    def _framevid_add_audio_track_item(self, file_path):
+        if not file_path or not os.path.exists(file_path):
+            return False
+        normalized = self._normalize_vid_prep_audio_path(file_path)
+        if not normalized:
+            return False
+        item = QListWidgetItem(os.path.basename(normalized))
+        item.setToolTip(normalized)
+        item.setData(Qt.UserRole, {
+            'track_id': int(self.framevid_next_audio_track_id),
+            'track_path': normalized,
+            'track_name': os.path.basename(normalized),
+            'volume_percent': 100.0,
+            'clip_start_seconds': 0.0,
+            'clip_end_seconds': float(self._get_vid_prep_audio_duration_seconds(normalized) or 0.0),
+            'enter_frame': 0,
+            'exit_frame': 0,
+            'fade_in_seconds': 0.0,
+            'fade_out_seconds': 0.0,
+        })
+        self.framevid_next_audio_track_id += 1
+        self.framevid_audio_track_list.addItem(item)
+        return True
+
+    def on_framevid_audio_tracks_dropped(self, file_paths):
+        if not file_paths:
+            return
+        added = 0
+        for file_path in file_paths:
+            if self._framevid_add_audio_track_item(file_path):
+                added += 1
+        if added and self.framevid_audio_track_list.count() == added:
+            self.framevid_audio_track_list.setCurrentRow(0)
+        if added:
+            self._save_framevid_state_setting()
+
+    def remove_selected_framevid_audio_track(self):
+        row = self.framevid_audio_track_list.currentRow()
+        if row < 0:
+            return
+        item = self.framevid_audio_track_list.takeItem(row)
+        del item
+        self._save_framevid_state_setting()
+
+    def clear_framevid_audio_tracks(self):
+        self.framevid_audio_track_list.clear()
+        self._save_framevid_state_setting()
+
+    def move_selected_framevid_audio_track(self, step):
+        row = self.framevid_audio_track_list.currentRow()
+        count = self.framevid_audio_track_list.count()
+        if row < 0 or count < 2:
+            return
+        new_row = max(0, min(count - 1, row + int(step)))
+        if new_row == row:
+            return
+        item = self.framevid_audio_track_list.takeItem(row)
+        self.framevid_audio_track_list.insertItem(new_row, item)
+        self.framevid_audio_track_list.setCurrentRow(new_row)
+        self._save_framevid_state_setting()
+
+    def on_framevid_audio_track_selection_changed(self):
+        item = self.framevid_audio_track_list.currentItem()
+        self._framevid_audio_track_editor_updating = True
+        try:
+            if not item:
+                self.framevid_track_volume_spin.setValue(100.0)
+                self.framevid_track_clip_start_spin.setValue(0.0)
+                self.framevid_track_clip_end_spin.setValue(0.0)
+                self.framevid_track_enter_frame_spin.setValue(0)
+                self.framevid_track_exit_frame_spin.setValue(0)
+                self.framevid_track_fade_in_spin.setValue(0.0)
+                self.framevid_track_fade_out_spin.setValue(0.0)
+                return
+            data = item.data(Qt.UserRole) or {}
+            self.framevid_track_volume_spin.setValue(float(data.get('volume_percent') or 100.0))
+            self.framevid_track_clip_start_spin.setValue(float(data.get('clip_start_seconds') or 0.0))
+            self.framevid_track_clip_end_spin.setValue(float(data.get('clip_end_seconds') or 0.0))
+            self.framevid_track_enter_frame_spin.setValue(int(data.get('enter_frame') or 0))
+            self.framevid_track_exit_frame_spin.setValue(int(data.get('exit_frame') or 0))
+            self.framevid_track_fade_in_spin.setValue(float(data.get('fade_in_seconds') or 0.0))
+            self.framevid_track_fade_out_spin.setValue(float(data.get('fade_out_seconds') or 0.0))
+        finally:
+            self._framevid_audio_track_editor_updating = False
+
+    def on_framevid_audio_track_editor_changed(self, *args):
+        if self._framevid_audio_track_editor_updating:
+            return
+        item = self.framevid_audio_track_list.currentItem()
+        if not item:
+            return
+        data = item.data(Qt.UserRole) or {}
+        data['volume_percent'] = float(self.framevid_track_volume_spin.value())
+        data['clip_start_seconds'] = float(self.framevid_track_clip_start_spin.value())
+        data['clip_end_seconds'] = float(self.framevid_track_clip_end_spin.value())
+        data['enter_frame'] = int(self.framevid_track_enter_frame_spin.value())
+        data['exit_frame'] = int(self.framevid_track_exit_frame_spin.value())
+        data['fade_in_seconds'] = float(self.framevid_track_fade_in_spin.value())
+        data['fade_out_seconds'] = float(self.framevid_track_fade_out_spin.value())
+        item.setData(Qt.UserRole, data)
+
+    def _framevid_source_items_in_order(self):
+        items = []
+        for i in range(self.framevid_source_list.count()):
+            item = self.framevid_source_list.item(i)
+            if not item:
+                continue
+            data = item.data(Qt.UserRole) or {}
+            if data.get('path') and os.path.exists(data.get('path')):
+                items.append(data)
+        return items
+
+    def _framevid_audio_tracks_in_order(self):
+        tracks = []
+        for i in range(self.framevid_audio_track_list.count()):
+            item = self.framevid_audio_track_list.item(i)
+            if not item:
+                continue
+            data = item.data(Qt.UserRole) or {}
+            if data.get('track_path') and os.path.exists(data.get('track_path')):
+                tracks.append(data)
+        return tracks
+
+    def framevid_status_text(self, text):
+        if hasattr(self, 'framevid_time_label'):
+            self.framevid_time_label.setText(text)
+
+    def on_framevid_duration_changed(self, duration_ms):
+        self.framevid_time_label.setText(f"00:00.000 / {self._format_vid_prep_time(max(0, int(duration_ms)) / 1000.0)}")
+
+    def on_framevid_position_changed(self, position_ms):
+        duration_ms = max(0, int(self.framevid_player.duration()))
+        self.framevid_time_label.setText(f"{self._format_vid_prep_time(max(0, int(position_ms)) / 1000.0)} / {self._format_vid_prep_time(duration_ms / 1000.0)}")
+
+    def stop_framevid_preview(self):
+        self.framevid_player.stop()
+
+    def _framevid_set_render_progress(self, visible, current_step=0, total_steps=1):
+        """Show/hide and update the inline FrameVid render progress bar."""
+        if not hasattr(self, 'framevid_render_progress'):
+            return
+        total_steps = max(1, int(total_steps or 1))
+        current_step = max(0, min(int(current_step or 0), total_steps))
+        self.framevid_render_progress.setMaximum(total_steps)
+        self.framevid_render_progress.setValue(current_step)
+        self.framevid_render_progress.setVisible(bool(visible))
+        QApplication.processEvents()
+
+    def _framevid_render_progress_callback(self, status_text, current_step, total_steps):
+        """Progress callback used by FrameVid preview/save rendering."""
+        self._framevid_set_render_progress(True, current_step, total_steps)
+        self.framevid_status_text(status_text)
+
+    def preview_framevid_video(self):
+        self._framevid_set_render_progress(True, 0, 1)
+        try:
+            preview_path = self._render_framevid_video(
+                tempfile.gettempdir(),
+                progress_callback=self._framevid_render_progress_callback,
+            )
+        except Exception as e:
+            self._framevid_set_render_progress(False, 0, 1)
+            QMessageBox.warning(self, "FrameVid", str(e))
+            return
+        self._framevid_set_render_progress(False, 0, 1)
+        self.framevid_last_preview_path = preview_path
+        self.framevid_player.setMedia(QMediaContent(QUrl.fromLocalFile(preview_path)))
+        self.framevid_player.play()
+
+    def save_framevid_video(self):
+        default_name = "framevid_output.mp4"
+        output_path, _ = QFileDialog.getSaveFileName(self, "Save FrameVid Video", default_name, "Video Files (*.mp4);;All Files (*)")
+        if not output_path:
+            return
+        self._framevid_set_render_progress(True, 0, 1)
+        try:
+            final_path = self._render_framevid_video(
+                Path(output_path).parent,
+                output_path,
+                progress_callback=self._framevid_render_progress_callback,
+            )
+        except Exception as e:
+            self._framevid_set_render_progress(False, 0, 1)
+            QMessageBox.warning(self, "FrameVid", str(e))
+            return
+        self._framevid_set_render_progress(False, 0, 1)
+        self.framevid_last_preview_path = final_path
+        QMessageBox.information(self, "FrameVid", f"Saved video:\n{final_path}")
+
+    def _render_framevid_video(self, temp_parent, output_path=None, progress_callback=None):
+        """Render the current FrameVid queue into an mp4 file."""
+        if not self.framevid_source_list.count():
+            raise ValueError("Add at least one image or video file.")
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            raise ValueError("ffmpeg is not available on PATH.")
+
+        render_dir = Path(tempfile.mkdtemp(prefix='framevid_', dir=str(temp_parent)))
+        segment_paths = []
+        target_w, target_h = 1080, 1920
+        fps = 30
+
+        source_items = self._framevid_source_items_in_order()
+        audio_tracks = self._framevid_audio_tracks_in_order()
+        total_steps = len(source_items) + 1 + (1 if audio_tracks else 0)
+        if progress_callback:
+            progress_callback("Preparing FrameVid render...", 0, total_steps)
+
+        for index, item_data in enumerate(source_items, start=1):
+            source_path = str(item_data.get('path') or '')
+            duration_s = max(0.1, float(item_data.get('duration_seconds') or 3.0))
+            fade_in_s = max(0.0, float(item_data.get('fade_in_seconds') or 0.0))
+            fade_out_s = max(0.0, float(item_data.get('fade_out_seconds') or 0.0))
+            is_image = item_data.get('type') == 'image'
+            segment_path = render_dir / f"segment_{index:03d}.mp4"
+
+            fade_out_start = max(0.0, duration_s - fade_out_s)
+            vf = (
+                f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"fps={fps},format=yuv420p,"
+                f"fade=t=in:st=0:d={min(fade_in_s, duration_s):.3f},"
+                f"fade=t=out:st={fade_out_start:.3f}:d={min(fade_out_s, duration_s):.3f}"
+            )
+
+            cmd = [ffmpeg_bin, '-y']
+            if is_image:
+                cmd.extend(['-loop', '1', '-i', source_path, '-t', f'{duration_s:.3f}', '-vf', vf, '-r', str(fps), '-pix_fmt', 'yuv420p', str(segment_path)])
+            else:
+                cmd.extend(['-i', source_path, '-t', f'{duration_s:.3f}', '-vf', vf, '-r', str(fps), '-pix_fmt', 'yuv420p', str(segment_path)])
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                stderr_text = (e.stderr or '').strip()
+                stdout_text = (e.stdout or '').strip()
+                detail = stderr_text or stdout_text or str(e)
+                raise RuntimeError(f"Failed to render segment {index}: {detail}") from e
+            segment_paths.append(segment_path)
+            if progress_callback:
+                progress_callback(f"Rendering source {index}/{len(source_items)}...", index, total_steps)
+
+        concat_file = render_dir / 'concat.txt'
+        concat_lines = []
+        for path in segment_paths:
+            safe_path = str(path).replace("'", "\\'")
+            concat_lines.append(f"file '{safe_path}'")
+        concat_file.write_text('\n'.join(concat_lines), encoding='utf-8')
+        video_only_path = render_dir / 'framevid_video.mp4'
+        try:
+            subprocess.run([ffmpeg_bin, '-y', '-f', 'concat', '-safe', '0', '-i', str(concat_file), '-c', 'copy', str(video_only_path)], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            stderr_text = (e.stderr or '').strip()
+            stdout_text = (e.stdout or '').strip()
+            detail = stderr_text or stdout_text or str(e)
+            raise RuntimeError(f"Failed to concatenate rendered segments: {detail}") from e
+
+        if progress_callback:
+            progress_callback("Concatenation complete.", len(source_items) + 1, total_steps)
+
+        if not audio_tracks:
+            if output_path:
+                shutil.copyfile(str(video_only_path), str(output_path))
+                return str(output_path)
+            return str(video_only_path)
+
+        video_duration = self._get_media_duration_seconds(str(video_only_path))
+        mix_output = render_dir / 'framevid_audio.m4a'
+        audio_inputs = []
+        filter_parts = []
+        mix_input_index = 1
+        mix_labels = []
+        for track in audio_tracks:
+            track_path = str(track.get('track_path') or '')
+            if not track_path or not os.path.exists(track_path):
+                continue
+            audio_inputs.extend(['-i', track_path])
+            clip_start = max(0.0, float(track.get('clip_start_seconds') or 0.0))
+            clip_end = float(track.get('clip_end_seconds') or 0.0)
+            volume = max(0.0, float(track.get('volume_percent') or 100.0) / 100.0)
+            fade_in = max(0.0, float(track.get('fade_in_seconds') or 0.0))
+            fade_out = max(0.0, float(track.get('fade_out_seconds') or 0.0))
+            enter_frame = int(track.get('enter_frame') or 0)
+            exit_frame = int(track.get('exit_frame') or 0)
+            start_ms = max(0, int((enter_frame / 30.0) * 1000))
+            if clip_end > clip_start:
+                clip_filter = [f'atrim=start={clip_start:.3f}:end={clip_end:.3f}']
+            else:
+                clip_filter = [f'atrim=start={clip_start:.3f}']
+            clip_filter.append('asetpts=PTS-STARTPTS')
+            clip_filter.append(f'volume={volume:.3f}')
+            clip_duration = max(0.1, (clip_end - clip_start) if clip_end > clip_start else max(0.1, (exit_frame - enter_frame) / 30.0 if exit_frame > enter_frame else video_duration))
+            if fade_in > 0:
+                clip_filter.append(f'afade=t=in:st=0:d={min(fade_in, clip_duration):.3f}')
+            if fade_out > 0:
+                clip_filter.append(f'afade=t=out:st={max(0.0, clip_duration - fade_out):.3f}:d={min(fade_out, clip_duration):.3f}')
+            if start_ms > 0:
+                clip_filter.append(f'adelay={start_ms}|{start_ms}')
+            label = f'a{mix_input_index}'
+            filter_parts.append(f'[{mix_input_index}:a]' + ','.join(clip_filter) + f'[{label}]')
+            mix_labels.append(f'[{label}]')
+            mix_input_index += 1
+
+        if filter_parts:
+            if progress_callback:
+                progress_callback("Mixing audio tracks...", len(source_items) + 1, total_steps)
+            amix_inputs = ''.join(mix_labels)
+            filter_parts.append(f'{amix_inputs}amix=inputs={len(mix_labels)}:normalize=0[mixed]')
+            cmd = [ffmpeg_bin, '-y', '-i', str(video_only_path)] + audio_inputs + ['-filter_complex', ';'.join(filter_parts), '-map', '0:v', '-map', '[mixed]', '-c:v', 'copy', '-c:a', 'aac', '-shortest', str(mix_output)]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                stderr_text = (e.stderr or '').strip()
+                stdout_text = (e.stdout or '').strip()
+                detail = stderr_text or stdout_text or str(e)
+                raise RuntimeError(f"Failed to mix FrameVid audio tracks: {detail}") from e
+            final_path = mix_output
+            if progress_callback:
+                progress_callback("Audio mix complete.", total_steps, total_steps)
+        else:
+            final_path = video_only_path
+
+        if output_path:
+            shutil.copyfile(str(final_path), str(output_path))
+            return str(output_path)
+        return str(final_path)
+
+    def _get_media_duration_seconds(self, file_path):
+        """Best-effort media duration probe in seconds."""
+        ffprobe_bin = shutil.which('ffprobe')
+        if not ffprobe_bin or not file_path or not os.path.exists(file_path):
+            return 0.0
+        try:
+            result = subprocess.run([ffprobe_bin, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path], capture_output=True, text=True, check=False)
+            return max(0.0, float((result.stdout or '').strip() or 0.0))
+        except Exception:
+            return 0.0
+
+    def _release_audio_extract_capture(self):
+        """Release OpenCV capture used for audio extract metadata."""
+        if self.audio_extract_cap is not None:
+            try:
+                self.audio_extract_cap.release()
+            except Exception:
+                pass
+            self.audio_extract_cap = None
+
+    def on_audio_extract_browse_video(self):
+        """Browse and load a source video for audio extraction."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Source Video",
+            "",
+            "Video Files (*.mp4 *.mov *.mkv *.m4v *.webm *.avi);;All Files (*)"
+        )
+        if not file_path:
+            return
+        self.load_audio_extract_source(file_path)
+
+    def load_audio_extract_source(self, file_path):
+        """Load source video metadata and configure preview/trim controls."""
+        if not file_path or not os.path.exists(file_path):
+            QMessageBox.warning(self, "Extract Audio", "Invalid source video path.")
+            return False
+
+        cv2 = self._get_cv2_for_vid_prep()
+        if cv2 is None:
+            self.audio_extract_status_label.setText("OpenCV not installed. Install opencv-python.")
+            return False
+
+        self._release_audio_extract_capture()
+        self.audio_extract_source_path = file_path
+        self.audio_extract_source_input.setText(file_path)
+
+        cap = cv2.VideoCapture(file_path)
+        if not cap or not cap.isOpened():
+            QMessageBox.warning(self, "Extract Audio", "Could not open source video.")
+            self.audio_extract_status_label.setText("Failed to open source video.")
+            return False
+
+        self.audio_extract_cap = cap
+        self.audio_extract_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.audio_extract_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        if self.audio_extract_fps <= 0:
+            self.audio_extract_fps = 30.0
+        self.audio_extract_duration_s = (
+            self.audio_extract_frame_count / self.audio_extract_fps
+            if self.audio_extract_frame_count > 0 else 0.0
+        )
+
+        max_frame = max(0, self.audio_extract_frame_count - 1)
+        self.audio_extract_trim_start_frame = 0
+        self.audio_extract_trim_end_frame = max_frame
+        self.audio_extract_trim_slider.setRange(0, max_frame)
+        self.audio_extract_trim_slider.setValues(0, max_frame)
+        self.update_audio_extract_trim_label()
+
+        self.audio_extract_player.stop()
+        self.audio_extract_player.setMedia(QMediaContent(QUrl.fromLocalFile(file_path)))
+        self.audio_extract_position_slider.blockSignals(True)
+        self.audio_extract_position_slider.setRange(0, int(self.audio_extract_duration_s * 1000))
+        self.audio_extract_position_slider.setValue(0)
+        self.audio_extract_position_slider.blockSignals(False)
+        self.audio_extract_time_label.setText(
+            f"{self._format_vid_prep_time(0.0)} / {self._format_vid_prep_time(self.audio_extract_duration_s)}"
+        )
+        self.audio_extract_status_label.setText("Source video loaded. Set trim and preview audio.")
+        return True
+
+    def _audio_extract_frame_to_seconds(self, frame_idx):
+        """Convert frame index to seconds for Extract Audio tab."""
+        fps = max(1.0, float(self.audio_extract_fps or 30.0))
+        return max(0.0, float(frame_idx) / fps)
+
+    def _audio_extract_end_boundary_seconds(self):
+        """Return exclusive end boundary time from end frame."""
+        return self._audio_extract_frame_to_seconds(int(self.audio_extract_trim_end_frame) + 1)
+
+    def on_audio_extract_trim_changed(self, start_frame, end_frame):
+        """Handle trim range slider changes."""
+        self.audio_extract_trim_start_frame = int(start_frame)
+        self.audio_extract_trim_end_frame = int(end_frame)
+        self.update_audio_extract_trim_label()
+
+    def update_audio_extract_trim_label(self):
+        """Refresh human-readable trim range label."""
+        start_s = self._audio_extract_frame_to_seconds(self.audio_extract_trim_start_frame)
+        end_s = self._audio_extract_frame_to_seconds(self.audio_extract_trim_end_frame)
+        self.audio_extract_trim_label.setText(
+            f"Trim: {self._format_vid_prep_time(start_s)} -> {self._format_vid_prep_time(end_s)}"
+        )
+
+    def step_audio_extract_trim(self, boundary, delta):
+        """Adjust trim start/end by frame delta."""
+        max_frame = max(0, self.audio_extract_frame_count - 1)
+        start = int(self.audio_extract_trim_start_frame)
+        end = int(self.audio_extract_trim_end_frame)
+
+        if boundary == 'start':
+            start = max(0, min(start + int(delta), end))
+        else:
+            end = min(max_frame, max(end + int(delta), start))
+
+        self.audio_extract_trim_slider.setValues(start, end)
+
+    def seek_audio_extract_to_start(self):
+        """Seek preview player to trim start."""
+        position_ms = int(self._audio_extract_frame_to_seconds(self.audio_extract_trim_start_frame) * 1000)
+        self.audio_extract_player.setPosition(position_ms)
+
+    def seek_audio_extract_to_end(self):
+        """Seek preview player to trim end."""
+        end_s = self._audio_extract_end_boundary_seconds()
+        position_ms = max(0, int(end_s * 1000) - 1)
+        self.audio_extract_player.setPosition(position_ms)
+
+    def play_audio_extract_preview(self):
+        """Play video preview constrained to trim range."""
+        if not self.audio_extract_source_path:
+            QMessageBox.information(self, "Extract Audio", "No source video loaded.")
+            return
+
+        start_ms = int(self._audio_extract_frame_to_seconds(self.audio_extract_trim_start_frame) * 1000)
+        end_ms = int(self._audio_extract_end_boundary_seconds() * 1000)
+        if end_ms <= start_ms:
+            QMessageBox.warning(self, "Extract Audio", "Trim range must be greater than zero.")
+            return
+
+        current_ms = int(self.audio_extract_player.position())
+        if current_ms < start_ms or current_ms >= end_ms:
+            self.audio_extract_player.setPosition(start_ms)
+
+        self.audio_extract_player.play()
+        self.audio_extract_preview_timer.start()
+        self.audio_extract_status_label.setText("Previewing video trim range.")
+
+    def pause_audio_extract_preview(self):
+        """Pause audio preview playback."""
+        self.audio_extract_player.pause()
+        self.audio_extract_preview_timer.stop()
+        self.audio_extract_status_label.setText("Video preview paused.")
+
+    def on_audio_extract_repeat_toggled(self, enabled):
+        """Toggle repeat mode for audio preview."""
+        self.audio_extract_repeat_enabled = bool(enabled)
+        self.audio_extract_repeat_btn.setText("Repeat On" if enabled else "Repeat Off")
+
+    def on_audio_extract_position_changed(self, position_ms):
+        """Sync position slider/time label from media player updates."""
+        position_ms = max(0, int(position_ms))
+        if not self.audio_extract_position_slider.isSliderDown():
+            self.audio_extract_position_slider.blockSignals(True)
+            self.audio_extract_position_slider.setValue(position_ms)
+            self.audio_extract_position_slider.blockSignals(False)
+
+        duration_ms = max(0, int(self.audio_extract_position_slider.maximum()))
+        self.audio_extract_time_label.setText(
+            f"{self._format_vid_prep_time(position_ms / 1000.0)} / {self._format_vid_prep_time(duration_ms / 1000.0)}"
+        )
+
+    def on_audio_extract_duration_changed(self, duration_ms):
+        """Update position slider range when player duration is known."""
+        duration_ms = max(0, int(duration_ms))
+        self.audio_extract_position_slider.blockSignals(True)
+        self.audio_extract_position_slider.setRange(0, duration_ms)
+        self.audio_extract_position_slider.blockSignals(False)
+
+    def seek_audio_extract_preview(self, position_ms):
+        """Seek preview player to requested position."""
+        self.audio_extract_player.setPosition(int(position_ms))
+
+    def _enforce_audio_extract_trim_boundaries(self):
+        """Stop or repeat playback when trim end is reached."""
+        if self.audio_extract_player.state() != QMediaPlayer.PlayingState:
+            self.audio_extract_preview_timer.stop()
+            return
+
+        start_ms = int(self._audio_extract_frame_to_seconds(self.audio_extract_trim_start_frame) * 1000)
+        end_ms = int(self._audio_extract_end_boundary_seconds() * 1000)
+        current_ms = int(self.audio_extract_player.position())
+
+        if current_ms >= end_ms:
+            if self.audio_extract_repeat_enabled:
+                self.audio_extract_player.setPosition(start_ms)
+                self.audio_extract_player.play()
+            else:
+                self.audio_extract_player.pause()
+                self.audio_extract_player.setPosition(end_ms)
+                self.audio_extract_preview_timer.stop()
+
+    def save_extracted_audio(self):
+        """Export trimmed audio from current source video using ffmpeg."""
+        output_path = self._save_extracted_audio_to_path()
+        if output_path:
+            self.audio_extract_status_label.setText(f"Saved audio: {output_path}")
+            QMessageBox.information(self, "Extract Audio", f"Saved audio:\n{output_path}")
+
+    def save_and_add_extracted_audio_to_music(self):
+        """Save extracted audio and add it to the saved music library."""
+        output_path = self._save_extracted_audio_to_path()
+        if not output_path:
+            return
+
+        added = self.add_vid_prep_audio_to_library(output_path, select_added=True)
+        self.refresh_vid_prep_audio_library_list(output_path)
+        self.audio_extract_status_label.setText(
+            f"Saved audio: {output_path}" + (" and added to music." if added else "")
+        )
+        QMessageBox.information(
+            self,
+            "Extract Audio",
+            f"Saved audio:\n{output_path}\n\n"
+            f"{ 'Added to saved music.' if added else 'Audio was already in saved music.' }"
+        )
+
+    def save_and_add_extracted_audio_to_effects(self):
+        """Save extracted audio and add it to the saved effects library."""
+        output_path = self._save_extracted_audio_to_path()
+        if not output_path:
+            return
+
+        added = self.add_vid_prep_sfx_to_library(output_path, select_added=True)
+        self.refresh_vid_prep_sfx_library_list(output_path)
+        self.audio_extract_status_label.setText(
+            f"Saved audio: {output_path}" + (" and added to effects." if added else "")
+        )
+        QMessageBox.information(
+            self,
+            "Extract Audio",
+            f"Saved audio:\n{output_path}\n\n"
+            f"{ 'Added to sound effects.' if added else 'Audio was already in sound effects.' }"
+        )
+
+    def _save_extracted_audio_to_path(self):
+        """Run the audio export and return the saved file path on success."""
+        if not self.audio_extract_source_path or not os.path.exists(self.audio_extract_source_path):
+            QMessageBox.warning(self, "Extract Audio", "Load a source video first.")
+            return None
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            QMessageBox.warning(self, "Extract Audio", "ffmpeg is not available on PATH.")
+            return None
+
+        start_frame = max(0, int(self.audio_extract_trim_start_frame))
+        end_frame = max(start_frame, int(self.audio_extract_trim_end_frame))
+        start_s = self._audio_extract_frame_to_seconds(start_frame)
+        end_s = self._audio_extract_frame_to_seconds(end_frame + 1)
+        duration_s = max(0.0, end_s - start_s)
+        if duration_s <= 0:
+            QMessageBox.warning(self, "Extract Audio", "Trim markers must define a positive range.")
+            return None
+
+        audio_format = (self.audio_extract_format_combo.currentText() or 'mp3').strip().lower()
+        source_stem = Path(self.audio_extract_source_path).stem
+        default_name = f"{source_stem}.audio.{audio_format}"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Extracted Audio",
+            str(Path(self.audio_extract_source_path).with_name(default_name)),
+            "Audio Files (*.mp3 *.m4a *.wav);;All Files (*)"
+        )
+        if not output_path:
+            return None
+
+        output_path = str(Path(output_path))
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-ss", f"{start_s:.3f}",
+            "-to", f"{end_s:.3f}",
+            "-i", self.audio_extract_source_path,
+            "-vn",
+        ]
+
+        if audio_format == 'wav':
+            cmd.extend(["-acodec", "pcm_s16le"]) 
+        elif audio_format == 'm4a':
+            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+        else:
+            cmd.extend(["-acodec", "libmp3lame", "-q:a", "2"])
+
+        cmd.append(output_path)
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return output_path
+        except subprocess.CalledProcessError as e:
+            stderr_text = (e.stderr or '').strip()
+            self.audio_extract_status_label.setText("Audio extraction failed.")
+            QMessageBox.warning(
+                self,
+                "Extract Audio",
+                f"Failed to extract audio.\n\n{stderr_text or str(e)}"
+            )
+            return None
+
     def on_vid_prep_audio_setting_changed(self, *args):
         """Persist audio replacement inputs and mark the preview stale."""
         self._save_vid_prep_ui_settings()
@@ -4702,6 +6627,7 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_audio_library_list.setCurrentRow(selected_row)
 
         self._update_vid_prep_audio_library_buttons()
+        self._refresh_framevid_library_lists_from_vid_prep()
 
     def _get_selected_vid_prep_audio_path(self):
         """Return the currently selected saved music path."""
@@ -4748,6 +6674,7 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_sfx_library_list.setCurrentRow(selected_row)
 
         self._update_vid_prep_sfx_library_buttons()
+        self._refresh_framevid_library_lists_from_vid_prep()
 
     def _get_selected_vid_prep_sfx_path(self):
         """Return the currently selected sound effects path."""
@@ -10365,35 +12292,37 @@ class InstagramDownloaderGUI(QMainWindow):
         url = self.url_input.text().strip()
         if not url:
             return
+
+        process_id = None
         
         try:
-            shortcode = None
-            url = url.strip('/')
-            parts = url.split('/')
-            
-            if 'p' in parts:
-                idx = parts.index('p')
-                if idx + 1 < len(parts):
-                    shortcode = parts[idx + 1].split('?')[0]
-            elif 'reel' in parts:
-                idx = parts.index('reel')
-                if idx + 1 < len(parts):
-                    shortcode = parts[idx + 1].split('?')[0]
-            elif 'instagram.com' not in url.lower() and len(url) > 5:
-                shortcode = url.split('?')[0]
-            
+            shortcode, is_video_url = self._extract_instagram_shortcode_from_text(url)
+
+            process_id = self.process_manager.add_process(
+                'add_url',
+                f'Add URL: {shortcode or url}',
+                None
+            )
+            self.process_manager.update_process(process_id, status='running', current=0, total=1)
+
             if not shortcode:
+                if process_id:
+                    self.process_manager.update_process(process_id, status='failed', current=0, total=1)
+                    QTimer.singleShot(5000, lambda pid=process_id: self.process_manager.remove_process(pid))
                 QMessageBox.warning(self, "Invalid URL", "Could not extract shortcode")
                 return
             
             for post in self.saved_posts:
                 if post.get('shortcode') == shortcode:
+                    if process_id:
+                        self.process_manager.update_process(process_id, status='completed', current=1, total=1)
+                        QTimer.singleShot(2000, lambda pid=process_id: self.process_manager.remove_process(pid))
                     QMessageBox.information(self, "Already Added", f"{shortcode} already in list")
                     self.url_input.clear()
                     return
             
-            # Detect if it's a reel from URL
-            if 'reel' in parts:
+            # Use media type hint from parsed URL path (reel/reels/tv -> video).
+            if is_video_url:
                 post = {'shortcode': shortcode, 'url': f"https://www.instagram.com/reel/{shortcode}/",
                        'owner_username': 'unknown', 'caption': f'URL: {shortcode}',
                        'typename': 'GraphVideo', 'is_video': True, 'date': '',
@@ -10410,6 +12339,10 @@ class InstagramDownloaderGUI(QMainWindow):
             self.filtered_posts = self.saved_posts.copy()  # Update filtered list for single add
             self.browse_status.setText(f"Added {shortcode}")
             self.url_input.clear()
+
+            if process_id:
+                self.process_manager.update_process(process_id, status='completed', current=1, total=1)
+                QTimer.singleShot(2000, lambda pid=process_id: self.process_manager.remove_process(pid))
             
             # Jump to the page where the newly added item appears
             if self.total_items > 0 and self.current_view_mode == 'tiles':
@@ -10420,7 +12353,48 @@ class InstagramDownloaderGUI(QMainWindow):
                 self.jump_to_page(target_page + 1)  # jump_to_page expects 1-indexed
             
         except Exception as e:
+            if process_id:
+                self.process_manager.update_process(
+                    process_id,
+                    status='failed',
+                    current=0,
+                    total=1,
+                )
+                QTimer.singleShot(5000, lambda pid=process_id: self.process_manager.remove_process(pid))
             QMessageBox.critical(self, "Error", f"Failed: {str(e)}")
+
+    def _extract_instagram_shortcode_from_text(self, text):
+        """Extract shortcode from Instagram URL/text and return (shortcode, is_video_url)."""
+        raw_text = str(text or '').strip()
+        if not raw_text:
+            return '', False
+
+        candidates = [raw_text]
+        candidates.extend([token for token in re.split(r'\s+', raw_text) if token])
+
+        pattern = re.compile(
+            r'(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/(?:share/)?(p|reel|reels|tv)/([A-Za-z0-9_-]+)',
+            re.IGNORECASE,
+        )
+
+        for token in candidates:
+            cleaned = token.strip().strip('"\'<>[](){}.,;')
+            if not cleaned:
+                continue
+
+            match = pattern.search(cleaned)
+            if match:
+                content_type = (match.group(1) or '').lower()
+                shortcode = (match.group(2) or '').strip()
+                if shortcode:
+                    return shortcode, content_type in ('reel', 'reels', 'tv')
+
+        # Fallback: allow direct shortcode input.
+        shortcode_candidate = raw_text.strip().split('?')[0].strip('/').strip()
+        if re.fullmatch(r'[A-Za-z0-9_-]{5,}', shortcode_candidate):
+            return shortcode_candidate, False
+
+        return '', False
     
     def filter_posts(self, text):
         """Filter posts table/tiles by search text"""
@@ -10428,20 +12402,9 @@ class InstagramDownloaderGUI(QMainWindow):
         search_text = text
         if text.strip():
             try:
-                url_text = text.strip().strip('/')
-                parts = url_text.split('/')
-                
-                # Check if it's an Instagram URL with /p/ or /reel/
-                if 'p' in parts:
-                    idx = parts.index('p')
-                    if idx + 1 < len(parts):
-                        # Extract shortcode from URL
-                        search_text = parts[idx + 1].split('?')[0]
-                elif 'reel' in parts:
-                    idx = parts.index('reel')
-                    if idx + 1 < len(parts):
-                        # Extract shortcode from URL
-                        search_text = parts[idx + 1].split('?')[0]
+                shortcode, _is_video_url = self._extract_instagram_shortcode_from_text(text)
+                if shortcode:
+                    search_text = shortcode
             except:
                 # If extraction fails, just use original text
                 search_text = text
@@ -12473,7 +14436,7 @@ class InstagramDownloaderGUI(QMainWindow):
             dialog = QDialog(self)
             dialog.setWindowTitle(f"Classify Content: {shortcode}")
             dialog.setMinimumWidth(500)
-            dialog.setMinimumHeight(600)
+            dialog.setMinimumHeight(700)
             
             layout = QVBoxLayout(dialog)
             
@@ -12591,7 +14554,7 @@ class InstagramDownloaderGUI(QMainWindow):
             
             existing_layout.addWidget(topic_tree, 1)
             
-            layout.addWidget(existing_panel)
+            layout.addWidget(existing_panel, 1)
             
             # === Panel for NEW topic creation ===
             new_panel = QWidget()
@@ -12676,7 +14639,9 @@ class InstagramDownloaderGUI(QMainWindow):
             
             parent_tree = QTreeWidget()
             parent_tree.setHeaderLabels(["Topic Name"])
-            parent_tree.setMinimumHeight(420)
+            parent_tree.setMinimumHeight(500)
+            parent_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            parent_tree.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
             parent_tree.setSelectionMode(QTreeWidget.SingleSelection)
             
             # Add Root node
@@ -12727,13 +14692,18 @@ class InstagramDownloaderGUI(QMainWindow):
             new_layout.addWidget(parent_tree, 1)
             
             new_panel.setVisible(False)  # Hidden by default
-            layout.addWidget(new_panel)
+            layout.addWidget(new_panel, 1)
             
             # Radio button switching logic
             def on_mode_changed():
                 is_existing = existing_radio.isChecked()
                 existing_panel.setVisible(is_existing)
                 new_panel.setVisible(not is_existing)
+                if not is_existing:
+                    # Force geometry recalculation after showing hidden panel so
+                    # parent tree scrollbar range is correct immediately.
+                    QTimer.singleShot(0, parent_tree.doItemsLayout)
+                    QTimer.singleShot(0, parent_tree.updateGeometries)
                 
                 # Update button text and tooltips
                 if is_existing:
@@ -15244,7 +17214,7 @@ class InstagramDownloaderGUI(QMainWindow):
                         row = i // columns
                         col = i % columns
                         start_idx = self.current_page * self.tiles_per_page
-                        row_number = start_idx + i + 1
+                        row_number = self._resolve_tile_row_number(post, start_idx + i + 1)
                         
                         # Save scroll position
                         scrollbar = self.tiles_scroll.verticalScrollBar()
@@ -15324,7 +17294,7 @@ class InstagramDownloaderGUI(QMainWindow):
                     row = i // columns
                     col = i % columns
                     start_idx = self.current_page * self.tiles_per_page
-                    row_number = start_idx + i + 1
+                    row_number = self._resolve_tile_row_number(post, start_idx + i + 1)
                     
                     # Remove old tile at this position
                     old_widget = self.tiles_grid.itemAtPosition(row, col)
@@ -16465,6 +18435,16 @@ class InstagramDownloaderGUI(QMainWindow):
     def toggle_video_mode(self):
         """Toggle between inline and popup video playback"""
         self.inline_video = not self.inline_video
+
+        if self.inline_video and self.force_system_player:
+            # Inline mode requires built-in playback; auto-disable forced system player.
+            self.force_system_player = False
+            self.account_manager.set_setting('force_system_player', 'false')
+            if hasattr(self, 'use_system_player_check'):
+                self.use_system_player_check.blockSignals(True)
+                self.use_system_player_check.setChecked(False)
+                self.use_system_player_check.blockSignals(False)
+
         mode_icons = {False: '🎬 Popup', True: '📺 Inline'}
         self.video_mode_btn.setText(mode_icons[self.inline_video])
         self.save_ui_setting('inline_video', 'true' if self.inline_video else 'false')
@@ -16590,6 +18570,10 @@ class InstagramDownloaderGUI(QMainWindow):
         # Restore Vid Prep tab state
         if hasattr(self, '_load_vid_prep_ui_settings'):
             self._load_vid_prep_ui_settings()
+
+        # Restore FrameVid tab state
+        if hasattr(self, '_load_framevid_state_setting'):
+            self._load_framevid_state_setting()
     
     def on_tile_volume_changed(self, volume):
         """Handle tile video volume slider change"""
@@ -16744,6 +18728,9 @@ class InstagramDownloaderGUI(QMainWindow):
         if tab_name == "Settings":
             logger.info("Refreshing Settings tab paths")
             QTimer.singleShot(0, self.refresh_settings_paths)
+
+        if tab_name == "FrameVid":
+            QTimer.singleShot(0, self._refresh_framevid_library_lists_from_vid_prep)
     
     def populate_tiles(self):
         """Populate the tile view with current page from cache - lazy loaded"""
@@ -16821,7 +18808,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 for i, post in enumerate(current_page_posts):
                     row = i // columns
                     col = i % columns
-                    row_number = start_idx + i + 1
+                    row_number = self._resolve_tile_row_number(post, start_idx + i + 1)
                     tile = self.create_tile_widget(post, row_number)
                     self.tiles_grid.addWidget(tile, row, col)
                 
@@ -16894,7 +18881,7 @@ class InstagramDownloaderGUI(QMainWindow):
                     widget.setParent(None)
                     widget.deleteLater()
                 # Add new tile
-                row_number = start_idx + (position[0] * columns + position[1]) + 1
+                row_number = self._resolve_tile_row_number(post, start_idx + (position[0] * columns + position[1]) + 1)
                 tile = self.create_tile_widget(post, row_number)
                 self.tiles_grid.addWidget(tile, position[0], position[1])
             
@@ -17008,6 +18995,14 @@ class InstagramDownloaderGUI(QMainWindow):
                 file_path = f.get('FileDestinationPath') or f.get('file_destination_path')
                 file_status = f.get('FileDownloadStatus') or f.get('file_download_status')
                 file_type = f.get('FileType') or f.get('file_type', '')
+                normalized_type = str(file_type or '').strip().lower()
+                if not normalized_type and file_path:
+                    normalized_type = os.path.splitext(str(file_path))[1].lstrip('.').lower()
+
+                if normalized_type in ('mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v') or 'video' in normalized_type:
+                    normalized_type = 'video'
+                elif normalized_type in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp') or 'image' in normalized_type:
+                    normalized_type = 'image'
                 
                 logger.debug(f"  File {i}: path={file_path}, status={file_status}, type={file_type}")
                 
@@ -17015,7 +19010,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 if file_path and os.path.exists(file_path) and file_status in ['downloaded', 'completed', 're-downloaded']:
                     downloaded_files.append({
                         'path': file_path,
-                        'type': file_type,
+                        'type': normalized_type,
                         'number': f.get('FileNumber') or f.get('file_number', 0)
                     })
                     logger.debug(f"  ✓ File {i} added to downloaded list")
@@ -17817,7 +19812,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if index < len(files):
             file_info = files[index]
             file_path = file_info['path']
-            is_video = file_info['type'] in ['video', 'mp4']
+            is_video = self._is_video_file_entry(file_info)
             
             # Get thumbnail size from media container's fixed size (most reliable)
             thumb_size = media_container.width() if media_container.width() > 0 else 150
@@ -17875,7 +19870,7 @@ class InstagramDownloaderGUI(QMainWindow):
             return
         
         current_file = files[index]
-        is_video = current_file['type'] in ['video', 'mp4']
+        is_video = self._is_video_file_entry(current_file)
         
         # Find and update play button
         for button in tile_frame.findChildren(QPushButton):
@@ -17910,6 +19905,126 @@ class InstagramDownloaderGUI(QMainWindow):
                 
                 button.clicked.connect(play_current)
                 break
+
+    def _find_first_video_layout(self, tile_widget):
+        """Return the first likely inline video layout container for a tile."""
+        if tile_widget is None:
+            return None
+
+        for widget in tile_widget.findChildren(QWidget):
+            if hasattr(widget, 'is_carousel_media_container'):
+                return widget.layout()
+            if hasattr(widget, 'is_bounded_video_container'):
+                return widget.layout()
+
+        return None
+
+    def _is_video_file_entry(self, file_info):
+        """Return True when a downloaded file entry should be treated as video."""
+        if not isinstance(file_info, dict):
+            return False
+
+        file_type = str(file_info.get('type') or '').strip().lower()
+        file_path = str(file_info.get('path') or '').strip().lower()
+
+        if file_type in ('video', 'mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v'):
+            return True
+        if 'video' in file_type:
+            return True
+
+        return file_path.endswith(('.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v'))
+
+    def _is_image_file_entry(self, file_info):
+        """Return True when a downloaded file entry should be treated as image."""
+        if not isinstance(file_info, dict):
+            return False
+
+        file_type = str(file_info.get('type') or '').strip().lower()
+        file_path = str(file_info.get('path') or '').strip().lower()
+
+        if file_type in ('image', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'):
+            return True
+        if 'image' in file_type:
+            return True
+
+        return file_path.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'))
+
+    def _resolve_current_copyable_image_path(self, shortcode, downloaded_files):
+        """Return currently selected image path for tile copy-to-clipboard action."""
+        if not downloaded_files:
+            return None
+
+        if len(downloaded_files) == 1:
+            only_file = downloaded_files[0]
+            if self._is_image_file_entry(only_file):
+                only_path = only_file.get('path')
+                if only_path and os.path.exists(only_path):
+                    return only_path
+            return None
+
+        current_idx = self.carousel_indices.get(shortcode, 0)
+        if 0 <= current_idx < len(downloaded_files):
+            selected_file = downloaded_files[current_idx]
+            if self._is_image_file_entry(selected_file):
+                selected_path = selected_file.get('path')
+                if selected_path and os.path.exists(selected_path):
+                    return selected_path
+
+        return None
+
+    def _copy_image_to_clipboard_from_tile(self, shortcode, downloaded_files):
+        """Copy selected/current image from a tile to system clipboard."""
+        image_path = self._resolve_current_copyable_image_path(shortcode, downloaded_files)
+        if not image_path:
+            QMessageBox.information(
+                self,
+                "Copy to Clipboard",
+                "No image is currently selected for this tile.\n\n"
+                "For carousels, navigate to an image item first."
+            )
+            return False
+
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Copy to Clipboard", f"Failed to load image:\n{image_path}")
+            return False
+
+        try:
+            QApplication.clipboard().setPixmap(pixmap)
+            self.statusBar().showMessage("Image copied to clipboard", 2500)
+            return True
+        except Exception as e:
+            logger.error(f"Error copying image to clipboard ({image_path}): {e}")
+            QMessageBox.warning(self, "Copy to Clipboard", f"Failed to copy image:\n{e}")
+            return False
+
+    def _resolve_tile_row_number(self, post, fallback=None):
+        """Resolve display row number from DB-backed fields, with optional fallback."""
+        if not isinstance(post, dict):
+            return fallback
+
+        direct = post.get('row_number')
+        if direct not in (None, '', 0, '0'):
+            try:
+                return int(direct)
+            except (TypeError, ValueError):
+                pass
+
+        content_info = post.get('ContentInformation') or {}
+        nested = content_info.get('rowNumber')
+        if nested not in (None, '', 0, '0'):
+            try:
+                return int(nested)
+            except (TypeError, ValueError):
+                pass
+
+        if fallback not in (None, '', 0, '0'):
+            try:
+                return int(fallback)
+            except (TypeError, ValueError):
+                return None
+
+        return None
     
     def _extract_video_thumbnail(self, video_path):
         """Extract first frame from video as thumbnail
@@ -17952,7 +20067,8 @@ class InstagramDownloaderGUI(QMainWindow):
             return None
     
     def _add_tile_media_display(self, layout, tile, config, shortcode, downloaded_files,
-                                inline_examine=False, examine_callback=None, inline_play=True):
+                                inline_examine=False, examine_callback=None, inline_play=True,
+                                has_video_hint=False):
         """Add media display to tile with interactive controls based on content type."""
         thumb_size = config['thumb']
         
@@ -17962,7 +20078,7 @@ class InstagramDownloaderGUI(QMainWindow):
             # Content is downloaded - add interactive controls
             file_count = len(downloaded_files)
             is_carousel = file_count > 1
-            has_video = any(f['type'] in ['video', 'mp4'] for f in downloaded_files)
+            has_video = any(self._is_video_file_entry(f) for f in downloaded_files)
             
             logger.info(f"[MEDIA_DISPLAY] {shortcode}: file_count={file_count}, is_carousel={is_carousel}, has_video={has_video}")
             
@@ -17970,14 +20086,15 @@ class InstagramDownloaderGUI(QMainWindow):
                 # Carousel with navigation
                 logger.info(f"[MEDIA_DISPLAY] {shortcode}: Creating CAROUSEL display")
                 self._add_carousel_display(layout, tile, thumb_size, shortcode, downloaded_files)
-            elif any(f['type'] in ['video', 'mp4'] for f in downloaded_files):
+            elif has_video or has_video_hint:
                 # Single video with play button
                 logger.info(f"[MEDIA_DISPLAY] {shortcode}: Creating VIDEO display with PLAY BUTTON")
+                video_file = next((f for f in downloaded_files if self._is_video_file_entry(f)), downloaded_files[0])
                 self._add_video_display(
                     layout,
                     thumb_size,
                     shortcode,
-                    downloaded_files[0],
+                    video_file,
                     tile=tile,
                     inline_examine=inline_examine,
                     examine_callback=examine_callback,
@@ -18016,7 +20133,7 @@ class InstagramDownloaderGUI(QMainWindow):
         media_container.is_carousel_media_container = True
         
         # Image/Video display
-        is_video = current_file['type'] in ['video', 'mp4']
+        is_video = self._is_video_file_entry(current_file)
         thumb_label = HoverImageLabel(current_file['path']) if not is_video else QLabel()
         thumb_label.is_carousel_image = True
         thumb_label.setFixedSize(thumb_size, media_height)  # Match container height
@@ -18095,7 +20212,7 @@ class InstagramDownloaderGUI(QMainWindow):
         play_btn.setToolTip("Play Video")
         play_btn.is_carousel_play_button = True
         
-        if current_file['type'] in ['video', 'mp4']:
+        if self._is_video_file_entry(current_file):
             play_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; font-weight: bold; }")
             play_btn.setEnabled(True)
         else:
@@ -18112,7 +20229,7 @@ class InstagramDownloaderGUI(QMainWindow):
             current_idx = self.carousel_indices.get(shortcode, 0)
             if current_idx < len(downloaded_files):
                 current = downloaded_files[current_idx]
-                if current['type'] in ['video', 'mp4']:
+                if self._is_video_file_entry(current):
                     # Find the media container
                     media_cont = None
                     for widget in tile.findChildren(QWidget):
@@ -18178,15 +20295,22 @@ class InstagramDownloaderGUI(QMainWindow):
 
         is_content_tile = bool(tile is not None and getattr(tile, '_is_content_tile', False))
         is_single_tile_viewer = bool(tile is not None and getattr(tile, '_is_single_tile_viewer', False))
-        if is_content_tile or is_single_tile_viewer:
+        if tile is not None:
             max_tile_height = tile.maximumHeight() if tile is not None else 0
             # Bound media area against the surrounding tile chrome.
             # Content tiles reserve both top and bottom button bands.
             # Single-tile viewer only reserves the checkbox/id row and the top button row.
-            static_overhead = 54 if is_single_tile_viewer else 98
+            if is_single_tile_viewer:
+                static_overhead = 54
+            elif is_content_tile:
+                static_overhead = 126 if not inline_play else 98
+            else:
+                # Browse tiles include ID row, top action row, margins, and usually an Examine footer row.
+                static_overhead = 120
+
             if max_tile_height and max_tile_height > static_overhead:
                 container_height = min(container_height, max_tile_height - static_overhead)
-            container_height = max(130, container_height)
+            container_height = max(110 if not is_single_tile_viewer else 130, container_height)
             video_height = max(74, container_height - (72 if is_single_tile_viewer else 56))
 
         video_container.setFixedSize(thumb_size, container_height)
@@ -18248,7 +20372,10 @@ class InstagramDownloaderGUI(QMainWindow):
         if inline_play:
             # Requested: make Play Video button roughly half-height.
             play_btn = QPushButton("▶ Play")
-            play_btn.setFixedHeight(18 if is_single_tile_viewer else 14)
+            if is_content_tile and not is_single_tile_viewer:
+                play_btn.setFixedHeight(24)
+            else:
+                play_btn.setFixedHeight(18 if is_single_tile_viewer else 14)
             play_btn.setStyleSheet("""
                 QPushButton {
                     background-color: #28a745;
@@ -18268,7 +20395,10 @@ class InstagramDownloaderGUI(QMainWindow):
         # Optional inline Examine button on the same control row as Play.
         if inline_examine and callable(examine_callback):
             examine_btn = QPushButton("Examine")
-            examine_btn.setFixedHeight(18 if is_single_tile_viewer else 14)
+            if is_content_tile and not is_single_tile_viewer:
+                examine_btn.setFixedHeight(24)
+            else:
+                examine_btn.setFixedHeight(18 if is_single_tile_viewer else 14)
             examine_btn.setStyleSheet(
                 "QPushButton { background-color: #495057; color: white; font-weight: bold; font-size: %s; padding: %s; border-radius: 3px; }"
                 % ("9pt" if is_single_tile_viewer else "8pt", "2px 8px" if is_single_tile_viewer else "1px 4px")
@@ -18354,7 +20484,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 
                 if file_count > 1:
                     # Carousel - count videos and images
-                    videos = sum(1 for f in files if f['type'] in ['video', 'mp4'])
+                    videos = sum(1 for f in files if self._is_video_file_entry(f))
                     images = file_count - videos
                     
                     if videos == file_count:
@@ -18366,7 +20496,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 else:
                     # Single file
                     file_type = files[0]['type']
-                    if file_type in ['video', 'mp4']:
+                    if self._is_video_file_entry(files[0]):
                         return '🎬 Post - Single Video'
                     else:
                         return '🖼️ Post - Single Image'
@@ -18387,7 +20517,7 @@ class InstagramDownloaderGUI(QMainWindow):
         
         try:
             files = self.get_downloaded_files(shortcode)
-            return any(f['type'] in ['video', 'mp4'] for f in files)
+            return any(self._is_video_file_entry(f) for f in files)
         except Exception:
             return False
 
@@ -18404,7 +20534,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if not files:
             return None
 
-        video_files = [f for f in files if f.get('type') in ['video', 'mp4'] and f.get('path')]
+        video_files = [f for f in files if self._is_video_file_entry(f) and f.get('path')]
         if not video_files:
             return None
 
@@ -18413,7 +20543,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if 0 <= selected_idx < len(files):
             selected = files[selected_idx]
             selected_path = selected.get('path')
-            if selected.get('type') in ['video', 'mp4'] and selected_path and os.path.exists(selected_path):
+            if self._is_video_file_entry(selected) and selected_path and os.path.exists(selected_path):
                 return selected_path
 
         for f in video_files:
@@ -18448,6 +20578,81 @@ class InstagramDownloaderGUI(QMainWindow):
             self.tabs.setCurrentIndex(vid_prep_index)
             if isinstance(close_dialog, QDialog):
                 close_dialog.accept()
+
+    def send_tile_to_audio_extract(self, shortcode, close_dialog=None):
+        """Open Extract Audio tab and load the tile's video file as source."""
+        video_path = self._get_video_file_for_shortcode(shortcode)
+        if not video_path:
+            QMessageBox.information(
+                self,
+                "Extract Audio",
+                "No downloaded video file is available for this tile yet.\n\n"
+                "Download the post (video) first, then click To Audio again."
+            )
+            return
+
+        if not self.load_audio_extract_source(video_path):
+            return
+
+        audio_tab_index = -1
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "Extract Audio":
+                audio_tab_index = i
+                break
+
+        if audio_tab_index >= 0:
+            self.tabs.setCurrentIndex(audio_tab_index)
+            if isinstance(close_dialog, QDialog):
+                close_dialog.accept()
+
+    def _get_framevid_tile_source_paths(self, shortcode, all_files=False):
+        """Return image/video file paths for a tile suitable for FrameVid."""
+        if not shortcode:
+            return []
+        try:
+            files = self.get_downloaded_files(shortcode)
+        except Exception:
+            return []
+        if not files:
+            return []
+        if all_files:
+            paths = [f.get('path') for f in files if f.get('path') and (self._is_image_file_entry(f) or self._is_video_file_entry(f)) and os.path.exists(f.get('path'))]
+            return paths
+        current_idx = self.carousel_indices.get(shortcode, 0)
+        if 0 <= current_idx < len(files):
+            selected = files[current_idx]
+            selected_path = selected.get('path')
+            if selected_path and os.path.exists(selected_path) and (self._is_image_file_entry(selected) or self._is_video_file_entry(selected)):
+                return [selected_path]
+        for f in files:
+            p = f.get('path')
+            if p and os.path.exists(p) and (self._is_image_file_entry(f) or self._is_video_file_entry(f)):
+                return [p]
+        return []
+
+    def send_tile_to_framevid_this(self, shortcode, close_dialog=None):
+        """Open FrameVid and add the current tile's single media item."""
+        paths = self._get_framevid_tile_source_paths(shortcode, all_files=False)
+        if not paths:
+            QMessageBox.information(self, "FrameVid", "No supported image/video file is available for this tile yet.")
+            return
+        for path in paths:
+            self._framevid_add_source_item(path)
+        self.tabs.setCurrentIndex(next((i for i in range(self.tabs.count()) if self.tabs.tabText(i) == 'FrameVid'), self.tabs.currentIndex()))
+        if isinstance(close_dialog, QDialog):
+            close_dialog.accept()
+
+    def send_tile_to_framevid_all(self, shortcode, close_dialog=None):
+        """Open FrameVid and add all supported media from the tile."""
+        paths = self._get_framevid_tile_source_paths(shortcode, all_files=True)
+        if not paths:
+            QMessageBox.information(self, "FrameVid", "No supported image/video files are available for this tile yet.")
+            return
+        for path in paths:
+            self._framevid_add_source_item(path)
+        self.tabs.setCurrentIndex(next((i for i in range(self.tabs.count()) if self.tabs.tabText(i) == 'FrameVid'), self.tabs.currentIndex()))
+        if isinstance(close_dialog, QDialog):
+            close_dialog.accept()
     
     def create_tile_widget(self, post, row_number=None, include_examine_button=True, tile_config_override=None, open_explorer_target='download', viewer_mode=False):
         """Create a tile widget for a single post
@@ -18519,6 +20724,11 @@ class InstagramDownloaderGUI(QMainWindow):
         tile.setMaximumHeight(config['max_height'])
         tile._is_content_tile = (open_explorer_target == 'topic')
         tile._is_single_tile_viewer = bool(viewer_mode)
+        if tile._is_content_tile and not viewer_mode:
+            # Content-topic tiles may include a second footer action row.
+            # Give them extra vertical room so that row is not clipped.
+            tile.setMinimumHeight(config['min_height'] + 40)
+            tile.setMaximumHeight(config['max_height'] + 60)
         # Set fixed width to match thumbnail + padding (left-aligned, no extra space)
         tile.setFixedWidth(config['thumb'] + 10)  # thumb + margins
         tile.setCursor(Qt.PointingHandCursor)
@@ -18741,7 +20951,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if is_content_tile:
             button_row_widget = QWidget()
             button_row_widget.setLayout(button_row)
-            button_row_widget.setFixedHeight(24)
+            button_row_widget.setMinimumHeight(24)
             layout.addWidget(button_row_widget)
         else:
             layout.addLayout(button_row)
@@ -18767,10 +20977,10 @@ class InstagramDownloaderGUI(QMainWindow):
 
         is_single_video = (
             len(downloaded_files) == 1 and
-            downloaded_files[0].get('type') in ['video', 'mp4']
+            self._is_video_file_entry(downloaded_files[0])
         )
         move_video_controls_to_footer = (
-            open_explorer_target == 'topic' and
+            include_examine_button and
             is_single_video and
             not viewer_mode
         )
@@ -18780,6 +20990,12 @@ class InstagramDownloaderGUI(QMainWindow):
             open_explorer_target == 'topic' and
             is_single_video and
             not move_video_controls_to_footer
+        )
+
+        has_video_hint = bool(
+            post.get('is_video') or
+            typename == 'GraphVideo' or
+            ('video' in str(display_typename).lower())
         )
 
         # Add interactive media display based on download status.
@@ -18792,6 +21008,7 @@ class InstagramDownloaderGUI(QMainWindow):
             inline_examine=inline_examine,
             examine_callback=open_examine_handler,
             inline_play=not move_video_controls_to_footer,
+            has_video_hint=has_video_hint,
         )
 
         needs_footer_controls = include_examine_button and status not in ['failed', 'error', 'completed_with_errors']
@@ -18799,48 +21016,201 @@ class InstagramDownloaderGUI(QMainWindow):
             examine_row = QHBoxLayout()
             examine_row.setContentsMargins(0, 2, 0, 0)
             examine_row.setSpacing(1)
+            assignment_row = None
+
+            has_copyable_image = any(self._is_image_file_entry(f) for f in downloaded_files)
+            has_video_available = any(self._is_video_file_entry(f) for f in downloaded_files)
 
             if move_video_controls_to_footer:
                 # Keep all action/toggle controls on one final row in content tiles.
                 # Footer play uses inline playback when inline mode is enabled.
                 footer_play_btn = QPushButton("Play")
-                footer_play_btn.setMaximumHeight(20)
-                footer_play_btn.setMaximumWidth(42)
+                footer_play_btn.setMaximumHeight(28)
+                footer_play_btn.setMinimumHeight(28)
+                footer_play_btn.setMinimumWidth(76)
                 footer_play_btn.setToolTip("Play Video")
-                footer_play_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; font-weight: bold; font-size: 7pt; padding: 0px 2px; }")
+                footer_play_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; font-weight: bold; font-size: 8pt; padding: 1px 6px; }")
                 play_handler = getattr(tile, '_single_video_play_handler', None)
                 if callable(play_handler):
                     footer_play_btn.clicked.connect(play_handler)
                 else:
-                    footer_play_btn.clicked.connect(lambda checked=False, path=downloaded_files[0].get('path', ''): self.play_video(path, None))
+                    footer_play_btn.clicked.connect(
+                        lambda checked=False, path=downloaded_files[0].get('path', ''), t=tile: self.play_video(path, self._find_first_video_layout(t))
+                    )
                 examine_row.addWidget(footer_play_btn)
                 _style_content_tile_action_button(footer_play_btn)
 
                 footer_examine_btn = QPushButton("Examine")
-                footer_examine_btn.setMaximumHeight(20)
-                footer_examine_btn.setMaximumWidth(56)
+                footer_examine_btn.setMaximumHeight(28)
+                footer_examine_btn.setMinimumHeight(28)
+                footer_examine_btn.setMaximumWidth(84)
                 footer_examine_btn.setToolTip("Open Single Tile Viewer")
                 footer_examine_btn.setStyleSheet("QPushButton { background-color: #495057; color: white; font-weight: bold; font-size: 7pt; padding: 0px 2px; }")
                 footer_examine_btn.clicked.connect(open_examine_handler)
                 examine_row.addWidget(footer_examine_btn)
                 _style_content_tile_action_button(footer_examine_btn)
 
+                if has_copyable_image:
+                    footer_copy_image_btn = QPushButton("Copy to Clipboard")
+                    footer_copy_image_btn.setMaximumHeight(24)
+                    footer_copy_image_btn.setMinimumWidth(108)
+                    footer_copy_image_btn.setToolTip("Copy current image to clipboard")
+                    footer_copy_image_btn.setStyleSheet("QPushButton { background-color: #455a64; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
+                    footer_copy_image_btn.clicked.connect(
+                        lambda checked=False, sc=shortcode, files=downloaded_files: self._copy_image_to_clipboard_from_tile(sc, files)
+                    )
+                    examine_row.addWidget(footer_copy_image_btn)
+                    _style_content_tile_action_button(footer_copy_image_btn)
+
+                if has_video_available:
+                    footer_to_audio_btn = QPushButton("To Audio")
+                    footer_to_audio_btn.setMaximumHeight(28)
+                    footer_to_audio_btn.setMinimumHeight(28)
+                    footer_to_audio_btn.setMinimumWidth(92)
+                    footer_to_audio_btn.setToolTip("Send selected video to Extract Audio tab")
+                    footer_to_audio_btn.setStyleSheet("QPushButton { background-color: #6f42c1; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
+                    footer_to_audio_btn.clicked.connect(
+                        lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_audio_extract(sc, close_dialog=dlg)
+                    )
+                    examine_row.addWidget(footer_to_audio_btn)
+                    _style_content_tile_action_button(footer_to_audio_btn)
+
+                has_framevid_source = any(self._is_image_file_entry(f) or self._is_video_file_entry(f) for f in downloaded_files)
+                if has_framevid_source:
+                    if len(downloaded_files) > 1:
+                        framevid_all_btn = QPushButton("FVA")
+                        framevid_all_btn.setMaximumHeight(24)
+                        framevid_all_btn.setMinimumWidth(48)
+                        framevid_all_btn.setToolTip("Send all carousel media to FrameVid")
+                        framevid_all_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
+                        framevid_all_btn.clicked.connect(
+                            lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_framevid_all(sc, close_dialog=dlg)
+                        )
+                        examine_row.addWidget(framevid_all_btn)
+                        _style_content_tile_action_button(framevid_all_btn)
+
+                        framevid_this_btn = QPushButton("FV This")
+                        framevid_this_btn.setMaximumHeight(24)
+                        framevid_this_btn.setMinimumWidth(72)
+                        framevid_this_btn.setToolTip("Send current carousel slide to FrameVid")
+                        framevid_this_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
+                        framevid_this_btn.clicked.connect(
+                            lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_framevid_this(sc, close_dialog=dlg)
+                        )
+                        examine_row.addWidget(framevid_this_btn)
+                        _style_content_tile_action_button(framevid_this_btn)
+                    else:
+                        framevid_btn = QPushButton("FrameVid This")
+                        framevid_btn.setMaximumHeight(24)
+                        framevid_btn.setMinimumWidth(100)
+                        framevid_btn.setToolTip("Send this tile to FrameVid")
+                        framevid_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
+                        framevid_btn.clicked.connect(
+                            lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_framevid_this(sc, close_dialog=dlg)
+                        )
+                        examine_row.addWidget(framevid_btn)
+                        _style_content_tile_action_button(framevid_btn)
+
             # If we already placed Examine next to Play for content-topic video tiles, skip duplicate footer button.
             if not inline_examine and not move_video_controls_to_footer:
                 examine_btn = QPushButton("Examine")
                 if open_explorer_target == 'topic':
-                    examine_btn.setMaximumHeight(24)
-                    examine_btn.setMaximumWidth(78)
+                    examine_btn.setMaximumHeight(28)
+                    examine_btn.setMinimumHeight(28)
+                    examine_btn.setMaximumWidth(96)
                 else:
                     examine_btn.setMaximumHeight(28)
+                    examine_btn.setMinimumHeight(28)
                 examine_btn.setToolTip("Open Single Tile Viewer")
                 examine_btn.setStyleSheet("QPushButton { background-color: #495057; color: white; font-weight: bold; }")
                 examine_btn.clicked.connect(open_examine_handler)
                 examine_row.addWidget(examine_btn)
                 _style_content_tile_action_button(examine_btn)
 
+                if has_copyable_image:
+                    copy_image_btn = QPushButton("Copy to Clipboard")
+                    if open_explorer_target == 'topic':
+                        copy_image_btn.setMaximumHeight(24)
+                        copy_image_btn.setMaximumWidth(128)
+                    else:
+                        copy_image_btn.setMaximumHeight(28)
+                        copy_image_btn.setMaximumWidth(140)
+                    copy_image_btn.setToolTip("Copy current image to clipboard")
+                    copy_image_btn.setStyleSheet("QPushButton { background-color: #455a64; color: white; font-weight: bold; }")
+                    copy_image_btn.clicked.connect(
+                        lambda checked=False, sc=shortcode, files=downloaded_files: self._copy_image_to_clipboard_from_tile(sc, files)
+                    )
+                    examine_row.addWidget(copy_image_btn)
+                    _style_content_tile_action_button(copy_image_btn)
+
+                if has_video_available:
+                    to_audio_btn = QPushButton("To Audio")
+                    if open_explorer_target == 'topic':
+                        to_audio_btn.setMaximumHeight(28)
+                        to_audio_btn.setMinimumHeight(28)
+                        to_audio_btn.setMaximumWidth(104)
+                    else:
+                        to_audio_btn.setMaximumHeight(28)
+                        to_audio_btn.setMinimumHeight(28)
+                        to_audio_btn.setMaximumWidth(112)
+                    to_audio_btn.setToolTip("Send selected video to Extract Audio tab")
+                    to_audio_btn.setStyleSheet("QPushButton { background-color: #6f42c1; color: white; font-weight: bold; }")
+                    to_audio_btn.clicked.connect(
+                        lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_audio_extract(sc, close_dialog=dlg)
+                    )
+                    examine_row.addWidget(to_audio_btn)
+                    _style_content_tile_action_button(to_audio_btn)
+
+                has_framevid_source = any(self._is_image_file_entry(f) or self._is_video_file_entry(f) for f in downloaded_files)
+                if has_framevid_source:
+                    if len(downloaded_files) > 1:
+                        framevid_all_btn = QPushButton("FVA")
+                        framevid_this_btn = QPushButton("FV This")
+                        if open_explorer_target == 'topic':
+                            framevid_all_btn.setMaximumHeight(24)
+                            framevid_all_btn.setMaximumWidth(56)
+                            framevid_this_btn.setMaximumHeight(24)
+                            framevid_this_btn.setMaximumWidth(86)
+                        else:
+                            framevid_all_btn.setMaximumHeight(28)
+                            framevid_all_btn.setMaximumWidth(64)
+                            framevid_this_btn.setMaximumHeight(28)
+                            framevid_this_btn.setMaximumWidth(94)
+                        framevid_all_btn.setToolTip("Send all carousel media to FrameVid")
+                        framevid_this_btn.setToolTip("Send current carousel slide to FrameVid")
+                        framevid_all_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; }")
+                        framevid_this_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; }")
+                        framevid_all_btn.clicked.connect(
+                            lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_framevid_all(sc, close_dialog=dlg)
+                        )
+                        framevid_this_btn.clicked.connect(
+                            lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_framevid_this(sc, close_dialog=dlg)
+                        )
+                        examine_row.addWidget(framevid_all_btn)
+                        _style_content_tile_action_button(framevid_all_btn)
+                        examine_row.addWidget(framevid_this_btn)
+                        _style_content_tile_action_button(framevid_this_btn)
+                    else:
+                        framevid_btn = QPushButton("FrameVid This")
+                        if open_explorer_target == 'topic':
+                            framevid_btn.setMaximumHeight(24)
+                            framevid_btn.setMaximumWidth(100)
+                        else:
+                            framevid_btn.setMaximumHeight(28)
+                            framevid_btn.setMaximumWidth(108)
+                        framevid_btn.setToolTip("Send this tile to FrameVid")
+                        framevid_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; }")
+                        framevid_btn.clicked.connect(
+                            lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_framevid_this(sc, close_dialog=dlg)
+                        )
+                        examine_row.addWidget(framevid_btn)
+                        _style_content_tile_action_button(framevid_btn)
+
             # Content tab only: add Tree/Site completion toggles for current topic assignment.
             if open_explorer_target == 'topic' and self.content_db and self.content_db.db:
+                assignment_row = QHBoxLayout()
+                assignment_row.setContentsMargins(0, 1, 0, 0)
+                assignment_row.setSpacing(1)
                 shortcode_clean = (shortcode or '').strip()
                 # Prefer explicit row number when available; fallback to shortcode.
                 content_row_number = row_number if row_number is not None else post.get('row_number')
@@ -18879,7 +21249,7 @@ class InstagramDownloaderGUI(QMainWindow):
                         sc,
                     )
                 )
-                examine_row.addWidget(tree_btn)
+                assignment_row.addWidget(tree_btn)
                 _style_content_tile_action_button(tree_btn)
 
                 site_btn = QPushButton()
@@ -18900,7 +21270,7 @@ class InstagramDownloaderGUI(QMainWindow):
                         sc,
                     )
                 )
-                examine_row.addWidget(site_btn)
+                assignment_row.addWidget(site_btn)
                 _style_content_tile_action_button(site_btn)
 
                 prep_btn = QPushButton()
@@ -18921,7 +21291,7 @@ class InstagramDownloaderGUI(QMainWindow):
                         sc,
                     )
                 )
-                examine_row.addWidget(prep_btn)
+                assignment_row.addWidget(prep_btn)
                 _style_content_tile_action_button(prep_btn)
 
             if not is_content_tile:
@@ -18929,8 +21299,14 @@ class InstagramDownloaderGUI(QMainWindow):
             if is_content_tile:
                 examine_row_widget = QWidget()
                 examine_row_widget.setLayout(examine_row)
-                examine_row_widget.setFixedHeight(24)
+                examine_row_widget.setMinimumHeight(30)
                 layout.addWidget(examine_row_widget)
+                if assignment_row is not None:
+                    assignment_row.addStretch(1)
+                    assignment_row_widget = QWidget()
+                    assignment_row_widget.setLayout(assignment_row)
+                    assignment_row_widget.setMinimumHeight(24)
+                    layout.addWidget(assignment_row_widget)
             else:
                 layout.addLayout(examine_row)
         
@@ -21421,6 +23797,9 @@ class InstagramDownloaderGUI(QMainWindow):
     def closeEvent(self, event):
         """Handle application close - clean up resources"""
         try:
+            if self.current_username and hasattr(self, '_save_framevid_state_setting'):
+                self._save_framevid_state_setting()
+
             # Save current page before closing
             if self.current_username:
                 self.save_ui_setting('current_page', str(self.current_page))

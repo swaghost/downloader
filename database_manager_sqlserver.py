@@ -64,10 +64,16 @@ class DatabaseManagerSQLServer:
                 self._local.connection = pyodbc.connect(self.connection_string, timeout=30)
                 self._local.connection.autocommit = False  # Explicit transaction control
                 
-                # Set session to use Latin1 collation for conversions
+                # Set deterministic SQL Server session options required for
+                # indexed views/computed columns/filtered indexes.
                 cursor = self._local.connection.cursor()
-                cursor.execute("SET ANSI_WARNINGS OFF")
+                cursor.execute("SET ANSI_NULLS ON")
                 cursor.execute("SET ANSI_PADDING ON")
+                cursor.execute("SET ANSI_WARNINGS ON")
+                cursor.execute("SET ARITHABORT ON")
+                cursor.execute("SET CONCAT_NULL_YIELDS_NULL ON")
+                cursor.execute("SET QUOTED_IDENTIFIER ON")
+                cursor.execute("SET NUMERIC_ROUNDABORT OFF")
                 cursor.close()
                 
             except pyodbc.Error as e:
