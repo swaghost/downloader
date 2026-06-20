@@ -16,7 +16,7 @@ requests>=2.28.0
 browser-cookie3>=0.19.0
 
 # Video thumbnail extraction (optional, for video preview in carousel)
-opencv-python>=4.8.0
+opencv-python>=4.13.0.92
 
 # VLC-based video player (alternative to Qt multimedia, includes codecs)
 python-vlc>=3.0.0
