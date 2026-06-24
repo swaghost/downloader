@@ -233,6 +233,109 @@ class AudioTrackEditorListWidget(QListWidget):
         self.order_changed.emit()
 
 
+class AudioStartFrameDropLabel(QLabel):
+    """Drop target that resolves an audio track path for Start-at-Frame assignment."""
+    track_dropped = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFrameShape(QFrame.StyledPanel)
+        self._normal_style = (
+            "QLabel { border: 1px dashed #6b7280; background-color: #111827;"
+            " color: #d1d5db; padding: 4px 10px; border-radius: 4px; }"
+        )
+        self._hover_style = (
+            "QLabel { border: 1px solid #22c55e; background-color: #052e1a;"
+            " color: #dcfce7; padding: 4px 10px; border-radius: 4px; }"
+        )
+        self.setStyleSheet(self._normal_style)
+
+    def _extract_audio_path_from_mime(self, mime_data):
+        if not mime_data:
+            return ''
+
+        supported = ('.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg')
+        if mime_data.hasUrls():
+            for url in mime_data.urls():
+                if not url.isLocalFile():
+                    continue
+                local_path = os.path.normpath(url.toLocalFile())
+                if str(local_path).lower().endswith(supported):
+                    return local_path
+
+        if mime_data.hasText():
+            raw_text = mime_data.text() or ''
+            for token in re.split(r'[\r\n]+', raw_text):
+                candidate = token.strip().strip('"')
+                if not candidate:
+                    continue
+                if candidate.startswith('file:///'):
+                    local_path = QUrl(candidate).toLocalFile()
+                else:
+                    local_path = candidate
+                local_path = os.path.normpath(local_path)
+                if str(local_path).lower().endswith(supported):
+                    return local_path
+
+        return ''
+
+    def _extract_audio_path_from_drag_source(self, event):
+        src = event.source()
+        if not isinstance(src, QListWidget):
+            return ''
+        item = src.currentItem()
+        if not item:
+            return ''
+        data = item.data(Qt.UserRole)
+        if isinstance(data, dict):
+            for key in ('track_path', 'path', 'file_path'):
+                value = data.get(key)
+                if value:
+                    return os.path.normpath(str(value))
+        if isinstance(data, str) and data:
+            return os.path.normpath(data)
+        tip = (item.toolTip() or '').strip()
+        if tip:
+            return os.path.normpath(tip)
+        return ''
+
+    def dragEnterEvent(self, event):
+        path = self._extract_audio_path_from_mime(event.mimeData())
+        if not path:
+            path = self._extract_audio_path_from_drag_source(event)
+        if path:
+            self.setStyleSheet(self._hover_style)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        path = self._extract_audio_path_from_mime(event.mimeData())
+        if not path:
+            path = self._extract_audio_path_from_drag_source(event)
+        if path:
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet(self._normal_style)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        self.setStyleSheet(self._normal_style)
+        path = self._extract_audio_path_from_mime(event.mimeData())
+        if not path:
+            path = self._extract_audio_path_from_drag_source(event)
+        if path:
+            self.track_dropped.emit(path)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+
 class PreserveTreeItemForegroundDelegate(QStyledItemDelegate):
     """Preserve per-item foreground colors when a tree item is selected."""
 
@@ -1797,7 +1900,10 @@ class InstagramDownloaderGUI(QMainWindow):
                 status_item = self.process_table.item(row, 2)
                 if status_item:
                     # Format status text for display
-                    status_display = status.replace('_', ' ').title()
+                    if status == 'space_on_disk':
+                        status_display = 'SPACE ON DISK'
+                    else:
+                        status_display = status.replace('_', ' ').title()
                     status_item.setText(status_display)
                     # Color code status
                     if status == 'running':
@@ -1813,6 +1919,8 @@ class InstagramDownloaderGUI(QMainWindow):
                     elif status == 're-downloaded':
                         status_item.setForeground(QColor("#6610f2"))  # Purple (distinct from completed)
                     elif status == 'failed':
+                        status_item.setForeground(QColor("#dc3545"))  # Red
+                    elif status == 'space_on_disk':
                         status_item.setForeground(QColor("#dc3545"))  # Red
                     elif status == 'completed_with_errors':
                         status_item.setForeground(QColor("#ff8c00"))  # Orange
@@ -3877,6 +3985,14 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_mute_btn.toggled.connect(self.on_vid_prep_output_mute_toggled)
         output_controls.addWidget(self.vid_prep_output_mute_btn)
 
+        self.vid_prep_render_progress = QProgressBar()
+        self.vid_prep_render_progress.setMinimumWidth(180)
+        self.vid_prep_render_progress.setMaximumWidth(260)
+        self.vid_prep_render_progress.setTextVisible(True)
+        self.vid_prep_render_progress.setVisible(False)
+        self.vid_prep_render_progress.setFormat("Rendering...")
+        output_controls.addWidget(self.vid_prep_render_progress)
+
         output_controls.addStretch()
         output_panel.addLayout(output_controls)
 
@@ -3893,7 +4009,7 @@ class InstagramDownloaderGUI(QMainWindow):
         preview_splitter.setChildrenCollapsible(False)
         preview_layout.addWidget(preview_splitter)
 
-        audio_group = QGroupBox("Audio")
+        audio_group = QGroupBox("Audio Options")
         audio_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         audio_layout = QVBoxLayout(audio_group)
         audio_layout.setContentsMargins(8, 8, 8, 8)
@@ -4831,12 +4947,13 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_source_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.framevid_source_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.framevid_source_list.currentItemChanged.connect(self.on_framevid_source_selection_changed)
+        self.framevid_source_list.model().rowsMoved.connect(self.on_framevid_source_rows_moved)
         self.framevid_source_list.setMinimumHeight(220)
         self.framevid_source_list.setToolTip("Drop image/video files here. Reorder by dragging or using move buttons. Supports multi-select actions.")
         source_list_box.addWidget(self.framevid_source_list, 1)
 
         source_editor = QGridLayout()
-        source_editor.setHorizontalSpacing(6)
+        source_editor.setHorizontalSpacing(4)
         source_editor.setVerticalSpacing(4)
         source_editor.addWidget(QLabel("Duration (s):"), 0, 0)
         self.framevid_source_duration_spin = QDoubleSpinBox()
@@ -4862,12 +4979,46 @@ class InstagramDownloaderGUI(QMainWindow):
         source_editor.addWidget(QLabel("Order Note:"), 1, 0)
         self.framevid_source_note = QLabel("Use drag/drop or Up/Down to reorder frames.")
         source_editor.addWidget(self.framevid_source_note, 1, 1, 1, 5)
+        compact_btn_style = "QPushButton { font-size: 8pt; padding: 1px 6px; }"
         self.framevid_apply_timing_this_btn = QPushButton("Apply to This Frame")
         self.framevid_apply_timing_this_btn.clicked.connect(self.apply_framevid_timing_to_current_source)
-        source_editor.addWidget(self.framevid_apply_timing_this_btn, 2, 0, 1, 3)
-        self.framevid_apply_timing_all_btn = QPushButton("Apply Frame Timing to All")
+        self.framevid_apply_timing_this_btn.setFixedHeight(24)
+        self.framevid_apply_timing_this_btn.setStyleSheet(compact_btn_style)
+        self.framevid_apply_timing_selection_btn = QPushButton("Apply to Selection")
+        self.framevid_apply_timing_selection_btn.clicked.connect(self.apply_framevid_timing_to_selected_sources)
+        self.framevid_apply_timing_selection_btn.setFixedHeight(24)
+        self.framevid_apply_timing_selection_btn.setStyleSheet(compact_btn_style)
+        self.framevid_apply_timing_all_btn = QPushButton("Apply to All Frames")
         self.framevid_apply_timing_all_btn.clicked.connect(self.apply_framevid_timing_to_all_sources)
-        source_editor.addWidget(self.framevid_apply_timing_all_btn, 2, 3, 1, 3)
+        self.framevid_apply_timing_all_btn.setFixedHeight(24)
+        self.framevid_apply_timing_all_btn.setStyleSheet(compact_btn_style)
+        self.framevid_full_video_time_btn = QPushButton("Full Video Time")
+        self.framevid_full_video_time_btn.clicked.connect(self.apply_framevid_full_video_time_to_current_source)
+        self.framevid_full_video_time_btn.setFixedHeight(24)
+        self.framevid_full_video_time_btn.setStyleSheet(compact_btn_style)
+        source_editor.addWidget(self.framevid_full_video_time_btn, 2, 0)
+        source_editor.addWidget(QLabel("Type:"), 2, 1)
+        self.framevid_section_type_combo = QComboBox()
+        self.framevid_section_type_combo.addItems(["Quarter", "Half", "Third"])
+        self.framevid_section_type_combo.currentTextChanged.connect(self.on_framevid_section_type_changed)
+        self.framevid_section_type_combo.setFixedHeight(24)
+        self.framevid_section_type_combo.setMaximumWidth(92)
+        self.framevid_section_type_combo.setToolTip("Section Type")
+        source_editor.addWidget(self.framevid_section_type_combo, 2, 2)
+        source_editor.addWidget(QLabel("Part:"), 2, 3)
+        self.framevid_section_partition_combo = QComboBox()
+        self.framevid_section_partition_combo.setFixedHeight(24)
+        self.framevid_section_partition_combo.setMaximumWidth(72)
+        self.framevid_section_partition_combo.setToolTip("Section Partition")
+        source_editor.addWidget(self.framevid_section_partition_combo, 2, 4)
+        self.framevid_apply_section_btn = QPushButton("Apply Section")
+        self.framevid_apply_section_btn.clicked.connect(self.apply_framevid_section_to_current_source)
+        self.framevid_apply_section_btn.setFixedHeight(24)
+        self.framevid_apply_section_btn.setStyleSheet(compact_btn_style)
+        source_editor.addWidget(self.framevid_apply_section_btn, 2, 5)
+        source_editor.addWidget(self.framevid_apply_timing_this_btn, 2, 6)
+        source_editor.addWidget(self.framevid_apply_timing_selection_btn, 2, 7)
+        source_editor.addWidget(self.framevid_apply_timing_all_btn, 2, 8)
         source_list_box.addLayout(source_editor)
 
         self.framevid_input_preview_stack = QStackedWidget()
@@ -4944,6 +5095,31 @@ class InstagramDownloaderGUI(QMainWindow):
         tracks_layout.setContentsMargins(8, 8, 8, 8)
         tracks_layout.setSpacing(6)
 
+        framevid_audio_mode_row = QHBoxLayout()
+        self.framevid_audio_remove_radio = QRadioButton("(A) Remove/Silence Audio")
+        self.framevid_audio_replace_radio = QRadioButton("(B) Music")
+        self.framevid_audio_maintain_radio = QRadioButton("(C) Maintain Source Audio")
+        self.framevid_audio_mix_radio = QRadioButton("(D) Mix Source + Music")
+        self.framevid_audio_remove_radio.setChecked(True)
+
+        self.framevid_audio_group = QButtonGroup(self)
+        self.framevid_audio_group.addButton(self.framevid_audio_remove_radio)
+        self.framevid_audio_group.addButton(self.framevid_audio_replace_radio)
+        self.framevid_audio_group.addButton(self.framevid_audio_maintain_radio)
+        self.framevid_audio_group.addButton(self.framevid_audio_mix_radio)
+
+        self.framevid_audio_remove_radio.toggled.connect(self.update_framevid_audio_mode_ui)
+        self.framevid_audio_replace_radio.toggled.connect(self.update_framevid_audio_mode_ui)
+        self.framevid_audio_maintain_radio.toggled.connect(self.update_framevid_audio_mode_ui)
+        self.framevid_audio_mix_radio.toggled.connect(self.update_framevid_audio_mode_ui)
+
+        framevid_audio_mode_row.addWidget(self.framevid_audio_remove_radio)
+        framevid_audio_mode_row.addWidget(self.framevid_audio_replace_radio)
+        framevid_audio_mode_row.addWidget(self.framevid_audio_maintain_radio)
+        framevid_audio_mode_row.addWidget(self.framevid_audio_mix_radio)
+        framevid_audio_mode_row.addStretch()
+        tracks_layout.addLayout(framevid_audio_mode_row)
+
         tracks_info = QLabel("Drag music or effect files into the used track list, then reorder them here.")
         tracks_info.setWordWrap(True)
         tracks_layout.addWidget(tracks_info)
@@ -5005,25 +5181,30 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_track_enter_frame_spin.setRange(0, 2147483647)
         self.framevid_track_enter_frame_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
         framevid_track_editor.addWidget(self.framevid_track_enter_frame_spin, 1, 1)
-        framevid_track_editor.addWidget(QLabel("Exit Frame:"), 1, 2)
+        self.framevid_start_at_frame_drop = AudioStartFrameDropLabel()
+        self.framevid_start_at_frame_drop.setText("Start at Frame (Drop Track)")
+        self.framevid_start_at_frame_drop.setToolTip("Drop an audio track here, then choose which FrameVid source frame it should start on.")
+        self.framevid_start_at_frame_drop.track_dropped.connect(self.on_framevid_start_at_frame_track_dropped)
+        framevid_track_editor.addWidget(self.framevid_start_at_frame_drop, 1, 2, 1, 2)
+        framevid_track_editor.addWidget(QLabel("Exit Frame:"), 1, 4)
         self.framevid_track_exit_frame_spin = QSpinBox()
         self.framevid_track_exit_frame_spin.setRange(0, 2147483647)
         self.framevid_track_exit_frame_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
-        framevid_track_editor.addWidget(self.framevid_track_exit_frame_spin, 1, 3)
-        framevid_track_editor.addWidget(QLabel("Fade In (s):"), 1, 4)
+        framevid_track_editor.addWidget(self.framevid_track_exit_frame_spin, 1, 5)
+        framevid_track_editor.addWidget(QLabel("Fade In (s):"), 2, 0)
         self.framevid_track_fade_in_spin = QDoubleSpinBox()
         self.framevid_track_fade_in_spin.setRange(0.0, 60.0)
         self.framevid_track_fade_in_spin.setDecimals(2)
         self.framevid_track_fade_in_spin.setSingleStep(0.25)
         self.framevid_track_fade_in_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
-        framevid_track_editor.addWidget(self.framevid_track_fade_in_spin, 1, 5)
-        framevid_track_editor.addWidget(QLabel("Fade Out (s):"), 2, 0)
+        framevid_track_editor.addWidget(self.framevid_track_fade_in_spin, 2, 1)
+        framevid_track_editor.addWidget(QLabel("Fade Out (s):"), 2, 2)
         self.framevid_track_fade_out_spin = QDoubleSpinBox()
         self.framevid_track_fade_out_spin.setRange(0.0, 60.0)
         self.framevid_track_fade_out_spin.setDecimals(2)
         self.framevid_track_fade_out_spin.setSingleStep(0.25)
         self.framevid_track_fade_out_spin.valueChanged.connect(self.on_framevid_audio_track_editor_changed)
-        framevid_track_editor.addWidget(self.framevid_track_fade_out_spin, 2, 1)
+        framevid_track_editor.addWidget(self.framevid_track_fade_out_spin, 2, 3)
         tracks_layout.addLayout(framevid_track_editor)
 
         self.framevid_status_label = QLabel("Ready.")
@@ -5090,10 +5271,33 @@ class InstagramDownloaderGUI(QMainWindow):
         self.tabs.addTab(tab, "FrameVid")
 
         self._framevid_input_preview_placeholder()
+        self.on_framevid_section_type_changed(self.framevid_section_type_combo.currentText())
         self.framevid_source_list.setCurrentRow(-1)
         self.framevid_status_text("Ready.")
         self._refresh_framevid_library_lists_from_vid_prep()
         QTimer.singleShot(0, self._refresh_framevid_library_lists_from_vid_prep)
+        self.update_framevid_audio_mode_ui()
+
+    def update_framevid_audio_mode_ui(self):
+        """Update FrameVid audio controls based on selected audio mode."""
+        use_mp3 = self.framevid_audio_replace_radio.isChecked() or self.framevid_audio_mix_radio.isChecked()
+        self.framevid_music_list.setEnabled(True)
+        self.framevid_effect_list.setEnabled(True)
+        self.framevid_audio_track_list.setEnabled(True)
+        self.framevid_music_add_btn.setEnabled(use_mp3)
+        self.framevid_effect_add_btn.setEnabled(use_mp3)
+        self.framevid_audio_add_btn.setEnabled(use_mp3)
+        self._save_framevid_state_setting()
+
+    def _current_framevid_audio_mode(self):
+        """Return canonical FrameVid audio mode token."""
+        if self.framevid_audio_replace_radio.isChecked():
+            return 'replace'
+        if self.framevid_audio_maintain_radio.isChecked():
+            return 'maintain'
+        if self.framevid_audio_mix_radio.isChecked():
+            return 'mix'
+        return 'remove'
 
     def _framevid_input_preview_placeholder(self):
         """Show placeholder in the FrameVid input preview area."""
@@ -5408,6 +5612,8 @@ class InstagramDownloaderGUI(QMainWindow):
                     'duration_seconds': float(data.get('duration_seconds') or 3.0),
                     'fade_in_seconds': float(data.get('fade_in_seconds') or 0.25),
                     'fade_out_seconds': float(data.get('fade_out_seconds') or 0.25),
+                    'clip_start_seconds': float(data.get('clip_start_seconds') or 0.0),
+                    'source_media_duration_seconds': float(data.get('source_media_duration_seconds') or 0.0),
                 })
 
             audio_tracks = []
@@ -5437,6 +5643,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 'audio_tracks': audio_tracks,
                 'source_current_row': int(self.framevid_source_list.currentRow()),
                 'audio_current_row': int(self.framevid_audio_track_list.currentRow()),
+                'audio_mode': self._current_framevid_audio_mode(),
             }
             self.save_ui_setting('framevid_state', json.dumps(state_payload))
         except Exception as e:
@@ -5481,8 +5688,12 @@ class InstagramDownloaderGUI(QMainWindow):
                 'duration_seconds': float(entry.get('duration_seconds') or 3.0),
                 'fade_in_seconds': float(entry.get('fade_in_seconds') or 0.25),
                 'fade_out_seconds': float(entry.get('fade_out_seconds') or 0.25),
+                'clip_start_seconds': float(entry.get('clip_start_seconds') or 0.0),
+                'source_media_duration_seconds': float(entry.get('source_media_duration_seconds') or 0.0),
             })
             self.framevid_source_list.addItem(item)
+
+        self._refresh_framevid_source_indices()
 
         audio_tracks = parsed.get('audio_tracks') or []
         max_track_id = 0
@@ -5513,6 +5724,17 @@ class InstagramDownloaderGUI(QMainWindow):
             self.framevid_audio_track_list.addItem(item)
 
         self.framevid_next_audio_track_id = max(1, max_track_id + 1)
+
+        audio_mode = str(parsed.get('audio_mode') or 'remove').strip().lower()
+        if audio_mode == 'replace':
+            self.framevid_audio_replace_radio.setChecked(True)
+        elif audio_mode == 'maintain':
+            self.framevid_audio_maintain_radio.setChecked(True)
+        elif audio_mode == 'mix':
+            self.framevid_audio_mix_radio.setChecked(True)
+        else:
+            self.framevid_audio_remove_radio.setChecked(True)
+        self.update_framevid_audio_mode_ui()
 
         source_row = int(parsed.get('source_current_row') or -1)
         if self.framevid_source_list.count() > 0:
@@ -5653,17 +5875,71 @@ class InstagramDownloaderGUI(QMainWindow):
         if file_type == 'unknown':
             return False
 
+        media_duration = 0.0
+        if file_type == 'video':
+            media_duration = max(0.0, float(self._get_media_duration_seconds(file_path) or 0.0))
+
+        duration_seconds = media_duration if (file_type == 'video' and media_duration > 0.0) else 3.0
+
         item = QListWidgetItem(os.path.basename(file_path))
         item.setToolTip(file_path)
         item.setData(Qt.UserRole, {
             'path': file_path,
             'type': file_type,
-            'duration_seconds': 3.0,
+            'duration_seconds': float(duration_seconds),
             'fade_in_seconds': 0.25,
             'fade_out_seconds': 0.25,
+            'clip_start_seconds': 0.0,
+            'source_media_duration_seconds': float(media_duration),
         })
         self.framevid_source_list.addItem(item)
         return True
+
+    def _framevid_source_display_name(self, item):
+        """Return base display name for a FrameVid source item."""
+        if not item:
+            return ''
+        data = item.data(Qt.UserRole) or {}
+        path = str(data.get('path') or item.toolTip() or '').strip()
+        return os.path.basename(path) or path or (item.text() or '').strip()
+
+    def _refresh_framevid_source_indices(self):
+        """Rewrite FrameVid source row labels to include a stable 1-based index."""
+        for idx in range(self.framevid_source_list.count()):
+            item = self.framevid_source_list.item(idx)
+            if not item:
+                continue
+            base_name = self._framevid_source_display_name(item)
+            item.setText(f"[{idx + 1:03d}] {base_name}")
+
+    def _framevid_clamp_video_timing(self, data):
+        """Clamp video clip start/duration to source media duration when available."""
+        if not isinstance(data, dict):
+            return data
+
+        file_type = str(data.get('type') or '')
+        if file_type != 'video':
+            data['clip_start_seconds'] = 0.0
+            return data
+
+        source_path = str(data.get('path') or '')
+        media_duration = max(0.0, float(data.get('source_media_duration_seconds') or 0.0))
+        if media_duration <= 0.0 and source_path and os.path.exists(source_path):
+            media_duration = max(0.0, float(self._get_media_duration_seconds(source_path) or 0.0))
+            data['source_media_duration_seconds'] = media_duration
+
+        clip_start = max(0.0, float(data.get('clip_start_seconds') or 0.0))
+        clip_duration = max(0.1, float(data.get('duration_seconds') or 3.0))
+
+        if media_duration > 0.0:
+            max_start = max(0.0, media_duration - 0.1)
+            clip_start = min(clip_start, max_start)
+            max_duration = max(0.1, media_duration - clip_start)
+            clip_duration = min(clip_duration, max_duration)
+
+        data['clip_start_seconds'] = clip_start
+        data['duration_seconds'] = clip_duration
+        return data
 
     def add_framevid_source_files(self):
         """Browse for image/video files to add to FrameVid."""
@@ -5684,6 +5960,7 @@ class InstagramDownloaderGUI(QMainWindow):
             if self._framevid_add_source_item(file_path):
                 added += 1
         if added:
+            self._refresh_framevid_source_indices()
             if self.framevid_source_list.count() == added:
                 self.framevid_source_list.setCurrentRow(0)
             self.framevid_status_text(f"Added {added} source file(s).")
@@ -5700,11 +5977,13 @@ class InstagramDownloaderGUI(QMainWindow):
             if item is not None:
                 del item
                 removed_count += 1
+        self._refresh_framevid_source_indices()
         self.framevid_status_text(f"Removed {removed_count} selected source(s).")
         self._save_framevid_state_setting()
 
     def clear_framevid_sources(self):
         self.framevid_source_list.clear()
+        self._refresh_framevid_source_indices()
         self.framevid_status_text("Cleared all sources.")
         self._save_framevid_state_setting()
 
@@ -5729,6 +6008,7 @@ class InstagramDownloaderGUI(QMainWindow):
         elif self.framevid_source_list.currentRow() < 0:
             self.framevid_source_list.setCurrentRow(0)
 
+        self._refresh_framevid_source_indices()
         self.framevid_status_text(f"Reset imagery: removed {removed} image source(s).")
         self._save_framevid_state_setting()
 
@@ -5742,6 +6022,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_audio_track_list.clear()
         self.framevid_source_list.setCurrentRow(-1)
         self.framevid_audio_track_list.setCurrentRow(-1)
+        self._refresh_framevid_source_indices()
         self.framevid_status_text(f"Reset all: removed {source_count} source(s) and {track_count} track(s).")
         self._save_framevid_state_setting()
 
@@ -5770,6 +6051,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if selected_items:
             self.framevid_source_list.setCurrentItem(selected_items[0])
 
+        self._refresh_framevid_source_indices()
         self._save_framevid_state_setting()
 
     def move_selected_framevid_source_top(self):
@@ -5794,6 +6076,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if moved_items:
             self.framevid_source_list.setCurrentItem(moved_items[0])
 
+        self._refresh_framevid_source_indices()
         self._save_framevid_state_setting()
 
     def move_selected_framevid_source_bottom(self):
@@ -5821,6 +6104,12 @@ class InstagramDownloaderGUI(QMainWindow):
         if moved_items:
             self.framevid_source_list.setCurrentItem(moved_items[0])
 
+        self._refresh_framevid_source_indices()
+        self._save_framevid_state_setting()
+
+    def on_framevid_source_rows_moved(self, *args):
+        """Keep source indices correct after drag/drop reorder in source list."""
+        self._refresh_framevid_source_indices()
         self._save_framevid_state_setting()
 
     def on_framevid_source_selection_changed(self, current, previous):
@@ -5834,6 +6123,8 @@ class InstagramDownloaderGUI(QMainWindow):
                 self._framevid_input_preview_placeholder()
                 return
             data = item.data(Qt.UserRole) or {}
+            data = self._framevid_clamp_video_timing(data)
+            item.setData(Qt.UserRole, data)
             self.framevid_source_duration_spin.setValue(float(data.get('duration_seconds') or 3.0))
             self.framevid_source_fade_in_spin.setValue(float(data.get('fade_in_seconds') or 0.25))
             self.framevid_source_fade_out_spin.setValue(float(data.get('fade_out_seconds') or 0.25))
@@ -5857,6 +6148,10 @@ class InstagramDownloaderGUI(QMainWindow):
         data['duration_seconds'] = float(self.framevid_source_duration_spin.value())
         data['fade_in_seconds'] = float(self.framevid_source_fade_in_spin.value())
         data['fade_out_seconds'] = float(self.framevid_source_fade_out_spin.value())
+        data = self._framevid_clamp_video_timing(data)
+        self.framevid_source_duration_spin.blockSignals(True)
+        self.framevid_source_duration_spin.setValue(float(data.get('duration_seconds') or 3.0))
+        self.framevid_source_duration_spin.blockSignals(False)
         item.setData(Qt.UserRole, data)
         if show_status:
             label = item.text() or os.path.basename(str(data.get('path') or '')) or 'selected frame'
@@ -5882,10 +6177,151 @@ class InstagramDownloaderGUI(QMainWindow):
             data['duration_seconds'] = duration_seconds
             data['fade_in_seconds'] = fade_in_seconds
             data['fade_out_seconds'] = fade_out_seconds
+            data = self._framevid_clamp_video_timing(data)
             item.setData(Qt.UserRole, data)
             updated += 1
 
         self.framevid_status_text(f"Applied frame timing to {updated} source(s).")
+        self._save_framevid_state_setting()
+
+    def apply_framevid_timing_to_selected_sources(self):
+        """Apply current source timing editor values to selected FrameVid sources."""
+        selected_items = self.framevid_source_list.selectedItems()
+        if not selected_items:
+            self.framevid_status_text("Select one or more source frames first.")
+            return
+
+        duration_seconds = float(self.framevid_source_duration_spin.value())
+        fade_in_seconds = float(self.framevid_source_fade_in_spin.value())
+        fade_out_seconds = float(self.framevid_source_fade_out_spin.value())
+
+        updated = 0
+        for item in selected_items:
+            if not item:
+                continue
+            data = item.data(Qt.UserRole) or {}
+            data['duration_seconds'] = duration_seconds
+            data['fade_in_seconds'] = fade_in_seconds
+            data['fade_out_seconds'] = fade_out_seconds
+            data = self._framevid_clamp_video_timing(data)
+            item.setData(Qt.UserRole, data)
+            updated += 1
+
+        self.framevid_status_text(f"Applied frame timing to {updated} selected source(s).")
+        self._save_framevid_state_setting()
+
+    def on_framevid_section_type_changed(self, section_type):
+        """Update section partition options for the selected section type."""
+        normalized = str(section_type or '').strip().lower()
+        section_count_map = {
+            'quarter': 4,
+            'half': 2,
+            'third': 3,
+        }
+        count = section_count_map.get(normalized, 4)
+        current_text = self.framevid_section_partition_combo.currentText() if hasattr(self, 'framevid_section_partition_combo') else '1'
+        self.framevid_section_partition_combo.blockSignals(True)
+        self.framevid_section_partition_combo.clear()
+        for i in range(1, count + 1):
+            self.framevid_section_partition_combo.addItem(str(i))
+        index = self.framevid_section_partition_combo.findText(current_text)
+        if index < 0:
+            index = 0
+        self.framevid_section_partition_combo.setCurrentIndex(index)
+        self.framevid_section_partition_combo.blockSignals(False)
+
+    def apply_framevid_full_video_time_to_current_source(self):
+        """Set selected video source timing to full source duration."""
+        item = self.framevid_source_list.currentItem()
+        if not item:
+            return
+
+        data = item.data(Qt.UserRole) or {}
+        if str(data.get('type') or '') != 'video':
+            self.framevid_status_text("Full Video Time applies to video sources only.")
+            return
+
+        source_path = str(data.get('path') or '')
+        media_duration = max(0.0, float(data.get('source_media_duration_seconds') or 0.0))
+        if media_duration <= 0.0 and source_path and os.path.exists(source_path):
+            media_duration = max(0.0, float(self._get_media_duration_seconds(source_path) or 0.0))
+
+        if media_duration <= 0.0:
+            self.framevid_status_text("Could not determine source video duration.")
+            return
+
+        data['source_media_duration_seconds'] = media_duration
+        data['clip_start_seconds'] = 0.0
+        data['duration_seconds'] = media_duration
+        data = self._framevid_clamp_video_timing(data)
+        item.setData(Qt.UserRole, data)
+
+        self._framevid_source_editor_updating = True
+        try:
+            self.framevid_source_duration_spin.setValue(float(data.get('duration_seconds') or media_duration))
+        finally:
+            self._framevid_source_editor_updating = False
+
+        label = item.text() or os.path.basename(source_path) or 'selected video'
+        self.framevid_status_text(f"Applied Full Video Time: {label}")
+        self._save_framevid_state_setting()
+
+    def apply_framevid_section_to_current_source(self):
+        """Apply selected section type/partition to current video source."""
+        item = self.framevid_source_list.currentItem()
+        if not item:
+            return
+
+        data = item.data(Qt.UserRole) or {}
+        if str(data.get('type') or '') != 'video':
+            self.framevid_status_text("Apply Section applies to video sources only.")
+            return
+
+        source_path = str(data.get('path') or '')
+        media_duration = max(0.0, float(data.get('source_media_duration_seconds') or 0.0))
+        if media_duration <= 0.0 and source_path and os.path.exists(source_path):
+            media_duration = max(0.0, float(self._get_media_duration_seconds(source_path) or 0.0))
+
+        if media_duration <= 0.0:
+            self.framevid_status_text("Could not determine source video duration.")
+            return
+
+        section_type = str(self.framevid_section_type_combo.currentText() or 'Quarter').strip()
+        partition_text = str(self.framevid_section_partition_combo.currentText() or '1').strip()
+        try:
+            partition = max(1, int(partition_text))
+        except Exception:
+            partition = 1
+
+        section_count_map = {
+            'quarter': 4,
+            'half': 2,
+            'third': 3,
+        }
+        section_count = section_count_map.get(section_type.lower(), 4)
+        partition = max(1, min(partition, section_count))
+
+        section_len = media_duration / float(section_count)
+        section_start = max(0.0, section_len * float(partition - 1))
+        if partition >= section_count:
+            section_end = media_duration
+        else:
+            section_end = section_start + section_len
+
+        data['source_media_duration_seconds'] = media_duration
+        data['clip_start_seconds'] = section_start
+        data['duration_seconds'] = max(0.1, section_end - section_start)
+        data = self._framevid_clamp_video_timing(data)
+        item.setData(Qt.UserRole, data)
+
+        self._framevid_source_editor_updating = True
+        try:
+            self.framevid_source_duration_spin.setValue(float(data.get('duration_seconds') or section_len))
+        finally:
+            self._framevid_source_editor_updating = False
+
+        label = item.text() or os.path.basename(source_path) or 'selected video'
+        self.framevid_status_text(f"Applied {section_type} {partition} to: {label}")
         self._save_framevid_state_setting()
 
     def add_framevid_audio_tracks(self):
@@ -5920,6 +6356,90 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_next_audio_track_id += 1
         self.framevid_audio_track_list.addItem(item)
         return True
+
+    def _framevid_find_audio_track_item_by_path(self, file_path):
+        """Find existing FrameVid audio track item by normalized path."""
+        normalized = self._normalize_vid_prep_audio_path(file_path)
+        if not normalized:
+            return None
+        for i in range(self.framevid_audio_track_list.count()):
+            item = self.framevid_audio_track_list.item(i)
+            if not item:
+                continue
+            data = item.data(Qt.UserRole) or {}
+            track_path = self._normalize_vid_prep_audio_path(str(data.get('track_path') or ''))
+            if track_path and os.path.normcase(track_path) == os.path.normcase(normalized):
+                return item
+        return None
+
+    def _framevid_source_start_frame_options(self):
+        """Return selectable source-frame options as (label, start_frame)."""
+        options = []
+        fps = 30.0
+        timeline_seconds = 0.0
+        for idx in range(self.framevid_source_list.count()):
+            item = self.framevid_source_list.item(idx)
+            if not item:
+                continue
+            data = item.data(Qt.UserRole) or {}
+            source_path = str(data.get('path') or '')
+            if not source_path or not os.path.exists(source_path):
+                continue
+            start_frame = max(0, int(round(timeline_seconds * fps)))
+            duration_s = max(0.1, float(data.get('duration_seconds') or 3.0))
+            source_name = os.path.basename(source_path) or source_path
+            label = f"#{len(options) + 1} {source_name} -> start frame {start_frame}"
+            options.append((label, start_frame))
+            timeline_seconds += duration_s
+        return options
+
+    def on_framevid_start_at_frame_track_dropped(self, file_path):
+        """Drop handler: choose source frame and set dropped track start frame."""
+        if not self.framevid_source_list.count():
+            QMessageBox.warning(self, "FrameVid", "Add FrameVid source files first, then assign track start frames.")
+            return
+
+        track_item = self._framevid_find_audio_track_item_by_path(file_path)
+        if not track_item and file_path and os.path.exists(file_path):
+            if self._framevid_add_audio_track_item(file_path):
+                track_item = self._framevid_find_audio_track_item_by_path(file_path)
+
+        if not track_item:
+            track_item = self.framevid_audio_track_list.currentItem()
+
+        if not track_item:
+            QMessageBox.warning(self, "FrameVid", "Drop an audio track from Used Track List (or a valid audio file) to assign Start at Frame.")
+            return
+
+        options = self._framevid_source_start_frame_options()
+        if not options:
+            QMessageBox.warning(self, "FrameVid", "No valid FrameVid source frames available to target.")
+            return
+
+        labels = [label for label, _frame in options]
+        selected_label, ok = QInputDialog.getItem(
+            self,
+            "Start at Frame",
+            "Select FrameVid frame where this track starts:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not selected_label:
+            return
+
+        frame_lookup = {label: frame for label, frame in options}
+        start_frame = int(frame_lookup.get(selected_label, 0))
+        data = track_item.data(Qt.UserRole) or {}
+        data['enter_frame'] = start_frame
+        track_item.setData(Qt.UserRole, data)
+
+        row = self.framevid_audio_track_list.row(track_item)
+        if row >= 0:
+            self.framevid_audio_track_list.setCurrentRow(row)
+        self.on_framevid_audio_track_selection_changed()
+        self._save_framevid_state_setting()
+        self.framevid_status_text(f"Assigned track start frame: {start_frame}")
 
     def on_framevid_audio_tracks_dropped(self, file_paths):
         if not file_paths:
@@ -6102,7 +6622,10 @@ class InstagramDownloaderGUI(QMainWindow):
 
         source_items = self._framevid_source_items_in_order()
         audio_tracks = self._framevid_audio_tracks_in_order()
-        total_steps = len(source_items) + 1 + (1 if audio_tracks else 0)
+        audio_mode = self._current_framevid_audio_mode()
+        include_source_audio = audio_mode in ('maintain', 'mix')
+        include_music_audio = audio_mode in ('replace', 'mix')
+        total_steps = len(source_items) + 1 + (1 if (include_music_audio and audio_tracks) else 0)
         if progress_callback:
             progress_callback("Preparing FrameVid render...", 0, total_steps)
 
@@ -6112,6 +6635,13 @@ class InstagramDownloaderGUI(QMainWindow):
             fade_in_s = max(0.0, float(item_data.get('fade_in_seconds') or 0.0))
             fade_out_s = max(0.0, float(item_data.get('fade_out_seconds') or 0.0))
             is_image = item_data.get('type') == 'image'
+            clip_start_s = max(0.0, float(item_data.get('clip_start_seconds') or 0.0))
+            media_duration_s = max(0.0, float(item_data.get('source_media_duration_seconds') or 0.0))
+            if (not is_image) and media_duration_s <= 0.0:
+                media_duration_s = max(0.0, float(self._get_media_duration_seconds(source_path) or 0.0))
+            if (not is_image) and media_duration_s > 0.0:
+                clip_start_s = min(clip_start_s, max(0.0, media_duration_s - 0.1))
+                duration_s = min(duration_s, max(0.1, media_duration_s - clip_start_s))
             segment_path = render_dir / f"segment_{index:03d}.mp4"
 
             fade_out_start = max(0.0, duration_s - fade_out_s)
@@ -6125,9 +6655,41 @@ class InstagramDownloaderGUI(QMainWindow):
 
             cmd = [ffmpeg_bin, '-y']
             if is_image:
-                cmd.extend(['-loop', '1', '-i', source_path, '-t', f'{duration_s:.3f}', '-vf', vf, '-r', str(fps), '-pix_fmt', 'yuv420p', str(segment_path)])
+                cmd.extend([
+                    '-loop', '1',
+                    '-i', source_path,
+                    '-f', 'lavfi',
+                    '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+                    '-t', f'{duration_s:.3f}',
+                    '-vf', vf,
+                    '-r', str(fps),
+                    '-pix_fmt', 'yuv420p',
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
+                    '-c:a', 'aac',
+                    '-ar', '48000',
+                    '-ac', '2',
+                    '-shortest',
+                    str(segment_path),
+                ])
             else:
-                cmd.extend(['-i', source_path, '-t', f'{duration_s:.3f}', '-vf', vf, '-r', str(fps), '-pix_fmt', 'yuv420p', str(segment_path)])
+                has_source_audio = self._media_has_audio_stream(source_path)
+                cmd.extend(['-ss', f'{clip_start_s:.3f}', '-i', source_path])
+                if not has_source_audio:
+                    cmd.extend(['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000'])
+                cmd.extend([
+                    '-t', f'{duration_s:.3f}',
+                    '-vf', vf,
+                    '-r', str(fps),
+                    '-pix_fmt', 'yuv420p',
+                    '-map', '0:v:0',
+                    '-map', '0:a:0' if has_source_audio else '1:a:0',
+                    '-c:a', 'aac',
+                    '-ar', '48000',
+                    '-ac', '2',
+                    '-shortest',
+                    str(segment_path),
+                ])
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
             except subprocess.CalledProcessError as e:
@@ -6157,18 +6719,54 @@ class InstagramDownloaderGUI(QMainWindow):
         if progress_callback:
             progress_callback("Concatenation complete.", len(source_items) + 1, total_steps)
 
-        if not audio_tracks:
+        def _export_muted_video(src_path, dst_path):
+            cmd = [ffmpeg_bin, '-y', '-i', str(src_path), '-map', '0:v', '-an', '-c:v', 'copy', str(dst_path)]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                stderr_text = (e.stderr or '').strip()
+                stdout_text = (e.stdout or '').strip()
+                detail = stderr_text or stdout_text or str(e)
+                raise RuntimeError(f"Failed to remove FrameVid audio: {detail}") from e
+
+        if not include_source_audio and not include_music_audio:
+            muted_output = render_dir / 'framevid_video_muted.mp4'
+            _export_muted_video(video_only_path, muted_output)
+            if output_path:
+                shutil.copyfile(str(muted_output), str(output_path))
+                return str(output_path)
+            return str(muted_output)
+
+        if include_source_audio and not include_music_audio:
             if output_path:
                 shutil.copyfile(str(video_only_path), str(output_path))
                 return str(output_path)
             return str(video_only_path)
 
+        if not audio_tracks:
+            if include_source_audio:
+                if output_path:
+                    shutil.copyfile(str(video_only_path), str(output_path))
+                    return str(output_path)
+                return str(video_only_path)
+            muted_output = render_dir / 'framevid_video_muted.mp4'
+            _export_muted_video(video_only_path, muted_output)
+            if output_path:
+                shutil.copyfile(str(muted_output), str(output_path))
+                return str(output_path)
+            return str(muted_output)
+
         video_duration = self._get_media_duration_seconds(str(video_only_path))
-        mix_output = render_dir / 'framevid_audio.m4a'
+        mix_output = render_dir / 'framevid_audio.mp4'
         audio_inputs = []
         filter_parts = []
         mix_input_index = 1
         mix_labels = []
+
+        if include_source_audio and self._media_has_audio_stream(str(video_only_path)):
+            filter_parts.append('[0:a]asetpts=PTS-STARTPTS,volume=1.000[src0]')
+            mix_labels.append('[src0]')
+
         for track in audio_tracks:
             track_path = str(track.get('track_path') or '')
             if not track_path or not os.path.exists(track_path):
@@ -6217,7 +6815,12 @@ class InstagramDownloaderGUI(QMainWindow):
             if progress_callback:
                 progress_callback("Audio mix complete.", total_steps, total_steps)
         else:
-            final_path = video_only_path
+            if include_source_audio:
+                final_path = video_only_path
+            else:
+                muted_output = render_dir / 'framevid_video_muted.mp4'
+                _export_muted_video(video_only_path, muted_output)
+                final_path = muted_output
 
         if output_path:
             shutil.copyfile(str(final_path), str(output_path))
@@ -6234,6 +6837,22 @@ class InstagramDownloaderGUI(QMainWindow):
             return max(0.0, float((result.stdout or '').strip() or 0.0))
         except Exception:
             return 0.0
+
+    def _media_has_audio_stream(self, file_path):
+        """Return True when media contains at least one audio stream."""
+        ffprobe_bin = shutil.which('ffprobe')
+        if not ffprobe_bin or not file_path or not os.path.exists(file_path):
+            return False
+        try:
+            result = subprocess.run(
+                [ffprobe_bin, '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', file_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return bool((result.stdout or '').strip())
+        except Exception:
+            return False
 
     def _release_audio_extract_capture(self):
         """Release OpenCV capture used for audio extract metadata."""
@@ -8818,6 +9437,15 @@ class InstagramDownloaderGUI(QMainWindow):
             self.vid_prep_output_player.setMuted(bool(muted))
         self.vid_prep_output_mute_btn.setText("🔈 Unmute" if muted else "🔇 Mute")
 
+    def _vid_prep_set_render_progress(self, visible, label_text="Rendering..."):
+        """Show or hide the Vid Prep inline render progress meter."""
+        if not hasattr(self, 'vid_prep_render_progress'):
+            return
+        self.vid_prep_render_progress.setFormat(label_text)
+        self.vid_prep_render_progress.setRange(0, 0)
+        self.vid_prep_render_progress.setVisible(bool(visible))
+        QApplication.processEvents()
+
     def on_vid_prep_scrubber_changed(self, frame_idx):
         """Seek to the requested frame and update crop preview."""
         cv2 = self._get_cv2_for_vid_prep()
@@ -9562,11 +10190,13 @@ class InstagramDownloaderGUI(QMainWindow):
             return
 
         self.vid_prep_status.setText("Rendering preview with output settings...")
+        self._vid_prep_set_render_progress(True, "Rendering preview...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True)
         finally:
             QApplication.restoreOverrideCursor()
+            self._vid_prep_set_render_progress(False)
 
         if result.returncode != 0:
             err = (result.stderr or "Unknown ffmpeg error").strip()
@@ -9606,11 +10236,13 @@ class InstagramDownloaderGUI(QMainWindow):
             return
 
         self.vid_prep_status.setText("Processing with ffmpeg...")
+        self._vid_prep_set_render_progress(True, "Saving video...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True)
         finally:
             QApplication.restoreOverrideCursor()
+            self._vid_prep_set_render_progress(False)
 
         if result.returncode != 0:
             err = (result.stderr or "Unknown ffmpeg error").strip()
@@ -9703,6 +10335,12 @@ class InstagramDownloaderGUI(QMainWindow):
         delete_topic_btn = QPushButton("🗑️ Delete Topic")
         delete_topic_btn.clicked.connect(self.delete_selected_topic)
         buttons.addWidget(delete_topic_btn)
+
+        self.combine_topic_btn = QPushButton("🔀 Combine with...")
+        self.combine_topic_btn.setToolTip("Move this topic's files and assignments into another topic, then delete this topic")
+        self.combine_topic_btn.clicked.connect(self.combine_selected_topic_with_target)
+        self.combine_topic_btn.setEnabled(False)
+        buttons.addWidget(self.combine_topic_btn)
         
         self.promote_topic_btn = QPushButton("⬆️ Promote")
         self.promote_topic_btn.setToolTip("Move topic to same level as its parent")
@@ -11647,7 +12285,6 @@ class InstagramDownloaderGUI(QMainWindow):
             skip_db_save: If True, skip database save (used when loading from DB)
         """
         logger.info(f"add_post_to_list called for {post.get('shortcode', 'unknown')}")
-        self.saved_posts.append(post)
         # Note: filtered_posts is updated separately in batch operations
         
         # Save to database if content_db is initialized (and not loading from DB)
@@ -11679,6 +12316,9 @@ class InstagramDownloaderGUI(QMainWindow):
                         logger.debug(f"Updated pagination controls, total_items={self.total_items}")
             except Exception as e:
                 logger.error(f"Error saving post to database: {e}")
+                return False
+
+        self.saved_posts.append(post)
         
         # Temporarily disable sorting for faster insertion
         was_sorting = self.posts_table.isSortingEnabled()
@@ -11898,6 +12538,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 self.stop_thumbnails_btn.setVisible(True)
         
         self.browse_status.setText(f"Loaded {len(self.saved_posts)} posts...")
+        return True
     
     def add_duplicate_post_to_list(self, post):
         """Add a duplicate post to the browse table with bright green color and skip mark.
@@ -12335,7 +12976,8 @@ class InstagramDownloaderGUI(QMainWindow):
                        'likes': None, 'comments': None, 'video_url': None,
                        'media_count': 1, 'thumbnail_url': None, 'row_number': 0}
             
-            self.add_post_to_list(post)
+            if not self.add_post_to_list(post):
+                raise RuntimeError("Failed to save the added URL to the database.")
             self.filtered_posts = self.saved_posts.copy()  # Update filtered list for single add
             self.browse_status.setText(f"Added {shortcode}")
             self.url_input.clear()
@@ -12343,14 +12985,27 @@ class InstagramDownloaderGUI(QMainWindow):
             if process_id:
                 self.process_manager.update_process(process_id, status='completed', current=1, total=1)
                 QTimer.singleShot(2000, lambda pid=process_id: self.process_manager.remove_process(pid))
-            
-            # Jump to the page where the newly added item appears
-            if self.total_items > 0 and self.current_view_mode == 'tiles':
-                # Calculate which page the new item is on (last item)
-                last_item_index = self.total_items - 1
-                target_page = last_item_index // self.tiles_per_page
-                logger.info(f"Jumping to page {target_page + 1} to show newly added item {shortcode}")
-                self.jump_to_page(target_page + 1)  # jump_to_page expects 1-indexed
+
+            # Force a fresh first-page reload so newly added URL appears immediately in Browse.
+            # Cancel any in-flight page-0 load first so stale results cannot overwrite the fresh page.
+            if 0 in self.page_load_threads:
+                thread = self.page_load_threads[0]
+                try:
+                    thread.page_loaded.disconnect()
+                    thread.error.disconnect()
+                except Exception:
+                    pass
+                thread.stop()
+                del self.page_load_threads[0]
+                thread.deleteLater()
+            self.loading_pages.discard(0)
+            self.page_cache.clear()
+            self.last_displayed_page = -1
+            self.current_page = 0
+            self.update_pagination_controls()
+            self.load_page(0)
+            self.preload_adjacent_pages(0)
+            self.save_ui_setting('current_page', '0')
             
         except Exception as e:
             if process_id:
@@ -13628,6 +14283,45 @@ class InstagramDownloaderGUI(QMainWindow):
 
         timer.timeout.connect(_close_and_cleanup)
         timer.start(timeout_ms)
+
+    def _is_no_space_left_error(self, error_msg):
+        """Return True when an error string indicates the disk is full."""
+        if not error_msg:
+            return False
+        err = str(error_msg).lower()
+        return (
+            "no space left on device" in err
+            or "errno 28" in err
+            or "disk full" in err
+            or "not enough space" in err
+        )
+
+    def _set_process_space_on_disk(self, process_id):
+        """Mark process monitor entry as disk-space failure in red."""
+        if not process_id:
+            return
+        self.process_manager.update_process(process_id, status='space_on_disk')
+
+    def _stop_download_process_for_disk_full(self, process_id, shortcode, error_msg):
+        """Stop an active download process due to disk-full failure and mark status."""
+        if not process_id:
+            return
+
+        process = self.process_manager.get_process(process_id)
+        if process and process.get('status') == 'space_on_disk':
+            return
+
+        logger.error(f"Disk full detected while downloading {shortcode}: {error_msg}")
+        self._set_process_space_on_disk(process_id)
+
+        # Cancel thread so batch downloads stop immediately after current item.
+        if process and process.get('thread') and hasattr(process['thread'], 'cancel'):
+            try:
+                process['thread'].cancel()
+            except Exception as cancel_error:
+                logger.error(f"Failed cancelling process {process_id} after disk-full: {cancel_error}")
+
+        self.statusBar().showMessage("SPACE ON DISK - download stopped", 6000)
     
     def handle_download_complete(self, shortcode, success, file_path, error_msg, downloaded_files, metadata):
         """Handle individual download completion - update database and table"""
@@ -16516,8 +17210,11 @@ class InstagramDownloaderGUI(QMainWindow):
         
         download_thread.progress.connect(lambda c, t: self.process_manager.update_process(process_id, current=c, total=t))
         download_thread.status.connect(lambda msg: self.statusBar().showMessage(msg))
-        download_thread.download_complete.connect(self.handle_single_download_complete)
-        download_thread.finished.connect(lambda s, f: self.on_download_thread_finished(download_thread, process_id))
+        download_thread.download_complete.connect(
+            lambda shortcode, success, target_dir, error_msg, files, metadata:
+            self.handle_single_download_complete(shortcode, success, target_dir, error_msg, files, metadata, process_id)
+        )
+        download_thread.finished.connect(lambda s, f: self.on_download_thread_finished(download_thread, process_id, s, f))
         
         # Store thread
         self.active_download_threads.append(download_thread)
@@ -16892,7 +17589,11 @@ class InstagramDownloaderGUI(QMainWindow):
         
         # Update process status based on success/failure
         if process_id:
-            if failed_count > 0 and success_count == 0:
+            process = self.process_manager.get_process(process_id)
+            if process and process.get('status') == 'space_on_disk':
+                # Preserve explicit disk-full status.
+                pass
+            elif failed_count > 0 and success_count == 0:
                 # All downloads failed
                 self.process_manager.update_process(process_id, status='failed')
             elif failed_count > 0:
@@ -17032,6 +17733,10 @@ class InstagramDownloaderGUI(QMainWindow):
         else:
             # Handle failure - update status to 'error' for visibility
             logger.error(f"Download Now failed for {shortcode}: {error_msg}")
+
+            # Stop browse download process immediately for disk-full errors.
+            if self._is_no_space_left_error(error_msg):
+                self._stop_download_process_for_disk_full(process_id, shortcode, error_msg)
             
             # Update post in saved_posts
             for post in self.saved_posts:
@@ -21079,7 +21784,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 if has_framevid_source:
                     if len(downloaded_files) > 1:
                         framevid_all_btn = QPushButton("FVA")
-                        framevid_all_btn.setMaximumHeight(24)
+                        framevid_all_btn.setFixedHeight(24)
                         framevid_all_btn.setMinimumWidth(48)
                         framevid_all_btn.setToolTip("Send all carousel media to FrameVid")
                         framevid_all_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
@@ -21089,8 +21794,8 @@ class InstagramDownloaderGUI(QMainWindow):
                         examine_row.addWidget(framevid_all_btn)
                         _style_content_tile_action_button(framevid_all_btn)
 
-                        framevid_this_btn = QPushButton("FV This")
-                        framevid_this_btn.setMaximumHeight(24)
+                        framevid_this_btn = QPushButton("FVT")
+                        framevid_this_btn.setFixedHeight(24)
                         framevid_this_btn.setMinimumWidth(72)
                         framevid_this_btn.setToolTip("Send current carousel slide to FrameVid")
                         framevid_this_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
@@ -21100,8 +21805,8 @@ class InstagramDownloaderGUI(QMainWindow):
                         examine_row.addWidget(framevid_this_btn)
                         _style_content_tile_action_button(framevid_this_btn)
                     else:
-                        framevid_btn = QPushButton("FrameVid This")
-                        framevid_btn.setMaximumHeight(24)
+                        framevid_btn = QPushButton("FVT")
+                        framevid_btn.setFixedHeight(24)
                         framevid_btn.setMinimumWidth(100)
                         framevid_btn.setToolTip("Send this tile to FrameVid")
                         framevid_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
@@ -21165,16 +21870,16 @@ class InstagramDownloaderGUI(QMainWindow):
                 if has_framevid_source:
                     if len(downloaded_files) > 1:
                         framevid_all_btn = QPushButton("FVA")
-                        framevid_this_btn = QPushButton("FV This")
+                        framevid_this_btn = QPushButton("FVT")
                         if open_explorer_target == 'topic':
-                            framevid_all_btn.setMaximumHeight(24)
+                            framevid_all_btn.setFixedHeight(24)
                             framevid_all_btn.setMaximumWidth(56)
-                            framevid_this_btn.setMaximumHeight(24)
+                            framevid_this_btn.setFixedHeight(24)
                             framevid_this_btn.setMaximumWidth(86)
                         else:
-                            framevid_all_btn.setMaximumHeight(28)
+                            framevid_all_btn.setFixedHeight(28)
                             framevid_all_btn.setMaximumWidth(64)
-                            framevid_this_btn.setMaximumHeight(28)
+                            framevid_this_btn.setFixedHeight(28)
                             framevid_this_btn.setMaximumWidth(94)
                         framevid_all_btn.setToolTip("Send all carousel media to FrameVid")
                         framevid_this_btn.setToolTip("Send current carousel slide to FrameVid")
@@ -21191,12 +21896,12 @@ class InstagramDownloaderGUI(QMainWindow):
                         examine_row.addWidget(framevid_this_btn)
                         _style_content_tile_action_button(framevid_this_btn)
                     else:
-                        framevid_btn = QPushButton("FrameVid This")
+                        framevid_btn = QPushButton("FVT")
                         if open_explorer_target == 'topic':
-                            framevid_btn.setMaximumHeight(24)
+                            framevid_btn.setFixedHeight(24)
                             framevid_btn.setMaximumWidth(100)
                         else:
-                            framevid_btn.setMaximumHeight(28)
+                            framevid_btn.setFixedHeight(28)
                             framevid_btn.setMaximumWidth(108)
                         framevid_btn.setToolTip("Send this tile to FrameVid")
                         framevid_btn.setStyleSheet("QPushButton { background-color: #0f766e; color: white; font-weight: bold; }")
@@ -21464,14 +22169,17 @@ class InstagramDownloaderGUI(QMainWindow):
     
     def first_page(self):
         """Go to first page"""
-        if self.current_page != 0:
-            # Cancel threads for distant pages
-            self.cancel_distant_page_loads(0)
-            
-            self.current_page = 0
-            self.load_page(self.current_page)
-            self.preload_adjacent_pages(self.current_page)
-            self.save_ui_setting('current_page', str(self.current_page))
+        # Always force a reload of page 1 so newly added items are visible even when already on page 1.
+        self.cancel_distant_page_loads(0)
+
+        self.current_page = 0
+        if 0 in self.page_cache:
+            del self.page_cache[0]
+        self.last_displayed_page = -1
+
+        self.load_page(self.current_page)
+        self.preload_adjacent_pages(self.current_page)
+        self.save_ui_setting('current_page', str(self.current_page))
     
     def prev_page(self):
         """Go to previous page"""
@@ -21873,6 +22581,7 @@ class InstagramDownloaderGUI(QMainWindow):
             self.assign_topic_btn.setEnabled(True)
             self.add_child_topic_btn.setEnabled(True)
             self.copy_files_for_topic_btn.setEnabled(True)
+            self.combine_topic_btn.setEnabled(True)
             
             # Enable/disable promote button (can promote if has parent)
             parent_id = topic.get('parent_topic_id')
@@ -21924,6 +22633,7 @@ class InstagramDownloaderGUI(QMainWindow):
             self.alphabetize_selected_btn.setEnabled(False)
             self.alphabetize_level_btn.setEnabled(False)
             self.copy_files_for_topic_btn.setEnabled(False)
+            self.combine_topic_btn.setEnabled(False)
 
     def _save_topics_tab_ui_state(self):
         """Persist Topics tab tree expansion and scroll state."""
@@ -22755,6 +23465,318 @@ class InstagramDownloaderGUI(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to delete topic:\n{str(e)}")
             finally:
                 QApplication.restoreOverrideCursor()
+
+    def _collect_topic_descendant_ids(self, source_topic_id, all_topics):
+        """Return a set of all descendant topic IDs for the provided source topic."""
+        children_by_parent = {}
+        for topic in all_topics:
+            parent_id = topic.get('parent_topic_id')
+            if parent_id is None:
+                continue
+            children_by_parent.setdefault(parent_id, []).append(topic['id'])
+
+        descendants = set()
+        stack = list(children_by_parent.get(source_topic_id, []))
+        while stack:
+            child_id = stack.pop()
+            if child_id in descendants:
+                continue
+            descendants.add(child_id)
+            stack.extend(children_by_parent.get(child_id, []))
+        return descendants
+
+    def _resolve_topic_folder_path(self, topic):
+        """Resolve a topic's configured folder into an absolute Path."""
+        topic_name = topic.get('topic_name', 'Unknown')
+        topic_path = topic.get('content_path') or topic_name
+        if not topic_path:
+            return None, f"Topic '{topic_name}' has no content path."
+
+        sanitized_path, is_absolute = self.sanitize_topic_path(topic_path)
+        if not sanitized_path:
+            return None, f"Topic '{topic_name}' has an invalid content path: {topic_path}"
+
+        if is_absolute:
+            return Path(sanitized_path), None
+
+        download_root = self.download_path_input.text().strip()
+        if not download_root:
+            return None, "Download path is blank. Set it in Settings before combining topics."
+
+        return Path(download_root) / Path(sanitized_path), None
+
+    def _build_nonconflicting_destination(self, destination_path, source_topic_id):
+        """Create a unique destination path when a conflicting filename already exists."""
+        stem = destination_path.stem
+        suffix = destination_path.suffix
+        parent = destination_path.parent
+
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}_from_topic{source_topic_id}_{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def _move_topic_folder_contents(self, source_topic, target_topic):
+        """Move files from source topic folder into target topic folder without losing data."""
+        source_folder, source_error = self._resolve_topic_folder_path(source_topic)
+        if source_error:
+            return {'moved': 0, 'deduped': 0, 'renamed': 0, 'errors': [source_error]}
+
+        target_folder, target_error = self._resolve_topic_folder_path(target_topic)
+        if target_error:
+            return {'moved': 0, 'deduped': 0, 'renamed': 0, 'errors': [target_error]}
+
+        try:
+            if source_folder.resolve() == target_folder.resolve():
+                return {'moved': 0, 'deduped': 0, 'renamed': 0, 'errors': []}
+        except Exception:
+            pass
+
+        target_folder.mkdir(parents=True, exist_ok=True)
+
+        if not source_folder.exists() or not source_folder.is_dir():
+            return {'moved': 0, 'deduped': 0, 'renamed': 0, 'errors': []}
+
+        moved_count = 0
+        deduped_count = 0
+        renamed_count = 0
+        errors = []
+
+        source_files = [p for p in source_folder.rglob('*') if p.is_file()]
+        for source_file in source_files:
+            try:
+                relative_path = source_file.relative_to(source_folder)
+                destination_file = target_folder / relative_path
+                destination_file.parent.mkdir(parents=True, exist_ok=True)
+
+                if destination_file.exists():
+                    try:
+                        if destination_file.stat().st_size == source_file.stat().st_size:
+                            source_file.unlink()
+                            deduped_count += 1
+                            continue
+                    except Exception:
+                        pass
+                    destination_file = self._build_nonconflicting_destination(destination_file, source_topic['id'])
+                    renamed_count += 1
+
+                shutil.move(str(source_file), str(destination_file))
+                moved_count += 1
+            except Exception as file_error:
+                errors.append(f"{source_file}: {str(file_error)}")
+
+        # Remove emptied directories, deepest first.
+        try:
+            for folder in sorted([p for p in source_folder.rglob('*') if p.is_dir()], key=lambda p: len(p.parts), reverse=True):
+                if not any(folder.iterdir()):
+                    folder.rmdir()
+            if source_folder.exists() and source_folder.is_dir() and not any(source_folder.iterdir()):
+                source_folder.rmdir()
+        except Exception as cleanup_error:
+            logger.warning(f"Topic combine cleanup warning: {cleanup_error}")
+
+        return {
+            'moved': moved_count,
+            'deduped': deduped_count,
+            'renamed': renamed_count,
+            'errors': errors,
+        }
+
+    def combine_selected_topic_with_target(self):
+        """Move a selected source topic into another target topic and delete the source topic."""
+        selected = self.topics_tree.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "No Selection", "Please select a source topic first.")
+            return
+
+        if not self.current_username:
+            QMessageBox.warning(self, "No Account", "Please select an account before combining topics.")
+            return
+
+        if not self.content_db or not self.content_db.db:
+            QMessageBox.warning(self, "No Database", "No database is loaded.")
+            return
+
+        source_topic = selected[0].data(0, Qt.UserRole)
+        source_topic_id = source_topic['id']
+
+        try:
+            all_topics = self.content_db.db.get_all_topics()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load topics:\n{str(e)}")
+            return
+
+        descendant_ids = self._collect_topic_descendant_ids(source_topic_id, all_topics)
+        target_candidates = [
+            topic for topic in all_topics
+            if topic['id'] != source_topic_id and topic['id'] not in descendant_ids
+        ]
+
+        if not target_candidates:
+            QMessageBox.warning(
+                self,
+                "No Targets",
+                "No valid target topics are available.\n"
+                "You cannot combine into the same topic or into one of its descendants."
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Combine Topic: {source_topic['topic_name']}")
+        dialog.setMinimumWidth(460)
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel(
+            f"Source topic: {source_topic['topic_name']} (ID: {source_topic_id})\n"
+            "Choose the target topic to migrate into:"
+        ))
+
+        target_combo = QComboBox()
+        for topic in sorted(target_candidates, key=lambda t: t['topic_name'].lower()):
+            parent_text = ''
+            if topic.get('parent_topic_id') is not None:
+                parent_text = f" | Parent ID: {topic.get('parent_topic_id')}"
+            target_combo.addItem(f"{topic['topic_name']} (ID: {topic['id']}{parent_text})", topic['id'])
+        layout.addWidget(target_combo)
+
+        details = QLabel(
+            "This operation will:\n"
+            "1. MOVE files from source topic folder to target topic folder\n"
+            "2. Move source topic assignments to target topic\n"
+            "3. Re-parent source topic children under target topic\n"
+            "4. Delete the source topic\n\n"
+            "No files are deleted during migration."
+        )
+        details.setWordWrap(True)
+        layout.addWidget(details)
+
+        button_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_row.addStretch()
+        button_row.addWidget(ok_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        target_topic_id = target_combo.currentData()
+        target_topic = next((t for t in target_candidates if t['id'] == target_topic_id), None)
+        if not target_topic:
+            QMessageBox.warning(self, "Invalid Target", "Selected target topic not found.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Combine",
+            f"Combine '{source_topic['topic_name']}' into '{target_topic['topic_name']}'?\n\n"
+            "This will MOVE files and topic assignments to the target and then delete the source topic.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        conn = None
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+
+            # Move files first. If this fails, keep DB untouched to avoid partial migration semantics.
+            move_stats = self._move_topic_folder_contents(source_topic, target_topic)
+            if move_stats['errors']:
+                preview_errors = "\n".join(move_stats['errors'][:8])
+                extra_error_count = max(0, len(move_stats['errors']) - 8)
+                if extra_error_count:
+                    preview_errors += f"\n...and {extra_error_count} more error(s)."
+                raise Exception(
+                    "File migration failed. Database changes were not applied.\n\n"
+                    f"Errors:\n{preview_errors}"
+                )
+
+            conn = self.content_db.db._get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                INSERT INTO DL.topic_assignments
+                    (account_name, content_id, row_number, topic_id, file_movement_status,
+                     file_movement_error, file_movement_updated_at, TreeUpdated, SiteUpdated, VidPrepUpdated)
+                SELECT
+                    ta.account_name,
+                    ta.content_id,
+                    ta.row_number,
+                    ?,
+                    ta.file_movement_status,
+                    ta.file_movement_error,
+                    ta.file_movement_updated_at,
+                    ta.TreeUpdated,
+                    ta.SiteUpdated,
+                    ta.VidPrepUpdated
+                FROM DL.topic_assignments ta
+                WHERE ta.account_name = ?
+                  AND ta.topic_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM DL.topic_assignments existing
+                      WHERE existing.account_name = ta.account_name
+                        AND existing.content_id = ta.content_id
+                        AND existing.topic_id = ?
+                  )
+            ''', (target_topic_id, self.current_username, source_topic_id, target_topic_id))
+
+            cursor.execute(
+                'DELETE FROM DL.topic_assignments WHERE account_name = ? AND topic_id = ?',
+                (self.current_username, source_topic_id)
+            )
+
+            # Preserve child topics by re-parenting them to the selected target.
+            cursor.execute(
+                'UPDATE DL.topics SET parent_topic_id = ? WHERE parent_topic_id = ?',
+                (target_topic_id, source_topic_id)
+            )
+
+            cursor.execute('DELETE FROM DL.topics WHERE id = ?', (source_topic_id,))
+            if cursor.rowcount != 1:
+                raise Exception("Source topic could not be deleted after migration.")
+
+            conn.commit()
+
+            try:
+                default_topic = self.content_db.db.get_default_approval_topic()
+                if default_topic and int(default_topic.get('id', 0)) == int(source_topic_id):
+                    self.content_db.db.set_default_approval_topic(int(target_topic_id))
+            except Exception as settings_error:
+                logger.warning(f"Default approval topic update warning after combine: {settings_error}")
+
+            self.load_topics_tree(force=True)
+            self.update_topic_filter_dropdown()
+            self.topics_status.setText(
+                f"Combined '{source_topic['topic_name']}' into '{target_topic['topic_name']}' "
+                f"(moved {move_stats['moved']} file(s), deduped {move_stats['deduped']})"
+            )
+
+            QMessageBox.information(
+                self,
+                "Combine Complete",
+                f"Topic '{source_topic['topic_name']}' was migrated into '{target_topic['topic_name']}'.\n\n"
+                f"Files moved: {move_stats['moved']}\n"
+                f"Files deduped: {move_stats['deduped']}\n"
+                f"Files renamed (name collisions): {move_stats['renamed']}\n\n"
+                "Source topic deleted and topic lists refreshed."
+            )
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error(f"Error combining topics: {e}", exc_info=True)
+            QMessageBox.critical(self, "Combine Failed", f"Failed to combine topics:\n{str(e)}")
+        finally:
+            QApplication.restoreOverrideCursor()
     
     def promote_selected_topic(self):
         """Promote topic to same level as its parent"""
