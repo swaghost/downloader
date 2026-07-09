@@ -42,6 +42,7 @@ class DatabaseManagerSQLServer:
         self.password = password
         self.connection = None
         self._local = threading.local()
+        self._saved_posts_proc_ready = False
         
         # Build connection string with explicit collation
         self.connection_string = (
@@ -191,6 +192,322 @@ class DatabaseManagerSQLServer:
         except Exception as e:
             conn.rollback()
             raise Exception(f"Failed to add content entry {entry_id}: {e}")
+
+    def _ensure_saved_posts_batch_procedure(self):
+        """Create or update fast cursor-based batch procedure for saved-post inserts."""
+        if self._saved_posts_proc_ready:
+            return
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            CREATE OR ALTER PROCEDURE DL.sp_insert_saved_posts_batch
+                @account_name NVARCHAR(100),
+                @posts_json NVARCHAR(MAX)
+            AS
+            BEGIN
+                SET NOCOUNT ON;
+                SET XACT_ABORT ON;
+
+                DECLARE @results TABLE (
+                    shortcode NVARCHAR(50) NOT NULL,
+                    is_inserted BIT NOT NULL,
+                    row_number INT NULL
+                );
+
+                DECLARE @batch TABLE (
+                    shortcode NVARCHAR(50) NOT NULL,
+                    media_url NVARCHAR(500) NOT NULL,
+                    caption NVARCHAR(MAX) NULL,
+                    source NVARCHAR(100) NULL,
+                    entry_type NVARCHAR(50) NULL,
+                    date_added DATETIME2 NULL,
+                    content_type NVARCHAR(50) NOT NULL,
+                    content_sub_type NVARCHAR(50) NULL,
+                    content_count_videos INT NOT NULL,
+                    content_count_images INT NOT NULL
+                );
+
+                INSERT INTO @batch (
+                    shortcode,
+                    media_url,
+                    caption,
+                    source,
+                    entry_type,
+                    date_added,
+                    content_type,
+                    content_sub_type,
+                    content_count_videos,
+                    content_count_images
+                )
+                SELECT
+                    j.shortcode,
+                    j.media_url,
+                    j.caption,
+                    COALESCE(j.source, 'Instagram Saved Posts'),
+                    COALESCE(j.entry_type, j.content_type),
+                    COALESCE(j.date_added, GETDATE()),
+                    COALESCE(j.content_type, 'post'),
+                    j.content_sub_type,
+                    COALESCE(j.content_count_videos, 0),
+                    COALESCE(j.content_count_images, 1)
+                FROM OPENJSON(@posts_json)
+                WITH (
+                    shortcode NVARCHAR(50) '$.shortcode',
+                    media_url NVARCHAR(500) '$.media_url',
+                    caption NVARCHAR(MAX) '$.caption',
+                    source NVARCHAR(100) '$.source',
+                    entry_type NVARCHAR(50) '$.entry_type',
+                    date_added DATETIME2 '$.date_added',
+                    content_type NVARCHAR(50) '$.content_type',
+                    content_sub_type NVARCHAR(50) '$.content_sub_type',
+                    content_count_videos INT '$.content_count_videos',
+                    content_count_images INT '$.content_count_images'
+                ) j
+                WHERE j.shortcode IS NOT NULL
+                  AND LTRIM(RTRIM(j.shortcode)) <> ''
+                  AND j.media_url IS NOT NULL
+                  AND LTRIM(RTRIM(j.media_url)) <> '';
+
+                BEGIN TRANSACTION;
+
+                DECLARE
+                    @shortcode NVARCHAR(50),
+                    @media_url NVARCHAR(500),
+                    @caption NVARCHAR(MAX),
+                    @source NVARCHAR(100),
+                    @entry_type NVARCHAR(50),
+                    @date_added DATETIME2,
+                    @content_type NVARCHAR(50),
+                    @content_sub_type NVARCHAR(50),
+                    @content_count_videos INT,
+                    @content_count_images INT,
+                    @next_row_number INT;
+
+                SELECT @next_row_number = ISNULL(MAX(row_number), 0) + 1
+                FROM DL.content_entries WITH (UPDLOCK, HOLDLOCK)
+                WHERE account_name = @account_name;
+
+                DECLARE post_cursor CURSOR LOCAL FAST_FORWARD FOR
+                    SELECT
+                        shortcode,
+                        media_url,
+                        caption,
+                        source,
+                        entry_type,
+                        date_added,
+                        content_type,
+                        content_sub_type,
+                        content_count_videos,
+                        content_count_images
+                    FROM @batch
+                    ORDER BY shortcode;
+
+                OPEN post_cursor;
+
+                FETCH NEXT FROM post_cursor INTO
+                    @shortcode,
+                    @media_url,
+                    @caption,
+                    @source,
+                    @entry_type,
+                    @date_added,
+                    @content_type,
+                    @content_sub_type,
+                    @content_count_videos,
+                    @content_count_images;
+
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM DL.content_entries WITH (UPDLOCK, HOLDLOCK)
+                        WHERE id = @shortcode
+                           OR (account_name = @account_name AND media_url = @media_url)
+                    )
+                    BEGIN
+                        INSERT INTO @results (shortcode, is_inserted, row_number)
+                        VALUES (@shortcode, 0, NULL);
+                    END
+                    ELSE
+                    BEGIN
+                        INSERT INTO DL.content_entries (
+                            id,
+                            account_name,
+                            media_url,
+                            text,
+                            source,
+                            type,
+                            date_added,
+                            content_type,
+                            content_sub_type,
+                            content_count_videos,
+                            content_count_images,
+                            cdn_acquisition_status,
+                            download_status,
+                            review_state,
+                            purge_status,
+                            is_duplicate,
+                            row_number,
+                            has_instagram_issues,
+                            instagram_issue_notes
+                        )
+                        VALUES (
+                            @shortcode,
+                            @account_name,
+                            @media_url,
+                            COALESCE(@caption, ''),
+                            COALESCE(@source, 'Instagram Saved Posts'),
+                            COALESCE(@entry_type, @content_type),
+                            COALESCE(@date_added, GETDATE()),
+                            COALESCE(@content_type, 'post'),
+                            @content_sub_type,
+                            COALESCE(@content_count_videos, 0),
+                            COALESCE(@content_count_images, 1),
+                            'awaiting scan',
+                            'awaiting scan',
+                            'not yet reviewed',
+                            0,
+                            0,
+                            @next_row_number,
+                            0,
+                            NULL
+                        );
+
+                        INSERT INTO @results (shortcode, is_inserted, row_number)
+                        VALUES (@shortcode, 1, @next_row_number);
+
+                        SET @next_row_number = @next_row_number + 1;
+                    END
+
+                    FETCH NEXT FROM post_cursor INTO
+                        @shortcode,
+                        @media_url,
+                        @caption,
+                        @source,
+                        @entry_type,
+                        @date_added,
+                        @content_type,
+                        @content_sub_type,
+                        @content_count_videos,
+                        @content_count_images;
+                END
+
+                CLOSE post_cursor;
+                DEALLOCATE post_cursor;
+
+                COMMIT TRANSACTION;
+
+                SELECT shortcode, is_inserted, row_number
+                FROM @results;
+            END
+        ''')
+        conn.commit()
+        self._saved_posts_proc_ready = True
+
+    def add_saved_posts_batch(self, posts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Insert saved posts quickly using a SQL cursor procedure with duplicate protection."""
+        stats: Dict[str, Any] = {
+            'saved': 0,
+            'duplicates': 0,
+            'errors': 0,
+            'saved_shortcodes': [],
+            'duplicate_shortcodes': [],
+            'row_numbers': {},
+        }
+
+        if not posts:
+            return stats
+
+        self._ensure_saved_posts_batch_procedure()
+
+        payload = []
+        for post in posts:
+            shortcode = str(post.get('shortcode') or '').strip()
+            if not shortcode:
+                stats['errors'] += 1
+                continue
+
+            typename = post.get('typename', 'GraphImage')
+            if typename == 'GraphVideo':
+                content_type = 'reel'
+                content_sub_type = 'single-video'
+                content_count_videos = 1
+                content_count_images = 0
+            elif typename == 'GraphSidecar':
+                content_type = 'carousel'
+                content_sub_type = None
+                media_count = int(post.get('media_count', 1) or 1)
+                # For mixed/unknown sidecar composition, default to image count for pending scan.
+                content_count_videos = 0
+                content_count_images = max(1, media_count)
+            else:
+                content_type = 'post'
+                content_sub_type = 'single-image'
+                content_count_videos = 0
+                content_count_images = 1
+
+            date_field = post.get('date')
+            if isinstance(date_field, int):
+                date_added = datetime.fromtimestamp(date_field).isoformat()
+            elif isinstance(date_field, str) and date_field.strip():
+                date_added = date_field.strip()
+            else:
+                date_added = datetime.now().isoformat()
+
+            media_url = str(post.get('url') or '').strip()
+            if not media_url:
+                media_url = f"https://www.instagram.com/p/{shortcode}/"
+
+            payload.append({
+                'shortcode': shortcode,
+                'media_url': media_url,
+                'caption': post.get('caption', ''),
+                'source': 'Instagram Saved Posts',
+                'entry_type': content_type,
+                'date_added': date_added,
+                'content_type': content_type,
+                'content_sub_type': content_sub_type,
+                'content_count_videos': content_count_videos,
+                'content_count_images': content_count_images,
+            })
+
+        if not payload:
+            return stats
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                'EXEC DL.sp_insert_saved_posts_batch @account_name = ?, @posts_json = ?',
+                (self.account_name, json.dumps(payload, ensure_ascii=False))
+            )
+            rows = cursor.fetchall()
+            conn.commit()
+
+            for row in rows:
+                shortcode = row[0]
+                is_inserted = bool(row[1])
+                row_number = row[2]
+                if is_inserted:
+                    stats['saved'] += 1
+                    stats['saved_shortcodes'].append(shortcode)
+                    if row_number is not None:
+                        stats['row_numbers'][shortcode] = int(row_number)
+                else:
+                    stats['duplicates'] += 1
+                    stats['duplicate_shortcodes'].append(shortcode)
+
+            unmatched = len(payload) - len(rows)
+            if unmatched > 0:
+                stats['errors'] += unmatched
+
+            return stats
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to batch insert saved posts: {e}")
     
     def _add_file_entry(self, cursor, content_id: str, file_entry: Dict[str, Any]):
         """Add a file entry (called within a transaction)."""
@@ -1002,6 +1319,102 @@ class DatabaseManagerSQLServer:
         sql = f"SELECT COUNT(*) FROM DL.content_entries WHERE {' AND '.join(where_clauses)}"
         cursor.execute(sql)
         return cursor.fetchone()[0]
+
+    def get_thumbnail_scan_entries(self) -> List[Dict[str, Any]]:
+        """Return lightweight entry rows for thumbnail scanning without heavy joins."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT id, account_name, text, content_type
+            FROM DL.content_entries
+            WHERE account_name = ?
+            ORDER BY row_number ASC
+        ''', (self.account_name,))
+
+        rows = []
+        for row in cursor.fetchall():
+            entry_id = (row[0] or '').strip() if row[0] else ''
+            if not entry_id:
+                continue
+
+            content_type = (row[3] or '').strip().lower() if row[3] else ''
+            if content_type == 'reel':
+                typename = 'GraphVideo'
+            elif content_type == 'carousel':
+                typename = 'GraphSidecar'
+            else:
+                typename = 'GraphImage'
+
+            rows.append({
+                'id': entry_id,
+                'shortcode': entry_id,
+                'account_name': row[1],
+                'text': row[2] or '',
+                'type': content_type,
+                'typename': typename,
+            })
+
+        return rows
+
+    def get_entries_missing_thumbnails(self) -> List[Dict[str, Any]]:
+        """Return lightweight entries that do not yet have a thumbnail record."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT
+                ce.id,
+                ce.account_name,
+                ce.text,
+                ce.content_type,
+                fhint.file_destination_path
+            FROM DL.content_entries ce
+            LEFT JOIN DL.thumbnails t
+                ON t.content_id = ce.id
+            OUTER APPLY (
+                SELECT TOP 1 f.file_destination_path
+                FROM DL.files f
+                WHERE f.content_id = ce.id
+                  AND f.file_destination_path IS NOT NULL
+                  AND LTRIM(RTRIM(f.file_destination_path)) <> ''
+                ORDER BY
+                    CASE
+                        WHEN f.file_download_status IN ('completed', 'downloaded', 're-downloaded') THEN 0
+                        ELSE 1
+                    END,
+                    f.file_number ASC
+            ) fhint
+            WHERE ce.account_name = ?
+              AND t.thumbnail_id IS NULL
+            ORDER BY ce.row_number ASC
+        ''', (self.account_name,))
+
+        rows = []
+        for row in cursor.fetchall():
+            entry_id = (row[0] or '').strip() if row[0] else ''
+            if not entry_id:
+                continue
+
+            content_type = (row[3] or '').strip().lower() if row[3] else ''
+            if content_type == 'reel':
+                typename = 'GraphVideo'
+            elif content_type == 'carousel':
+                typename = 'GraphSidecar'
+            else:
+                typename = 'GraphImage'
+
+            rows.append({
+                'id': entry_id,
+                'shortcode': entry_id,
+                'account_name': row[1],
+                'text': row[2] or '',
+                'type': content_type,
+                'typename': typename,
+                'local_media_path': row[4] or None,
+            })
+
+        return rows
     
     def bulk_update_download_status(self, entry_ids: List[str], status: str) -> int:
         """Bulk update download status."""
@@ -2874,6 +3287,7 @@ class DatabaseManagerSQLServer:
                     CREATE TABLE VIDEO.VideoOutput (
                         VidID INT IDENTITY(1,1) PRIMARY KEY,
                         AccountName NVARCHAR(255) NOT NULL,
+                        OutputKind NVARCHAR(20) NOT NULL CONSTRAINT DF_VideoOutput_OutputKind DEFAULT 'video',
                         OutputPath NVARCHAR(1000) NOT NULL,
                         OutputFileName NVARCHAR(255) NULL,
                         VideoFileTitle NVARCHAR(500) NULL,
@@ -2939,6 +3353,8 @@ class DatabaseManagerSQLServer:
                     ALTER TABLE VIDEO.AudioTracks ADD FadeInSeconds FLOAT NULL;
                 IF COL_LENGTH('VIDEO.AudioTracks', 'FadeOutSeconds') IS NULL
                     ALTER TABLE VIDEO.AudioTracks ADD FadeOutSeconds FLOAT NULL;
+                IF COL_LENGTH('VIDEO.AudioTracks', 'Muted') IS NULL
+                    ALTER TABLE VIDEO.AudioTracks ADD Muted BIT NOT NULL CONSTRAINT DF_AudioTracks_Muted DEFAULT 0;
                 IF COL_LENGTH('VIDEO.AudioTracks', 'CreatedAt') IS NULL
                     ALTER TABLE VIDEO.AudioTracks ADD CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_AudioTracks_CreatedAt DEFAULT GETDATE();
             ''')
@@ -2949,6 +3365,8 @@ class DatabaseManagerSQLServer:
             cursor.execute('''
                 IF COL_LENGTH('VIDEO.VideoOutput', 'AccountName') IS NULL
                     ALTER TABLE VIDEO.VideoOutput ADD AccountName NVARCHAR(255) NULL;
+                IF COL_LENGTH('VIDEO.VideoOutput', 'OutputKind') IS NULL
+                    ALTER TABLE VIDEO.VideoOutput ADD OutputKind NVARCHAR(20) NOT NULL CONSTRAINT DF_VideoOutput_OutputKind DEFAULT 'video';
                 IF COL_LENGTH('VIDEO.VideoOutput', 'OutputPath') IS NULL
                     ALTER TABLE VIDEO.VideoOutput ADD OutputPath NVARCHAR(1000) NULL;
                 IF COL_LENGTH('VIDEO.VideoOutput', 'OutputFileName') IS NULL
@@ -3080,6 +3498,7 @@ class DatabaseManagerSQLServer:
                         ExitFrame INT NULL,
                         FadeInSeconds FLOAT NULL,
                         FadeOutSeconds FLOAT NULL,
+                        Muted BIT NOT NULL CONSTRAINT DF_AudioTracks_Muted DEFAULT 0,
                         CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_AudioTracks_CreatedAt DEFAULT GETDATE(),
                         CONSTRAINT FK_AudioTracks_VideoOutput FOREIGN KEY (VidID)
                             REFERENCES VIDEO.VideoOutput(VidID) ON DELETE CASCADE
@@ -3284,6 +3703,7 @@ class DatabaseManagerSQLServer:
                 '''
                 INSERT INTO VIDEO.VideoOutput (
                     AccountName,
+                    OutputKind,
                     OutputPath,
                     OutputFileName,
                     VideoFileTitle,
@@ -3322,10 +3742,11 @@ class DatabaseManagerSQLServer:
                     UpdatedAt
                 )
                 OUTPUT INSERTED.VidID
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE())
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE())
                 ''',
                 (
                     account_name,
+                    video_output.get('output_kind') or 'video',
                     output_path,
                     video_output.get('output_file_name'),
                     video_output.get('video_file_title'),
@@ -3387,9 +3808,10 @@ class DatabaseManagerSQLServer:
                         EnterFrame,
                         ExitFrame,
                         FadeInSeconds,
-                        FadeOutSeconds
+                        FadeOutSeconds,
+                        Muted
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''',
                     (
                         vid_id,
@@ -3403,6 +3825,7 @@ class DatabaseManagerSQLServer:
                         track.get('exit_frame'),
                         track.get('fade_in_seconds'),
                         track.get('fade_out_seconds'),
+                        1 if bool(track.get('muted')) else 0,
                     ),
                 )
 
@@ -3518,6 +3941,7 @@ class DatabaseManagerSQLServer:
             SELECT TOP 1
                 VidID,
                 AccountName,
+                OutputKind,
                 OutputPath,
                 OutputFileName,
                 VideoFileTitle,
@@ -3587,6 +4011,7 @@ class DatabaseManagerSQLServer:
                 ExitFrame,
                 FadeInSeconds,
                 FadeOutSeconds,
+                Muted,
                 CreatedAt
             FROM VIDEO.AudioTracks
             WHERE VidID = ?
@@ -3642,6 +4067,60 @@ class DatabaseManagerSQLServer:
         record['applications'] = self.get_video_applications(record['VidID'])
         record['nodes'] = self.get_video_nodes(record['VidID'])
         return record
+
+    def delete_video_output_record(self, output_path: str, account_name: str = None) -> bool:
+        """Delete VIDEO.VideoOutput row by account/path. Dependent rows are removed via FK cascade."""
+        self.ensure_video_output_tables()
+
+        normalized_output = str(output_path or '').strip()
+        if not normalized_output:
+            return False
+
+        target_account = str(account_name or self.account_name or '').strip()
+        if not target_account:
+            return False
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                '''
+                DELETE FROM VIDEO.VideoOutput
+                WHERE AccountName = ? AND OutputPath = ?
+                ''',
+                (target_account, normalized_output),
+            )
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            return bool(deleted)
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Failed to delete video output record: {e}")
+
+    def get_vid_prep_count_for_shortcode(self, shortcode: str, account_name: str = None) -> int:
+        """Count VIDEO.VideoOutput rows produced from a given source shortcode."""
+        self.ensure_video_output_tables()
+
+        clean_shortcode = str(shortcode or '').strip()
+        if not clean_shortcode:
+            return 0
+
+        if account_name is None:
+            account_name = self.account_name
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT COUNT(*)
+            FROM VIDEO.VideoOutput
+            WHERE AccountName = ?
+              AND SourceShortcode = ?
+            ''',
+            (account_name, clean_shortcode),
+        )
+        row = cursor.fetchone()
+        return int(row[0] if row and row[0] is not None else 0)
 
     def save_video_application(
         self,
@@ -3865,7 +4344,7 @@ class DatabaseManagerSQLServer:
                 )
                 BEGIN
                     CREATE INDEX IX_NodeOutput_VidID
-                    ON VIDEO.NodeOutput(VidID, VidNID)
+                    ON VIDEO.NodeOutput(VidID)
                 END
             ''')
             conn.commit()
@@ -3911,10 +4390,14 @@ class DatabaseManagerSQLServer:
         cursor = conn.cursor()
         cursor.execute(
             '''
-            SELECT VidNID, VidID, FlowID, ParentNodeID, NodeName, NodeDescription
+            SELECT VidID, FlowID, ParentNodeID, NodeName, NodeDescription
             FROM VIDEO.NodeOutput
             WHERE VidID = ?
-            ORDER BY VidNID ASC
+            ORDER BY
+                COALESCE(FlowID, 9223372036854775807),
+                COALESCE(ParentNodeID, 9223372036854775807),
+                COALESCE(NodeName, N''),
+                COALESCE(NodeDescription, N'')
             ''',
             (int(vid_id),),
         )

@@ -5,7 +5,7 @@ Manages saved posts persistence with duplicate checking
 
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 
 from database_factory import get_database_manager
@@ -59,7 +59,7 @@ class ContentDatabaseManager:
             logger.error(f"Failed to save post {post.get('shortcode', 'unknown')}: {e}")
             return False
     
-    def save_posts_batch(self, posts: List[Dict]) -> Dict[str, int]:
+    def save_posts_batch(self, posts: List[Dict]) -> Dict[str, Any]:
         """
         Save multiple posts to database.
         
@@ -69,19 +69,49 @@ class ContentDatabaseManager:
         Returns:
             Dictionary with counts: {'saved': N, 'duplicates': N, 'errors': N}
         """
-        stats = {'saved': 0, 'duplicates': 0, 'errors': 0}
-        
+        stats = {
+            'saved': 0,
+            'duplicates': 0,
+            'errors': 0,
+            'saved_shortcodes': [],
+            'duplicate_shortcodes': [],
+            'row_numbers': {},
+        }
+
+        if not posts:
+            return stats
+
+        # Prefer database-native batch processing when available.
+        if hasattr(self.db, 'add_saved_posts_batch'):
+            try:
+                batch_stats = self.db.add_saved_posts_batch(posts)
+                stats['saved'] = int(batch_stats.get('saved', 0))
+                stats['duplicates'] = int(batch_stats.get('duplicates', 0))
+                stats['errors'] = int(batch_stats.get('errors', 0))
+                stats['saved_shortcodes'] = list(batch_stats.get('saved_shortcodes', []))
+                stats['duplicate_shortcodes'] = list(batch_stats.get('duplicate_shortcodes', []))
+                stats['row_numbers'] = dict(batch_stats.get('row_numbers', {}))
+                return stats
+            except Exception as e:
+                logger.warning(f"Fast batch save failed, falling back to row inserts: {e}")
+
+        # Fallback path (slower): save one by one
         for post in posts:
+            shortcode = post.get('shortcode')
             try:
                 result = self.save_post(post)
                 if result:
                     stats['saved'] += 1
+                    if shortcode:
+                        stats['saved_shortcodes'].append(shortcode)
                 else:
                     stats['duplicates'] += 1
+                    if shortcode:
+                        stats['duplicate_shortcodes'].append(shortcode)
             except Exception as e:
-                logger.error(f"Error saving post {post.get('shortcode')}: {e}")
+                logger.error(f"Error saving post {shortcode}: {e}")
                 stats['errors'] += 1
-        
+
         return stats
     
     def is_duplicate(self, shortcode: str) -> bool:
