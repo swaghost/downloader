@@ -9,7 +9,6 @@ Simple, intuitive interface with three main tabs:
 import sys
 import os
 import json
-import pickle
 import platform
 import re
 import shutil
@@ -30,7 +29,7 @@ from PyQt5.QtWidgets import (
     QStyledItemDelegate, QStyleOptionViewItem, QStyle
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QMetaObject, Q_ARG, QSize, QTimer, QPoint, QUrl, QMutex, QRect, QEvent, QMimeData
-from PyQt5.QtGui import QPixmap, QColor, QFont, QImage, QPainter, QPen, QBrush, QPalette, QDrag, QTextCharFormat, QIntValidator
+from PyQt5.QtGui import QPixmap, QColor, QFont, QImage, QImageReader, QPainter, QPen, QBrush, QPalette, QDrag, QTextCharFormat, QIntValidator
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 import logging
@@ -234,6 +233,86 @@ class AudioTrackEditorListWidget(QListWidget):
         self.order_changed.emit()
 
 
+class FrameVidSourceListWidget(QListWidget):
+    """List widget supporting image/video file drops and internal drag reordering."""
+    files_dropped = pyqtSignal(list)
+
+    IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff')
+    VIDEO_EXTENSIONS = ('.mp4', '.mov', '.mkv', '.m4v', '.webm', '.avi', '.flv')
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+
+    def _is_supported_media(self, file_path):
+        lowered = str(file_path).lower()
+        return lowered.endswith(self.IMAGE_EXTENSIONS) or lowered.endswith(self.VIDEO_EXTENSIONS)
+
+    def _extract_supported_paths(self, mime_data):
+        if not mime_data:
+            return []
+
+        paths = []
+
+        if mime_data.hasUrls():
+            for url in mime_data.urls():
+                if not url.isLocalFile():
+                    continue
+                local_path = os.path.normpath(url.toLocalFile())
+                if self._is_supported_media(local_path):
+                    paths.append(local_path)
+
+        # Accept text payloads too because some Qt drag sources emit text/uri-list or newline paths.
+        if not paths and mime_data.hasText():
+            raw_text = mime_data.text() or ''
+            for token in re.split(r'[\r\n]+', raw_text):
+                candidate = token.strip()
+                if not candidate:
+                    continue
+                if candidate.startswith('file:///'):
+                    local_path = QUrl(candidate).toLocalFile()
+                else:
+                    local_path = candidate.strip('"')
+                local_path = os.path.normpath(local_path)
+                if self._is_supported_media(local_path):
+                    paths.append(local_path)
+
+        unique_paths = []
+        seen = set()
+        for path in paths:
+            norm_key = os.path.normcase(path)
+            if norm_key in seen:
+                continue
+            seen.add(norm_key)
+            unique_paths.append(path)
+        return unique_paths
+
+    def dragEnterEvent(self, event):
+        if self._extract_supported_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._extract_supported_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        file_paths = self._extract_supported_paths(event.mimeData())
+        if file_paths:
+            self.files_dropped.emit(file_paths)
+            event.acceptProposedAction()
+            return
+
+        super().dropEvent(event)
+
+
 class AudioStartFrameDropLabel(QLabel):
     """Drop target that resolves an audio track path for Start-at-Frame assignment."""
     track_dropped = pyqtSignal(str)
@@ -432,7 +511,7 @@ class QTextEditLogger(logging.Handler, QObject):
 
 class LoginThread(QThread):
     """Background thread for login operation"""
-    finished = pyqtSignal(bool, str)  # success, message
+    finished = pyqtSignal(bool, str, str)  # success, message, ig_username
     
     def __init__(self, manager, username, password, session_file):
         super().__init__()
@@ -443,13 +522,10 @@ class LoginThread(QThread):
     
     def run(self):
         try:
-            success = self.manager.login(self.username, self.password, self.session_file)
-            if success:
-                self.finished.emit(True, f"Logged in as {self.username}")
-            else:
-                self.finished.emit(False, "Login failed. Check credentials.")
+            result = self.manager.login_detailed(self.username, self.password, self.session_file)
+            self.finished.emit(bool(result.get('success')), str(result.get('message') or ''), str(result.get('ig_username') or ''))
         except Exception as e:
-            self.finished.emit(False, f"Error: {str(e)}")
+            self.finished.emit(False, f"Error: {str(e)}", "")
 
 
 class SoccrTechniquesTestThread(QThread):
@@ -490,14 +566,15 @@ class LoadSavedThread(QThread):
     finished = pyqtSignal(int)  # total count
     error = pyqtSignal(str)
     duplicate_found = pyqtSignal(str)  # shortcode of duplicate post
-    progress = pyqtSignal(int, int, int, int, int)  # processed_count, total_count, new_count, skipped_count, batch_size
+    progress = pyqtSignal(int, int, int, int, int, int)  # processed_count, discovered_count, new_count, existing_db_count, skipped_ui_count, batch_size
     
-    def __init__(self, manager, content_db, stop_at_first_duplicate, existing_shortcodes=None):
+    def __init__(self, manager, content_db, stop_at_first_duplicate, existing_shortcodes=None, batch_size=80):
         super().__init__()
         self.manager = manager
         self.content_db = content_db
         self.stop_at_first_duplicate = stop_at_first_duplicate
         self.existing_shortcodes = existing_shortcodes or set()
+        self.batch_size = max(10, int(batch_size or 80))
         self._stop_requested = False
     
     def run(self):
@@ -506,21 +583,9 @@ class LoadSavedThread(QThread):
             existing_count = 0  # Posts that already exist in database
             skipped_ui = 0  # Posts already loaded in UI
             total_fetched = 0  # Total posts fetched from Instagram
-            batch_size = 80
+            processed_count = 0  # Rows already handled (saved/duplicate/skipped)
+            batch_size = self.batch_size
             pending_posts = []
-            all_posts = []
-
-            # First pass: gather available saved posts so we can show Y in progress text.
-            for post in self.manager.get_saved_posts():
-                if self._stop_requested:
-                    break
-                all_posts.append(post)
-
-            total_available = len(all_posts)
-            processed_count = 0
-
-            # Emit initial progress so Process Manager shows 0 / Y immediately.
-            self.progress.emit(0, total_available, new_count, existing_count + skipped_ui, batch_size)
 
             def flush_batch(posts_batch):
                 nonlocal new_count, existing_count, processed_count
@@ -533,9 +598,10 @@ class LoadSavedThread(QThread):
                         processed_count += 1
                         self.progress.emit(
                             processed_count,
-                            total_available,
+                            total_fetched,
                             new_count,
-                            existing_count + skipped_ui,
+                            existing_count,
+                            skipped_ui,
                             batch_size
                         )
                         self.post_loaded.emit(batched_post)
@@ -556,9 +622,10 @@ class LoadSavedThread(QThread):
                         processed_count += 1
                         self.progress.emit(
                             processed_count,
-                            total_available,
+                            total_fetched,
                             new_count,
-                            existing_count + skipped_ui,
+                            existing_count,
+                            skipped_ui,
                             batch_size
                         )
                         self.post_loaded.emit(batched_post)
@@ -567,9 +634,10 @@ class LoadSavedThread(QThread):
                         processed_count += 1
                         self.progress.emit(
                             processed_count,
-                            total_available,
+                            total_fetched,
                             new_count,
-                            existing_count + skipped_ui,
+                            existing_count,
+                            skipped_ui,
                             batch_size
                         )
                         self.duplicate_post_loaded.emit(batched_post)
@@ -577,19 +645,31 @@ class LoadSavedThread(QThread):
                         processed_count += 1
                         self.progress.emit(
                             processed_count,
-                            total_available,
+                            total_fetched,
                             new_count,
-                            existing_count + skipped_ui,
+                            existing_count,
+                            skipped_ui,
                             batch_size
                         )
                         # Unexpected/failed insert path; do not emit row into UI.
                         logger.debug(f"Skipping unresolved batch insert outcome for {shortcode_value}")
 
-            for post in all_posts:
+            # Stream discovery and batch inserts in one pass so DB count grows continuously.
+            for post in self.manager.get_saved_posts():
                 if self._stop_requested:
                     break
 
                 total_fetched += 1
+                if total_fetched == 1 or total_fetched % 10 == 0:
+                    self.progress.emit(
+                        processed_count,
+                        total_fetched,
+                        new_count,
+                        existing_count,
+                        skipped_ui,
+                        batch_size
+                    )
+
                 shortcode = post.get('shortcode')
                 
                 # Skip if already loaded in UI
@@ -598,9 +678,10 @@ class LoadSavedThread(QThread):
                     processed_count += 1
                     self.progress.emit(
                         processed_count,
-                        total_available,
+                        total_fetched,
                         new_count,
-                        existing_count + skipped_ui,
+                        existing_count,
+                        skipped_ui,
                         batch_size
                     )
                     continue
@@ -621,9 +702,10 @@ class LoadSavedThread(QThread):
                     processed_count += 1
                     self.progress.emit(
                         processed_count,
-                        total_available,
+                        total_fetched,
                         new_count,
-                        existing_count + skipped_ui,
+                        existing_count,
+                        skipped_ui,
                         batch_size
                     )
                     # Emit as duplicate to show in green UI and skip downloading
@@ -638,6 +720,16 @@ class LoadSavedThread(QThread):
 
             # Flush final partial batch
             flush_batch(pending_posts)
+
+            # Final progress frame after all discovered rows are processed.
+            self.progress.emit(
+                processed_count,
+                total_fetched,
+                new_count,
+                existing_count,
+                skipped_ui,
+                batch_size
+            )
             
             logger.info(f"Fetched {total_fetched} saved posts from Instagram:")
             logger.info(f"  - {new_count} new (added to UI + database)")
@@ -1091,7 +1183,7 @@ class VideoCropPreview(QLabel):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(640, 360)
         self.setStyleSheet("QLabel { border: 2px dashed #888; background-color: #1f1f1f; color: #ddd; }")
-        self.setText("Drag and drop a video file here")
+        self.setText("")
 
         self._source_frame = None
         self._source_w = 0
@@ -1148,7 +1240,7 @@ class VideoCropPreview(QLabel):
             self._image_rect = QRect()
             self._crop_rect_display = QRect()
             self.setPixmap(QPixmap())
-            self.setText("Drag and drop a video file here")
+            self.setText("")
             return
 
         self._source_h, self._source_w = frame_bgr.shape[:2]
@@ -1173,10 +1265,32 @@ class VideoCropPreview(QLabel):
         if not self._base_pixmap:
             return
 
+        previous_image_rect = QRect(self._image_rect)
+        previous_crop_rect = QRect(self._crop_rect_display)
+
         scaled = self._base_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
         x = (self.width() - scaled.width()) // 2
         y = (self.height() - scaled.height()) // 2
         self._image_rect = QRect(x, y, scaled.width(), scaled.height())
+
+        # Keep existing crop selection stable when the preview widget is resized.
+        if not previous_crop_rect.isNull() and not previous_image_rect.isNull() and not self._image_rect.isNull():
+            prev = previous_crop_rect.normalized().intersected(previous_image_rect)
+            if not prev.isNull() and previous_image_rect.width() > 0 and previous_image_rect.height() > 0:
+                rel_x = (prev.left() - previous_image_rect.left()) / max(1, previous_image_rect.width())
+                rel_y = (prev.top() - previous_image_rect.top()) / max(1, previous_image_rect.height())
+                rel_w = prev.width() / max(1, previous_image_rect.width())
+                rel_h = prev.height() / max(1, previous_image_rect.height())
+
+                new_x = int(round(self._image_rect.left() + rel_x * self._image_rect.width()))
+                new_y = int(round(self._image_rect.top() + rel_y * self._image_rect.height()))
+                new_w = int(round(rel_w * self._image_rect.width()))
+                new_h = int(round(rel_h * self._image_rect.height()))
+
+                remapped = QRect(new_x, new_y, max(1, new_w), max(1, new_h)).intersected(self._image_rect)
+                if not remapped.isNull():
+                    self._crop_rect_display = remapped
+
         self.setPixmap(scaled)
         self.update()
 
@@ -1608,8 +1722,9 @@ class InstagramDownloaderGUI(QMainWindow):
         super().__init__()
         self.account_manager = AccountManager()
         self.instagram_manager = InstagramManager()
-        self.content_db = None  # Will be initialized when user logs in
+        self.content_db = None  # Will be initialized when user selects account
         self.current_username = None
+        self.instagram_authenticated = False  # Track if we're logged into Instagram (vs offline mode)
         self.saved_posts = []  # Deprecated - kept for backward compatibility
         self.current_content_entry = None
         
@@ -1634,6 +1749,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.active_download_threads = []  # Track active download threads
         self.thumbnail_threads = []  # Track active thumbnail download threads
         self.stop_thumbnail_downloads = False  # Flag to stop thumbnail downloads
+        self.failed_thumbnail_downloads = set()  # Track shortcodes with failed thumbnail downloads
         self.fetch_thumbnail_candidates = []  # New posts queued for post-fetch thumbnail pass
         self.failure_diagnostics_counts = {
             'null_metadata_shape': 0,
@@ -1760,6 +1876,11 @@ class InstagramDownloaderGUI(QMainWindow):
         self.stop_at_first_duplicate = self.account_manager.get_setting('stop_at_first_duplicate', 'false') == 'true'
         self.auto_fetch_thumbnails = self.account_manager.get_setting('auto_fetch_thumbnails', 'false') == 'true'
         self.auto_fetch_new_thumbnails = self.account_manager.get_setting('auto_fetch_new_thumbnails', 'true') == 'true'
+        saved_batch_size = self.account_manager.get_setting('saved_posts_batch_size', '80')
+        try:
+            self.saved_posts_batch_size = max(10, min(500, int(saved_batch_size)))
+        except (TypeError, ValueError):
+            self.saved_posts_batch_size = 80
         self.soccr_api_client_mode = config.normalize_soccr_api_client_mode(
             self.account_manager.get_setting('soccr_api_client_mode', 'dev')
         )
@@ -1999,6 +2120,14 @@ class InstagramDownloaderGUI(QMainWindow):
     def _normalize_failure_category(self, category: str) -> str:
         """Normalize category names to the four diagnostics buckets."""
         normalized = (category or "").strip().lower().replace('-', '_').replace(' ', '_')
+        aliases = {
+            '403': 'rate_limit_gating_issue',
+            'parse_miss': 'rate_limit_gating_issue',
+            'decode_fail': 'rate_limit_gating_issue',
+            'timeout': 'rate_limit_gating_issue',
+            'thumbnail_fetch_issue': 'rate_limit_gating_issue',
+        }
+        normalized = aliases.get(normalized, normalized)
         valid = {
             'null_metadata_shape',
             'auth_session_issue',
@@ -2131,11 +2260,25 @@ class InstagramDownloaderGUI(QMainWindow):
                 # Update status
                 status_item = self.process_table.item(row, 2)
                 if status_item:
+                    known_statuses = {
+                        'running',
+                        're-downloading',
+                        'paused',
+                        'cancelled',
+                        'completed',
+                        're-downloaded',
+                        'failed',
+                        'space_on_disk',
+                        'completed_with_errors',
+                    }
                     # Format status text for display
                     if status == 'space_on_disk':
                         status_display = 'SPACE ON DISK'
-                    else:
+                    elif status in known_statuses:
                         status_display = status.replace('_', ' ').title()
+                    else:
+                        # Preserve detailed, user-facing step text verbatim.
+                        status_display = str(status)
                     status_item.setText(status_display)
                     # Color code status
                     if status == 'running':
@@ -2156,6 +2299,9 @@ class InstagramDownloaderGUI(QMainWindow):
                         status_item.setForeground(QColor("#dc3545"))  # Red
                     elif status == 'completed_with_errors':
                         status_item.setForeground(QColor("#ff8c00"))  # Orange
+                    else:
+                        # Default custom in-flight steps to active green for readability.
+                        status_item.setForeground(QColor("#28a745"))
                 
                 # Update progress
                 progress_item = self.process_table.item(row, 3)
@@ -2311,6 +2457,97 @@ class InstagramDownloaderGUI(QMainWindow):
         
         return path if path else None, is_absolute
     
+    def select_account_for_local_access(self, account_dict, load_database=True):
+        """
+        Select an account for local data access WITHOUT requiring Instagram authentication.
+        This allows browsing already-downloaded content offline.
+        
+        Args:
+            account_dict: Account dictionary from account_manager
+            load_database: Whether to load database entries after selecting account
+        """
+        username = account_dict['username']
+        logger.info(f"Selecting account '{username}' for local data access (offline mode)")
+        
+        # Set current account
+        self.current_username = username
+        self.instagram_authenticated = False  # Offline mode
+        
+        # Initialize content database manager (does not require Instagram auth)
+        self.content_db = ContentDatabaseManager(str(config.DATA_DIR), username)
+        logger.info(f"Initialized content database for {username}")
+        
+        # Update UI to show offline mode
+        self.account_status.setText(f"📁 {username} (Local Data Only)")
+        self.account_status.setStyleSheet(
+            "font-weight: bold; padding: 10px; color: #FF9800;"  # Orange for offline mode
+        )
+        self.statusBar().showMessage(f"Accessing local data for {username}")
+        self.load_accounts()
+        
+        # Load account's download path
+        download_path = account_dict.get('download_path')
+        if download_path:
+            self.download_path_input.setText(download_path)
+            logger.info(f"Loaded download path: {download_path}")
+        else:
+            logger.warning(f"No download_path in account data")
+        
+        # Load account's thumbnails path
+        thumbnails_path = account_dict.get('thumbnails_path')
+        if thumbnails_path:
+            self.thumbnails_path = thumbnails_path
+            logger.info(f"Loaded thumbnails path: {thumbnails_path}")
+        else:
+            # Calculate from download_path if available
+            if download_path:
+                dl_path = Path(download_path)
+                if dl_path.name == 'content':
+                    self.thumbnails_path = str(dl_path.parent / ".thumbnails")
+                else:
+                    self.thumbnails_path = str(dl_path / ".thumbnails")
+                logger.warning(f"No thumbnails_path, calculated from download_path: {self.thumbnails_path}")
+            else:
+                self.thumbnails_path = None
+                logger.error("No download_path or thumbnails_path - cannot determine thumbnails location")
+        
+        # Load account's topics root path
+        topics_root_path = account_dict.get('topics_root_path')
+        if topics_root_path:
+            self.topics_root_path = topics_root_path
+            logger.info(f"Loaded topics_root_path: {topics_root_path}")
+        else:
+            if download_path:
+                self.topics_root_path = download_path
+                logger.warning(f"No topics_root_path, using download_path: {self.topics_root_path}")
+            else:
+                self.topics_root_path = None
+                logger.error("No download_path or topics_root_path - cannot determine topics location")
+        
+        # Clear failed thumbnail tracking for new account
+        self.failed_thumbnail_downloads.clear()
+        
+        # Load UI settings for this account
+        self.load_ui_settings()
+        
+        # Restore download queue from database
+        self.restore_queue_from_database()
+        
+        # Refresh Settings tab with account paths
+        self.refresh_settings_paths()
+        logger.info("Settings tab paths refreshed")
+        
+        # Load saved content entries from database
+        if load_database:
+            if self.auto_load_at_startup:
+                self.load_database_entries_async()
+                logger.info(f"Loading database in background for {username}")
+            else:
+                logger.info(f"Account selected (auto-load disabled)")
+                self.browse_status.setText("Click 'Load Database Entries' to view saved content")
+        
+        logger.info(f"✓ Account '{username}' selected for local data access")
+    
     def auto_login(self):
         """Automatically login with the most recent account if available"""
         logger.info("=" * 60)
@@ -2332,96 +2569,40 @@ class InstagramDownloaderGUI(QMainWindow):
             logger.info(f"Most recent account: {username} (IG: {ig_username})")
             logger.info(f"Session file path: {session_file}")
             
-            if not session_file.exists():
-                logger.warning(f"Session file not found for {username}")
-                return
-            
-            # Try to login with saved session (no need to re-login if session is valid)
-            logger.info(f"Attempting login with {username} (IG: {ig_username})...")
-            login_success = self.instagram_manager.login(ig_username, "", session_file)
-            logger.info(f"Login result: {login_success}")
+            # Try to login with saved session if session file exists
+            login_success = False
+            if session_file.exists():
+                logger.info(f"Attempting Instagram login with {username} (IG: {ig_username})...")
+                login_result = self.instagram_manager.login_detailed(ig_username, "", session_file)
+                login_success = bool(login_result.get('success'))
+                logger.info(f"Instagram login result: {login_success}")
+                self._apply_instagram_manager_status()
+            else:
+                logger.warning(f"Session file not found for {username} - continuing in offline mode")
             
             if login_success:
-                logger.info(f"✓ Login successful for {username}")
-                self.current_username = username
-                self.account_status.setText(f"✓ Logged in as {username}")
+                # Instagram authentication successful
+                logger.info(f"✓ Instagram login successful for {username}")
+                self.instagram_authenticated = True
+                self.account_status.setText(f"✓ {username} (Instagram Connected)")
                 self.account_status.setStyleSheet(
                     "font-weight: bold; padding: 10px; color: green;"
                 )
-                # Initialize content database manager
-                self.content_db = ContentDatabaseManager(str(config.DATA_DIR), username)
-                self.statusBar().showMessage(f"Logged in as {username}")
-                self.load_accounts()
-                
-                # Load account's download path
-                download_path = account.get('download_path')
-                logger.info(f"DEBUG auto_login: account data = {account}")
-                logger.info(f"DEBUG auto_login: download_path from account = {download_path}")
-                logger.info(f"DEBUG auto_login: Current download_path_input.text() = {self.download_path_input.text()}")
-                if download_path:
-                    self.download_path_input.setText(download_path)
-                    logger.info(f"✓ Set download_path_input to: {download_path}")
-                    logger.info(f"  Verify: download_path_input.text() now = {self.download_path_input.text()}")
-                else:
-                    logger.warning(f"No download_path in account data, keeping default: {self.download_path_input.text()}")
-                
-                # Load account's thumbnails path
-                thumbnails_path = account.get('thumbnails_path')
-                if thumbnails_path:
-                    self.thumbnails_path = thumbnails_path
-                    logger.info(f"Loaded thumbnails path: {thumbnails_path}")
-                else:
-                    # Calculate from download_path if available
-                    if download_path:
-                        dl_path = Path(download_path)
-                        if dl_path.name == 'content':
-                            self.thumbnails_path = str(dl_path.parent / ".thumbnails")
-                        else:
-                            self.thumbnails_path = str(dl_path / ".thumbnails")
-                        logger.warning(f"No thumbnails_path in account data, calculated from download_path: {self.thumbnails_path}")
-                    else:
-                        logger.error("No download_path or thumbnails_path in database - cannot determine thumbnails location")
-                        self.thumbnails_path = None
-                
-                # Load account's topics root path
-                topics_root_path = account.get('topics_root_path')
-                if topics_root_path:
-                    self.topics_root_path = topics_root_path
-                    logger.info(f"Loaded topics_root_path: {topics_root_path}")
-                else:
-                    if download_path:
-                        self.topics_root_path = download_path
-                        logger.warning(f"No topics_root_path in account data, using download_path: {self.topics_root_path}")
-                    else:
-                        logger.error("No download_path or topics_root_path in database - cannot determine topics location")
-                        self.topics_root_path = None
-                
-                # Load UI settings for this account
-                self.load_ui_settings()
-                
-                # Restore download queue from database
-                self.restore_queue_from_database()
-                
-                # Refresh Settings tab with account paths
-                self.refresh_settings_paths()
-                logger.info("Settings tab paths refreshed after auto-login")
-                
-                # Load saved content entries from database (if enabled)
-                if self.auto_load_at_startup:
-                    # Load async in background - UI will appear immediately
-                    self.load_database_entries_async()
-                    logger.info(f"Auto-login successful for {username} - loading database in background")
-                else:
-                    logger.info(f"Auto-login successful for {username} (auto-load disabled)")
-                    self.browse_status.setText("Click 'Load Database Entries' to view saved content")
-                
+            else:
+                # Instagram login failed or not attempted - continue in offline mode
+                logger.info(f"Continuing in offline mode for {username}")
+                self.instagram_authenticated = False
+            
+            # Initialize account data (works with or without Instagram auth)
+            self.select_account_for_local_access(account, load_database=True)
+            
+            if self.instagram_authenticated:
                 logger.info("=" * 60)
-                logger.info("AUTO-LOGIN COMPLETED SUCCESSFULLY")
+                logger.info("AUTO-LOGIN COMPLETED SUCCESSFULLY (ONLINE MODE)")
                 logger.info("=" * 60)
             else:
-                logger.warning(f"✗ Auto-login failed for {username} - session may have expired")
                 logger.info("=" * 60)
-                logger.info("AUTO-LOGIN FAILED")
+                logger.info("AUTO-LOGIN COMPLETED (OFFLINE MODE - LOCAL DATA ONLY)")
                 logger.info("=" * 60)
         except Exception as e:
             logger.error(f"Auto-login error: {e}")
@@ -3985,6 +4166,7 @@ class InstagramDownloaderGUI(QMainWindow):
         preview_splitter = QSplitter(Qt.Horizontal)
         self.vid_prep_preview_splitter = preview_splitter
         vid_prep_panel_min_height = 360
+        vid_prep_output_panel_min_height = 800
 
         source_panel_widget = QWidget()
         source_panel = QVBoxLayout(source_panel_widget)
@@ -3997,19 +4179,17 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_preview.crop_changed.connect(self.on_vid_prep_crop_changed)
         source_panel.addWidget(self.vid_prep_preview, 1)
 
-        source_panel.addWidget(QLabel("Input Timeline"))
+        self.vid_prep_input_timeline_label = QLabel("Input Timeline")
         scrub_row = QHBoxLayout()
         scrub_row.setContentsMargins(0, 0, 0, 0)
         scrub_row.setSpacing(0)
         self.vid_prep_scrubber = QSlider(Qt.Horizontal)
         self.vid_prep_scrubber.setRange(0, 0)
-        self.vid_prep_scrubber.setMinimumHeight(36)
+        self.vid_prep_scrubber.setMinimumHeight(32)
         self.vid_prep_scrubber.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.vid_prep_scrubber.valueChanged.connect(self.on_vid_prep_scrubber_changed)
         scrub_row.addWidget(self.vid_prep_scrubber)
-        source_panel.addLayout(scrub_row)
         self.vid_prep_time_label = QLabel("00:00.000 / 00:00.000")
-        source_panel.addWidget(self.vid_prep_time_label)
 
         info_row = QHBoxLayout()
         self.vid_prep_file_label = QLabel("File: (none)")
@@ -4021,6 +4201,9 @@ class InstagramDownloaderGUI(QMainWindow):
         source_controls = QHBoxLayout()
         source_controls.setContentsMargins(0, 0, 0, 0)
         source_controls.setSpacing(4)
+        source_controls_secondary = QHBoxLayout()
+        source_controls_secondary.setContentsMargins(0, 0, 0, 0)
+        source_controls_secondary.setSpacing(4)
         self.vid_prep_source_play_btn = QPushButton("▶ Play")
         self.vid_prep_source_play_btn.setToolTip("Play input preview")
         self.vid_prep_source_play_btn.setFixedHeight(24)
@@ -4080,39 +4263,39 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_move_to_trim_in_btn.setFixedWidth(112)
         self.vid_prep_move_to_trim_in_btn.setToolTip("Move input timeline marker to current Trim In")
         self.vid_prep_move_to_trim_in_btn.clicked.connect(self.jump_vid_prep_source_to_trim_in)
-        source_controls.addWidget(self.vid_prep_move_to_trim_in_btn)
+        source_controls_secondary.addWidget(self.vid_prep_move_to_trim_in_btn)
 
         self.vid_prep_move_to_trim_out_btn = QPushButton("Move to Trim Out")
         self.vid_prep_move_to_trim_out_btn.setFixedHeight(24)
         self.vid_prep_move_to_trim_out_btn.setFixedWidth(118)
         self.vid_prep_move_to_trim_out_btn.setToolTip("Move input timeline marker to current Trim Out")
         self.vid_prep_move_to_trim_out_btn.clicked.connect(self.jump_vid_prep_source_to_trim_out)
-        source_controls.addWidget(self.vid_prep_move_to_trim_out_btn)
+        source_controls_secondary.addWidget(self.vid_prep_move_to_trim_out_btn)
 
         self.vid_prep_reset_trim_btn = QPushButton("Reset Trim")
         self.vid_prep_reset_trim_btn.setFixedHeight(24)
         self.vid_prep_reset_trim_btn.setFixedWidth(84)
         self.vid_prep_reset_trim_btn.setToolTip("Reset trim to encompass the full video")
         self.vid_prep_reset_trim_btn.clicked.connect(self.reset_vid_prep_trim_to_full_video)
-        source_controls.addWidget(self.vid_prep_reset_trim_btn)
+        source_controls_secondary.addWidget(self.vid_prep_reset_trim_btn)
 
-        source_controls.addWidget(QLabel("Input Vol:"))
+        source_controls_secondary.addWidget(QLabel("Input Vol:"))
         self.vid_prep_input_volume_slider = QSlider(Qt.Horizontal)
         self.vid_prep_input_volume_slider.setRange(0, 100)
         self.vid_prep_input_volume_slider.setValue(80)
         self.vid_prep_input_volume_slider.setFixedWidth(90)
         self.vid_prep_input_volume_slider.valueChanged.connect(self.on_vid_prep_input_volume_changed)
-        source_controls.addWidget(self.vid_prep_input_volume_slider)
+        source_controls_secondary.addWidget(self.vid_prep_input_volume_slider)
 
         self.vid_prep_input_mute_btn = QPushButton("🔇 Mute")
         self.vid_prep_input_mute_btn.setFixedHeight(24)
         self.vid_prep_input_mute_btn.setFixedWidth(72)
         self.vid_prep_input_mute_btn.setCheckable(True)
         self.vid_prep_input_mute_btn.toggled.connect(self.on_vid_prep_input_mute_toggled)
-        source_controls.addWidget(self.vid_prep_input_mute_btn)
+        source_controls_secondary.addWidget(self.vid_prep_input_mute_btn)
 
         source_controls.addStretch()
-        source_panel.addLayout(source_controls)
+        source_controls_secondary.addStretch()
 
         source_jump_row = QHBoxLayout()
         source_jump_row.setContentsMargins(0, 0, 0, 0)
@@ -4182,9 +4365,8 @@ class InstagramDownloaderGUI(QMainWindow):
         source_jump_row.addWidget(self.vid_prep_source_jump_last_btn)
 
         source_jump_row.addStretch()
-        source_panel.addLayout(source_jump_row)
 
-        source_panel.addWidget(QLabel("Trim Start / End"))
+        self.vid_prep_trim_title_label = QLabel("Trim Start / End")
         trim_row = QHBoxLayout()
         trim_row.setContentsMargins(0, 0, 0, 0)
         trim_row.setSpacing(0)
@@ -4192,20 +4374,32 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_trim_slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.vid_prep_trim_slider.range_changed.connect(self.on_vid_prep_trim_range_changed)
         trim_row.addWidget(self.vid_prep_trim_slider)
-        source_panel.addLayout(trim_row)
 
         self.vid_prep_trim_label = QLabel("Trim: full video")
         self.vid_prep_trim_label.setWordWrap(True)
-        source_panel.addWidget(self.vid_prep_trim_label)
 
-        source_panel.addLayout(info_row)
-        source_panel.addStretch()
+        source_bottom_controls_widget = QWidget()
+        source_bottom_controls = QVBoxLayout(source_bottom_controls_widget)
+        source_bottom_controls.setContentsMargins(0, 0, 0, 0)
+        source_bottom_controls.setSpacing(4)
+        source_bottom_controls.addWidget(self.vid_prep_input_timeline_label)
+        source_bottom_controls.addLayout(scrub_row)
+        source_bottom_controls.addWidget(self.vid_prep_time_label)
+        source_bottom_controls.addLayout(source_controls)
+        source_bottom_controls.addLayout(source_controls_secondary)
+        source_bottom_controls.addLayout(source_jump_row)
+        source_bottom_controls.addWidget(self.vid_prep_trim_title_label)
+        source_bottom_controls.addLayout(trim_row)
+        source_bottom_controls.addWidget(self.vid_prep_trim_label)
+        source_bottom_controls.addLayout(info_row)
+
+        source_panel.addWidget(source_bottom_controls_widget, 0)
 
         output_panel_widget = QWidget()
         output_panel = QVBoxLayout(output_panel_widget)
         output_panel.setContentsMargins(0, 0, 0, 0)
         self.vid_prep_output_display_stack = QStackedWidget()
-        self.vid_prep_output_display_stack.setMinimumHeight(vid_prep_panel_min_height)
+        self.vid_prep_output_display_stack.setMinimumHeight(vid_prep_output_panel_min_height)
         self.vid_prep_output_display_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.vid_prep_output_placeholder = QLabel("Output preview placeholder\n(Preview or save to render output)")
         self.vid_prep_output_placeholder.setAlignment(Qt.AlignCenter)
@@ -4222,24 +4416,19 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_display_stack.addWidget(self.vid_prep_output_image_label)
         self.vid_prep_output_display_stack.addWidget(self.vid_prep_output_video_widget)
         self.vid_prep_output_display_stack.setCurrentWidget(self.vid_prep_output_placeholder)
-        output_panel.addWidget(self.vid_prep_output_display_stack, 0, Qt.AlignTop)
+        output_panel.addWidget(self.vid_prep_output_display_stack, 1)
 
-        output_panel.addWidget(QLabel("Output Timeline"), 0, Qt.AlignTop)
-        output_timeline_row = QHBoxLayout()
-        self.vid_prep_output_scrubber = QSlider(Qt.Horizontal)
-        self.vid_prep_output_scrubber.setRange(0, 0)
-        self.vid_prep_output_scrubber.setMinimumHeight(36)
-        self.vid_prep_output_scrubber.sliderMoved.connect(self.seek_vid_prep_output)
-        output_timeline_row.addWidget(self.vid_prep_output_scrubber)
-        output_panel.addLayout(output_timeline_row)
-        self.vid_prep_output_time_label = QLabel("00:00.000 / 00:00.000")
-        output_panel.addWidget(self.vid_prep_output_time_label, 0, Qt.AlignTop)
-
-        output_panel.addStretch(1)
+        output_bottom_controls_widget = QWidget()
+        output_bottom_controls = QVBoxLayout(output_bottom_controls_widget)
+        output_bottom_controls.setContentsMargins(0, 0, 0, 0)
+        output_bottom_controls.setSpacing(2)
 
         output_controls = QHBoxLayout()
         output_controls.setContentsMargins(0, 0, 0, 0)
         output_controls.setSpacing(4)
+        output_controls_secondary = QHBoxLayout()
+        output_controls_secondary.setContentsMargins(0, 0, 0, 0)
+        output_controls_secondary.setSpacing(4)
         self.vid_prep_output_play_btn = QPushButton("▶ Play")
         self.vid_prep_output_play_btn.setToolTip("Play output preview")
         self.vid_prep_output_play_btn.setFixedHeight(24)
@@ -4274,19 +4463,49 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_output_mute_btn.toggled.connect(self.on_vid_prep_output_mute_toggled)
         output_controls.addWidget(self.vid_prep_output_mute_btn)
 
+        self.vid_prep_preview_stale_label = QLabel("Preview out of date")
+        self.vid_prep_preview_stale_label.setStyleSheet("font-size: 8pt; color: #d97706; font-weight: bold;")
+        output_controls.addWidget(self.vid_prep_preview_stale_label)
+
         self.vid_prep_render_progress = QProgressBar()
         self.vid_prep_render_progress.setMinimumWidth(180)
         self.vid_prep_render_progress.setMaximumWidth(260)
         self.vid_prep_render_progress.setTextVisible(True)
         self.vid_prep_render_progress.setVisible(False)
         self.vid_prep_render_progress.setFormat("Rendering...")
-        output_controls.addWidget(self.vid_prep_render_progress)
+        output_controls_secondary.addWidget(self.vid_prep_render_progress)
+
+        output_bottom_controls.addWidget(QLabel("Output Timeline"))
+        output_timeline_row = QHBoxLayout()
+        output_timeline_row.setContentsMargins(0, 0, 0, 0)
+        output_timeline_row.setSpacing(2)
+        self.vid_prep_output_scrubber = QSlider(Qt.Horizontal)
+        self.vid_prep_output_scrubber.setRange(0, 0)
+        self.vid_prep_output_scrubber.setMinimumHeight(24)
+        self.vid_prep_output_scrubber.sliderMoved.connect(self.seek_vid_prep_output)
+        output_timeline_row.addWidget(self.vid_prep_output_scrubber)
+        output_bottom_controls.addLayout(output_timeline_row)
+        self.vid_prep_output_time_label = QLabel("00:00.000 / 00:00.000")
+        self.vid_prep_output_time_label.setFixedHeight(18)
+        output_bottom_controls.addWidget(self.vid_prep_output_time_label)
 
         output_controls.addStretch()
-        output_panel.addLayout(output_controls)
+        output_controls_secondary.addStretch()
+        output_bottom_controls.addLayout(output_controls)
+        output_bottom_controls.addLayout(output_controls_secondary)
 
-        self.vid_prep_preview_stale_label = QLabel("Preview out of date")
-        self.vid_prep_preview_stale_label.setStyleSheet("font-size: 8pt; color: #d97706; font-weight: bold;")
+        # Keep both control stacks identical height so timelines align on the same y-line.
+        bottom_controls_height = max(
+            236,
+            int(source_bottom_controls_widget.sizeHint().height()),
+            int(output_bottom_controls_widget.sizeHint().height()),
+        )
+        source_bottom_controls_widget.setMinimumHeight(bottom_controls_height)
+        source_bottom_controls_widget.setMaximumHeight(bottom_controls_height)
+        output_bottom_controls_widget.setMinimumHeight(bottom_controls_height)
+        output_bottom_controls_widget.setMaximumHeight(bottom_controls_height)
+
+        output_panel.addWidget(output_bottom_controls_widget, 0)
 
         preview_splitter.addWidget(source_panel_widget)
         preview_splitter.addWidget(output_panel_widget)
@@ -4400,12 +4619,6 @@ class InstagramDownloaderGUI(QMainWindow):
         audio_mode_row.addWidget(self.vid_prep_audio_maintain_radio)
         audio_mode_row.addWidget(self.vid_prep_audio_mix_radio)
         audio_mode_row.addStretch()
-        tracks_layout.addLayout(audio_mode_row)
-
-        tracks_info = QLabel("Drag/drop audio files below. Reorder by dragging list rows. Track settings are saved with each exported video.")
-        tracks_info.setWordWrap(True)
-        tracks_layout.addWidget(tracks_info)
-
         track_actions = QHBoxLayout()
         self.vid_prep_audio_track_add_btn = QPushButton("Add Tracks...")
         self.vid_prep_audio_track_add_btn.clicked.connect(self.add_vid_prep_audio_tracks)
@@ -4418,10 +4631,11 @@ class InstagramDownloaderGUI(QMainWindow):
         track_actions.addWidget(self.vid_prep_audio_track_clear_btn)
         track_actions.addStretch()
         tracks_layout.addLayout(track_actions)
+        tracks_layout.addLayout(audio_mode_row)
 
         self.vid_prep_audio_track_list = AudioTrackTableWidget()
-        self.vid_prep_audio_track_list.setMinimumHeight(128)
-        self.vid_prep_audio_track_list.setMaximumHeight(188)
+        self.vid_prep_audio_track_list.setMinimumHeight(108)
+        self.vid_prep_audio_track_list.setMaximumHeight(168)
         self.vid_prep_audio_track_list.setToolTip("Drop audio files here to create tracks. Use the row buttons to move tracks up/down.")
         self.vid_prep_audio_track_list.setColumnCount(5)
         self.vid_prep_audio_track_list.setHorizontalHeaderLabels(["Track #", "File Name", "Track Position", "Mute", ""])
@@ -4987,9 +5201,7 @@ class InstagramDownloaderGUI(QMainWindow):
         top_row.addWidget(right_sidebar_scroll, 0)
         layout.addLayout(top_row, 10)
 
-        layout.addWidget(self.vid_prep_preview_stale_label)
-
-        self.vid_prep_status = QLabel("Drop a video to begin.")
+        self.vid_prep_status = QLabel("")
         layout.addWidget(self.vid_prep_status)
 
         self.vid_prep_output_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
@@ -5252,15 +5464,11 @@ class InstagramDownloaderGUI(QMainWindow):
         source_actions.addStretch(1)
         source_list_box.addLayout(source_actions)
 
-        self.framevid_source_list = QListWidget()
-        self.framevid_source_list.setAcceptDrops(True)
-        self.framevid_source_list.setDragEnabled(True)
-        self.framevid_source_list.setDropIndicatorShown(True)
-        self.framevid_source_list.setDefaultDropAction(Qt.MoveAction)
-        self.framevid_source_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.framevid_source_list = FrameVidSourceListWidget()
         self.framevid_source_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.framevid_source_list.currentItemChanged.connect(self.on_framevid_source_selection_changed)
         self.framevid_source_list.model().rowsMoved.connect(self.on_framevid_source_rows_moved)
+        self.framevid_source_list.files_dropped.connect(self.on_framevid_source_files_dropped)
         self.framevid_source_list.setMinimumHeight(220)
         self.framevid_source_list.setToolTip("Drop image/video files here. Reorder by dragging or using move buttons. Supports multi-select actions.")
         source_list_box.addWidget(self.framevid_source_list, 1)
@@ -5395,6 +5603,10 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_music_add_btn = QPushButton("Add Files...")
         self.framevid_music_add_btn.clicked.connect(self.add_framevid_music_files)
         music_actions.addWidget(self.framevid_music_add_btn)
+        self.framevid_music_preview_btn = QPushButton("▶ Preview")
+        self.framevid_music_preview_btn.clicked.connect(self.preview_selected_framevid_music)
+        self.framevid_music_preview_btn.setEnabled(False)
+        music_actions.addWidget(self.framevid_music_preview_btn)
         self.framevid_music_remove_btn = QPushButton("Remove")
         self.framevid_music_remove_btn.clicked.connect(self.remove_selected_framevid_music_file)
         music_actions.addWidget(self.framevid_music_remove_btn)
@@ -5414,6 +5626,10 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_effect_add_btn = QPushButton("Add Files...")
         self.framevid_effect_add_btn.clicked.connect(self.add_framevid_effect_files)
         effect_actions.addWidget(self.framevid_effect_add_btn)
+        self.framevid_effect_preview_btn = QPushButton("▶ Preview")
+        self.framevid_effect_preview_btn.clicked.connect(self.preview_selected_framevid_effect)
+        self.framevid_effect_preview_btn.setEnabled(False)
+        effect_actions.addWidget(self.framevid_effect_preview_btn)
         self.framevid_effect_remove_btn = QPushButton("Remove")
         self.framevid_effect_remove_btn.clicked.connect(self.remove_selected_framevid_effect_file)
         effect_actions.addWidget(self.framevid_effect_remove_btn)
@@ -5579,6 +5795,10 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_save_btn = QPushButton("Save Video...")
         self.framevid_save_btn.clicked.connect(self.save_framevid_video)
         preview_controls.addWidget(self.framevid_save_btn)
+        self.framevid_crop_to_max_image_checkbox = QCheckBox("Crop To Max Image Size")
+        self.framevid_crop_to_max_image_checkbox.setToolTip("Use the largest source image's dimensions as the output video size instead of the default 1080x1920, cropping other frames to fill it.")
+        self.framevid_crop_to_max_image_checkbox.toggled.connect(self.on_framevid_crop_to_max_image_toggled)
+        preview_controls.addWidget(self.framevid_crop_to_max_image_checkbox)
         self.framevid_render_progress = QProgressBar()
         self.framevid_render_progress.setMinimumWidth(220)
         self.framevid_render_progress.setMaximumWidth(320)
@@ -5598,6 +5818,10 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_player.durationChanged.connect(self.on_framevid_duration_changed)
         self.framevid_player.stateChanged.connect(self.on_framevid_player_state_changed)
         right_layout.addWidget(preview_group, 1)
+
+        self.framevid_audio_preview_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
+        self.framevid_audio_preview_player.stateChanged.connect(self.on_framevid_audio_preview_state_changed)
+        self.framevid_preview_audio_path = ''
 
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
@@ -5636,6 +5860,38 @@ class InstagramDownloaderGUI(QMainWindow):
         self.framevid_audio_add_btn.setEnabled(use_mp3)
         if not getattr(self, '_framevid_state_loading', False):
             self._save_framevid_state_setting()
+
+    def on_framevid_crop_to_max_image_toggled(self, _checked):
+        """Persist the Crop To Max Image Size preference."""
+        if not getattr(self, '_framevid_state_loading', False):
+            self._save_framevid_state_setting()
+
+    def _get_image_dimensions(self, file_path):
+        """Return (width, height) for an image file, or (0, 0) if it cannot be read."""
+        try:
+            reader = QImageReader(file_path)
+            size = reader.size()
+            if size.isValid() and size.width() > 0 and size.height() > 0:
+                return int(size.width()), int(size.height())
+        except Exception as e:
+            logger.debug(f"Failed to read image dimensions for {file_path}: {e}")
+        return 0, 0
+
+    def _get_framevid_max_image_dimensions(self, source_items):
+        """Return the largest width/height among image-type source items, or None if unavailable."""
+        max_w, max_h = 0, 0
+        for item_data in source_items:
+            if item_data.get('type') != 'image':
+                continue
+            path = str(item_data.get('path') or '')
+            if not path or not os.path.exists(path):
+                continue
+            width, height = self._get_image_dimensions(path)
+            max_w = max(max_w, width)
+            max_h = max(max_h, height)
+        if max_w > 0 and max_h > 0:
+            return max_w, max_h
+        return None
 
     def _current_framevid_audio_mode(self):
         """Return canonical FrameVid audio mode token."""
@@ -5931,6 +6187,10 @@ class InstagramDownloaderGUI(QMainWindow):
     def on_framevid_music_selection_changed(self, current, previous):
         """Update status for the selected music file."""
         item = current or self.framevid_music_list.currentItem()
+        self.framevid_music_preview_btn.setEnabled(bool(item and self._framevid_list_item_path(item)))
+        if not (item and self._framevid_list_item_path(item)) and hasattr(self, 'framevid_audio_preview_player'):
+            self.framevid_audio_preview_player.stop()
+            self.framevid_preview_audio_path = ''
         if not item:
             return
         path = self._framevid_list_item_path(item)
@@ -5966,11 +6226,60 @@ class InstagramDownloaderGUI(QMainWindow):
     def on_framevid_effect_selection_changed(self, current, previous):
         """Update status for the selected effect file."""
         item = current or self.framevid_effect_list.currentItem()
+        self.framevid_effect_preview_btn.setEnabled(bool(item and self._framevid_list_item_path(item)))
+        if not (item and self._framevid_list_item_path(item)) and hasattr(self, 'framevid_audio_preview_player'):
+            self.framevid_audio_preview_player.stop()
+            self.framevid_preview_audio_path = ''
         if not item:
             return
         path = self._framevid_list_item_path(item)
         if path:
             self.framevid_status_text(f"Effect selected: {os.path.basename(path)}")
+
+    def on_framevid_audio_preview_state_changed(self, state):
+        """Update preview button labels based on current playback state."""
+        is_playing = state == QMediaPlayer.PlayingState
+        if hasattr(self, 'framevid_music_preview_btn'):
+            self.framevid_music_preview_btn.setText("⏹ Stop" if is_playing else "▶ Preview")
+        if hasattr(self, 'framevid_effect_preview_btn'):
+            self.framevid_effect_preview_btn.setText("⏹ Stop" if is_playing else "▶ Preview")
+
+    def _preview_framevid_audio_path(self, selected_path):
+        """Preview/stop the given audio file using the shared FrameVid preview player."""
+        if not selected_path:
+            return
+
+        if not os.path.exists(selected_path):
+            QMessageBox.warning(self, "FrameVid", "Selected audio file does not exist on disk.")
+            return
+
+        current_state = self.framevid_audio_preview_player.state()
+        if (
+            current_state == QMediaPlayer.PlayingState
+            and os.path.normcase(self.framevid_preview_audio_path) == os.path.normcase(selected_path)
+        ):
+            self.framevid_audio_preview_player.stop()
+            self.framevid_preview_audio_path = ''
+            return
+
+        self.framevid_audio_preview_player.stop()
+        self.framevid_preview_audio_path = selected_path
+        self.framevid_audio_preview_player.setMedia(QMediaContent(QUrl.fromLocalFile(selected_path)))
+        self.framevid_audio_preview_player.play()
+
+    def preview_selected_framevid_music(self):
+        """Preview/stop the currently selected music selection file."""
+        item = self.framevid_music_list.currentItem()
+        if not item:
+            return
+        self._preview_framevid_audio_path(self._framevid_list_item_path(item))
+
+    def preview_selected_framevid_effect(self):
+        """Preview/stop the currently selected effect selection file."""
+        item = self.framevid_effect_list.currentItem()
+        if not item:
+            return
+        self._preview_framevid_audio_path(self._framevid_list_item_path(item))
 
     def _framevid_file_type(self, file_path):
         """Classify a FrameVid source file."""
@@ -6008,7 +6317,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 source_items.append({
                     'path': path,
                     'type': file_type,
-                    'duration_seconds': float(data.get('duration_seconds') or 3.0),
+                    'duration_seconds': float(data.get('duration_seconds') or 7.0),
                     'fade_in_seconds': float(data.get('fade_in_seconds') or 0.25),
                     'fade_out_seconds': float(data.get('fade_out_seconds') or 0.25),
                     'clip_start_seconds': float(data.get('clip_start_seconds') or 0.0),
@@ -6043,6 +6352,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 'source_current_row': int(self.framevid_source_list.currentRow()),
                 'audio_current_row': int(self.framevid_audio_track_list.currentRow()),
                 'audio_mode': self._current_framevid_audio_mode(),
+                'crop_to_max_image_size': bool(self.framevid_crop_to_max_image_checkbox.isChecked()),
             }
             self.save_ui_setting('framevid_state', json.dumps(state_payload))
         except Exception as e:
@@ -6087,7 +6397,7 @@ class InstagramDownloaderGUI(QMainWindow):
                 item.setData(Qt.UserRole, {
                     'path': file_path,
                     'type': file_type,
-                    'duration_seconds': float(entry.get('duration_seconds') or 3.0),
+                    'duration_seconds': float(entry.get('duration_seconds') or 7.0),
                     'fade_in_seconds': float(entry.get('fade_in_seconds') or 0.25),
                     'fade_out_seconds': float(entry.get('fade_out_seconds') or 0.25),
                     'clip_start_seconds': float(entry.get('clip_start_seconds') or 0.0),
@@ -6137,6 +6447,8 @@ class InstagramDownloaderGUI(QMainWindow):
             else:
                 self.framevid_audio_remove_radio.setChecked(True)
             self.update_framevid_audio_mode_ui()
+
+            self.framevid_crop_to_max_image_checkbox.setChecked(bool(parsed.get('crop_to_max_image_size')))
 
             source_row = int(parsed.get('source_current_row') or -1)
             if self.framevid_source_list.count() > 0:
@@ -6283,7 +6595,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if file_type == 'video':
             media_duration = max(0.0, float(self._get_media_duration_seconds(file_path) or 0.0))
 
-        duration_seconds = media_duration if (file_type == 'video' and media_duration > 0.0) else 3.0
+        duration_seconds = media_duration if (file_type == 'video' and media_duration > 0.0) else 7.0
 
         item = QListWidgetItem(os.path.basename(file_path))
         item.setToolTip(file_path)
@@ -6347,12 +6659,17 @@ class InstagramDownloaderGUI(QMainWindow):
 
     def add_framevid_source_files(self):
         """Browse for image/video files to add to FrameVid."""
+        start_dir = self.account_manager.get_setting('framevid_last_source_dir', '') or ''
+        if not os.path.isdir(start_dir):
+            start_dir = ''
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Add FrameVid Sources",
-            "",
+            start_dir,
             "Media Files (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff *.mp4 *.mov *.mkv *.m4v *.webm *.avi *.flv);;All Files (*)"
         )
+        if file_paths:
+            self.account_manager.set_setting('framevid_last_source_dir', os.path.dirname(file_paths[0]))
         self.on_framevid_source_files_dropped(file_paths)
 
     def on_framevid_source_files_dropped(self, file_paths):
@@ -7027,9 +7344,13 @@ class InstagramDownloaderGUI(QMainWindow):
 
     def save_framevid_video(self):
         default_name = "framevid_output.mp4"
+        last_save_dir = self.account_manager.get_setting('framevid_last_save_dir', '') or ''
+        if os.path.isdir(last_save_dir):
+            default_name = os.path.join(last_save_dir, default_name)
         output_path, _ = QFileDialog.getSaveFileName(self, "Save FrameVid Video", default_name, "Video Files (*.mp4);;All Files (*)")
         if not output_path:
             return
+        self.account_manager.set_setting('framevid_last_save_dir', str(Path(output_path).parent))
         self._framevid_set_render_progress(True, 0, 1)
         try:
             final_path = self._render_framevid_video(
@@ -7056,10 +7377,15 @@ class InstagramDownloaderGUI(QMainWindow):
 
         render_dir = Path(tempfile.mkdtemp(prefix='framevid_', dir=str(temp_parent)))
         segment_paths = []
-        target_w, target_h = 1080, 1920
         fps = 30
 
         source_items = self._framevid_source_items_in_order()
+        crop_to_max_image = bool(self.framevid_crop_to_max_image_checkbox.isChecked())
+        target_w, target_h = 1080, 1920
+        if crop_to_max_image:
+            max_dims = self._get_framevid_max_image_dimensions(source_items)
+            if max_dims:
+                target_w, target_h = max_dims
         audio_tracks = self._framevid_audio_tracks_in_order()
         audio_mode = self._current_framevid_audio_mode()
         include_source_audio = audio_mode in ('maintain', 'mix')
@@ -7084,9 +7410,18 @@ class InstagramDownloaderGUI(QMainWindow):
             segment_path = render_dir / f"segment_{index:03d}.mp4"
 
             fade_out_start = max(0.0, duration_s - fade_out_s)
+            if crop_to_max_image:
+                scale_and_frame_vf = (
+                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+                    f"crop={target_w}:{target_h}"
+                )
+            else:
+                scale_and_frame_vf = (
+                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black"
+                )
             vf = (
-                f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"{scale_and_frame_vf},"
                 f"fps={fps},format=yuv420p,"
                 f"fade=t=in:st=0:d={min(fade_in_s, duration_s):.3f},"
                 f"fade=t=out:st={fade_out_start:.3f}:d={min(fade_out_s, duration_s):.3f}"
@@ -8011,10 +8346,10 @@ class InstagramDownloaderGUI(QMainWindow):
             end_frame = int(round(track_duration_s * float(self.vid_prep_fps)))
 
         if int(self.vid_prep_frame_count or 0) > 0:
+            # Track timeline placement defaults to full video span.
+            # Audio clip length is handled independently via clip start/end values.
             max_frame = max(0, int(self.vid_prep_frame_count) - 1)
-            if end_frame <= 0:
-                end_frame = max_frame
-            end_frame = max(0, min(end_frame, max_frame))
+            end_frame = max_frame
 
         track = {
             'track_id': int(self.vid_prep_next_audio_track_id),
@@ -8031,6 +8366,19 @@ class InstagramDownloaderGUI(QMainWindow):
         }
         self.vid_prep_next_audio_track_id += 1
         return track
+
+    def _sync_vid_prep_track_windows_to_video_length(self):
+        """Clamp existing track timeline windows to current source video length."""
+        if int(self.vid_prep_frame_count or 0) <= 0:
+            return
+
+        max_frame = max(0, int(self.vid_prep_frame_count) - 1)
+        for track in self.vid_prep_audio_tracks:
+            enter_frame = int(track.get('enter_frame') or 0)
+            enter_frame = max(0, min(enter_frame, max_frame))
+            track['enter_frame'] = enter_frame
+            # New source video should define default track placement window.
+            track['exit_frame'] = max(enter_frame, max_frame)
 
     def _get_vid_prep_audio_duration_seconds(self, file_path):
         """Best-effort duration probe for an audio file in seconds."""
@@ -10536,6 +10884,8 @@ class InstagramDownloaderGUI(QMainWindow):
         self.vid_prep_trim_start_frame = 0
         self.vid_prep_trim_end_frame = max(0, self.vid_prep_frame_count - 1)
         self.update_vid_prep_trim_label()
+        self._sync_vid_prep_track_windows_to_video_length()
+        self._refresh_vid_prep_audio_track_list()
 
         ok, frame = self.vid_prep_cap.read()
         if not ok or frame is None:
@@ -11272,9 +11622,9 @@ class InstagramDownloaderGUI(QMainWindow):
 
         if audio_labels:
             audio_filters.append(f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=2[aout]")
-            cmd.extend(["-filter_complex", ";".join([video_filter] + audio_filters), "-map", "[v]", "-map", "[aout]", "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-c:a", "aac", "-shortest"])
+            cmd.extend(["-filter_complex", ";".join([video_filter] + audio_filters), "-map", "[v]", "-map", "[aout]", "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-c:a", "aac", "-t", f"{trim_duration:.3f}"])
         else:
-            cmd.extend(["-filter_complex", video_filter, "-map", "[v]", "-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf)])
+            cmd.extend(["-filter_complex", video_filter, "-map", "[v]", "-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-t", f"{trim_duration:.3f}"])
 
         cmd.append(str(output_path))
         return cmd
@@ -11620,6 +11970,20 @@ class InstagramDownloaderGUI(QMainWindow):
         self.settings_stop_duplicate_check.setToolTip("Stop loading new posts from Instagram when encountering a post already in database")
         app_layout.addWidget(self.settings_stop_duplicate_check)
 
+        batch_size_row = QHBoxLayout()
+        batch_size_row.addWidget(QLabel("Saved-post ingest batch size:"))
+        self.settings_saved_posts_batch_size_spin = QSpinBox()
+        self.settings_saved_posts_batch_size_spin.setRange(10, 500)
+        self.settings_saved_posts_batch_size_spin.setSingleStep(10)
+        self.settings_saved_posts_batch_size_spin.setValue(self.saved_posts_batch_size)
+        self.settings_saved_posts_batch_size_spin.setToolTip(
+            "Rows written per database batch during 'Download new Saved Posts'."
+        )
+        self.settings_saved_posts_batch_size_spin.valueChanged.connect(self.change_saved_posts_batch_size_from_settings)
+        batch_size_row.addWidget(self.settings_saved_posts_batch_size_spin)
+        batch_size_row.addStretch()
+        app_layout.addLayout(batch_size_row)
+
         # Soccr API client mode
         soccr_api_mode_row = QHBoxLayout()
         soccr_api_mode_row.addWidget(QLabel("Soccr API Client:"))
@@ -11836,6 +12200,16 @@ class InstagramDownloaderGUI(QMainWindow):
         self.auto_fetch_new_thumbnails = (state == Qt.Checked)
         self.account_manager.set_setting('auto_fetch_new_thumbnails', 'true' if self.auto_fetch_new_thumbnails else 'false')
         logger.info(f"Auto-fetch new thumbnails: {self.auto_fetch_new_thumbnails}")
+
+    def change_saved_posts_batch_size_from_settings(self, value):
+        """Persist saved-post ingest batch size from Settings tab."""
+        self.saved_posts_batch_size = max(10, min(500, int(value)))
+        self.account_manager.set_setting('saved_posts_batch_size', str(self.saved_posts_batch_size))
+        logger.info(f"Saved-post ingest batch size: {self.saved_posts_batch_size}")
+        if hasattr(self, 'settings_status'):
+            self.settings_status.setText(
+                f"Saved-post ingest batch size set to {self.saved_posts_batch_size}"
+            )
 
     def change_soccr_api_mode_from_settings(self, index):
         """Persist Soccr API client mode and host target from Settings tab."""
@@ -12116,98 +12490,137 @@ class InstagramDownloaderGUI(QMainWindow):
         self.login_thread.finished.connect(self.login_finished)
         self.login_thread.start()
     
-    def login_finished(self, success, message):
+    def _apply_instagram_manager_status(self):
+        """Reflect the manager's current runtime status in the UI."""
+        status = self.instagram_manager.get_runtime_status()
+        message = status.get('message') or ''
+        recommendation = status.get('recommendation') or ''
+        full_message = message if not recommendation else f"{message} Next: {recommendation}"
+
+        if hasattr(self, 'session_status'):
+            code = str(status.get('code') or '')
+            step = str(status.get('step') or '')
+            color = 'gray'
+            if step in ('session_valid', 'post_resolved', 'completed') or code in ('login_success', 'cookie_import_success', 'session_valid'):
+                color = 'green'
+            elif step in ('session_invalid', 'login_failed', 'failed') or 'error' in code or 'invalid' in code:
+                color = 'red'
+            elif 'started' in code or step in ('loading_session', 'validating_session', 'logging_in', 'importing_cookies', 'resolving_post', 'downloading_media'):
+                color = 'orange'
+            self.session_status.setText(full_message)
+            self.session_status.setStyleSheet(f"font-size: 9pt; color: {color}; padding: 0 10px;")
+
+        if message:
+            self.statusBar().showMessage(full_message)
+        return status
+
+    def _get_existing_account_paths(self, username):
+        """Return persisted account paths for reuse during login/session refresh."""
+        existing_account = self.account_manager.get_account(username)
+        if existing_account:
+            logger.info(f"Account {username} exists, preserving all existing paths")
+            return {
+                'existing_account': existing_account,
+                'download_path': existing_account.get('download_path'),
+                'debug_path': existing_account.get('debug_path'),
+                'thumbnails_path': existing_account.get('thumbnails_path'),
+                'topics_root_path': existing_account.get('topics_root_path'),
+                'root_folder': existing_account.get('root_folder'),
+            }
+
+        logger.info(f"NEW account {username}, no persisted paths yet")
+        return {
+            'existing_account': None,
+            'download_path': None,
+            'debug_path': None,
+            'thumbnails_path': None,
+            'topics_root_path': None,
+            'root_folder': None,
+        }
+
+    def _activate_account_session(self, account_name, ig_username, success_message):
+        """Bind a validated Instagram session to the current GUI state."""
+        path_info = self._get_existing_account_paths(account_name)
+        download_path = path_info['download_path']
+        thumbnails_path = path_info['thumbnails_path']
+
+        session_file = str(config.SESSIONS_DIR / f"{account_name}.session")
+        self.account_manager.save_account(
+            account_name,
+            session_file,
+            download_path=download_path,
+            debug_path=path_info['debug_path'],
+            ig_username=ig_username,
+            thumbnails_path=thumbnails_path,
+            topics_root_path=path_info['topics_root_path'],
+            root_folder=path_info['root_folder'],
+        )
+
+        # Set Instagram authentication status
+        self.instagram_authenticated = True
+        self.current_username = account_name
+        self.account_status.setText(f"✓ {account_name} (Instagram Connected)")
+        self.account_status.setStyleSheet("font-weight: bold; padding: 10px; color: green;")
+        self.content_db = ContentDatabaseManager(str(config.DATA_DIR), account_name)
+
+        if self.content_db and self.content_db.db:
+            try:
+                self.content_db.db.ensure_topic_assignments_table()
+            except Exception as e:
+                logger.error(f"Failed to create topic_assignments table: {e}")
+
+        self.load_accounts()
+
+        if download_path:
+            self.download_path_input.setText(download_path)
+            logger.info(f"Loaded download path: {download_path}")
+        else:
+            self.download_path_input.setText("")
+            self.download_path_input.setPlaceholderText("⚠️ Set download path in Settings tab")
+
+        if thumbnails_path:
+            self.thumbnails_path = thumbnails_path
+            logger.info(f"Loaded thumbnails path: {thumbnails_path}")
+        elif download_path:
+            dl_path = Path(download_path)
+            if dl_path.name == 'content':
+                self.thumbnails_path = str(dl_path.parent / ".thumbnails")
+            else:
+                self.thumbnails_path = str(dl_path / ".thumbnails")
+            logger.warning(f"No thumbnails_path in account data, using derived path: {self.thumbnails_path}")
+        else:
+            self.thumbnails_path = None
+
+        self.load_ui_settings()
+        self.restore_queue_from_database()
+        self.refresh_settings_paths()
+        
+        # Clear failed thumbnail tracking for new session
+        self.failed_thumbnail_downloads.clear()
+        
+        self.load_database_entries()
+        self.update_session_status()
+        self.statusBar().showMessage(success_message)
+        self._apply_instagram_manager_status()
+
+    def login_finished(self, success, message, ig_username):
         """Handle login completion"""
         self.login_btn.setEnabled(True)
         self.login_btn.setText("Login")
+        self._apply_instagram_manager_status()
         
         if success:
             username = self.username_input.text().strip()
-            session_file = str(config.SESSIONS_DIR / f"{username}.session")
-            
-            # Check if account already exists to preserve ALL its paths
-            existing_account = self.account_manager.get_account(username)
-            if existing_account:
-                # Account exists - preserve all paths
-                download_path = existing_account.get('download_path')
-                debug_path = existing_account.get('debug_path')
-                thumbnails_path = existing_account.get('thumbnails_path')
-                topics_root_path = existing_account.get('topics_root_path')
-                root_folder = existing_account.get('root_folder')
-                logger.info(f"Account {username} exists, preserving all existing paths")
-            else:
-                # NEW account - all paths will be None, account_manager will use defaults
-                download_path = None
-                debug_path = None
-                thumbnails_path = None
-                topics_root_path = None
-                root_folder = None
-                logger.info(f"NEW account {username}, will use default paths")
-            
-            self.account_manager.save_account(
-                username, 
-                session_file, 
-                download_path=download_path,
-                debug_path=debug_path,
-                ig_username=username,
-                thumbnails_path=thumbnails_path,
-                topics_root_path=topics_root_path
-            )
-            self.current_username = username
-            
-            # Initialize content database manager
-            self.content_db = ContentDatabaseManager(str(config.DATA_DIR), username)
-            
-            # Ensure topic assignments table exists
-            if self.content_db and self.content_db.db:
-                try:
-                    self.content_db.db.ensure_topic_assignments_table()
-                except Exception as e:
-                    logger.error(f"Failed to create topic_assignments table: {e}")
-            
-            # Update UI
-            self.account_status.setText(f"✓ Logged in as {username}")
-            self.account_status.setStyleSheet(
-                "font-weight: bold; padding: 10px; color: green;"
-            )
+            resolved_ig_username = ig_username or username
+            self._activate_account_session(username, resolved_ig_username, message)
             self.password_input.clear()
-            self.load_accounts()
-            
-            # Set download path
-            self.download_path_input.setText(download_path)
-            
-            # Load account's thumbnails path
-            thumbnails_path = existing_account.get('thumbnails_path') if existing_account else None
-            if thumbnails_path:
-                self.thumbnails_path = thumbnails_path
-                logger.info(f"Loaded thumbnails path: {thumbnails_path}")
-            else:
-                # Calculate default: if download_path ends with 'content', go up one level
-                dl_path = Path(download_path)
-                if dl_path.name == 'content':
-                    self.thumbnails_path = str(dl_path.parent / ".thumbnails")
-                else:
-                    self.thumbnails_path = str(dl_path / ".thumbnails")
-                logger.warning(f"No thumbnails_path in account data, using default: {self.thumbnails_path}")
-            
-            # Load UI settings for this account
-            self.load_ui_settings()
-            
-            # Restore download queue from database
-            self.restore_queue_from_database()
-            
-            # Refresh Settings tab with account paths
-            self.refresh_settings_paths()
-            logger.info("Settings tab paths refreshed after manual login")
-            
-            # Load saved content from database
-            self.load_database_entries()
-            
             QMessageBox.information(self, "Success", message)
-            self.statusBar().showMessage(f"Logged in as {username}")
         else:
-            QMessageBox.warning(self, "Login Failed", message)
-            self.statusBar().showMessage("Login failed")
+            status = self.instagram_manager.get_runtime_status()
+            recommendation = status.get('recommendation') or ''
+            detail = message if not recommendation else f"{message}\n\nNext: {recommendation}"
+            QMessageBox.warning(self, "Login Failed", detail)
+            self.statusBar().showMessage(detail)
     
     def import_session_from_json(self):
         """Import Instagram session from browser cookies JSON file"""
@@ -12261,118 +12674,32 @@ class InstagramDownloaderGUI(QMainWindow):
             with open(json_file, 'r') as f:
                 cookies = json.load(f)
             
-            # Extract sessionid and csrftoken
-            sessionid = None
-            csrftoken = None
+            # Keep the full instagram.com cookie set for Instaloader-native import.
+            cookie_dict = {}
             for cookie in cookies:
                 if isinstance(cookie, dict):
-                    if cookie.get('name') == 'sessionid':
-                        sessionid = cookie.get('value')
-                    elif cookie.get('name') == 'csrftoken':
-                        csrftoken = cookie.get('value')
-            
-            if not sessionid:
-                QMessageBox.critical(
-                    self,
-                    "Error",
-                    "Could not find 'sessionid' cookie in the JSON file.\n\n"
-                    "Make sure you exported cookies from instagram.com"
-                )
+                    name = str(cookie.get('name') or '').strip()
+                    value = cookie.get('value')
+                    if name and value is not None:
+                        cookie_dict[name] = str(value)
+
+            if not cookie_dict:
+                QMessageBox.critical(self, "Error", "No usable cookies were found in the JSON file.")
                 return
-            
-            if not csrftoken:
-                QMessageBox.critical(
-                    self,
-                    "Error",
-                    "Could not find 'csrftoken' cookie in the JSON file.\n\n"
-                    "Make sure you exported cookies from instagram.com"
-                )
-                return
-            
-            # Create session file with both required cookies
-            session_data = {
-                'sessionid': sessionid,
-                'csrftoken': csrftoken
-            }
             
             session_file = config.SESSIONS_DIR / f"{username}.session"
-            session_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(session_file, 'wb') as f:
-                pickle.dump(session_data, f)
-            
-            # Check if account already exists in database
-            existing_account = self.account_manager.get_account(username)
-            if existing_account:
-                # Preserve existing paths from database
-                logger.info(f"Account {username} exists - preserving paths from database")
-                download_path = existing_account.get('download_path')
-                thumbnails_path = existing_account.get('thumbnails_path')
-                topics_root_path = existing_account.get('topics_root_path')
-                root_folder = existing_account.get('root_folder')
-                debug_path = existing_account.get('debug_path')
+            result = self.instagram_manager.import_session_from_cookies(username, cookie_dict, session_file)
+            self._apply_instagram_manager_status()
+            if result.get('success'):
+                resolved_ig_username = result.get('ig_username') or username
+                self._activate_account_session(username, resolved_ig_username, result.get('message') or f"Session imported for {resolved_ig_username}")
+                QMessageBox.information(self, "Success", str(result.get('message') or 'Session imported successfully.'))
             else:
-                # New account - no paths yet
-                logger.info(f"New account {username} - user must set paths in Settings tab")
-                download_path = None
-                thumbnails_path = None
-                topics_root_path = None
-                root_folder = None
-                debug_path = None
-            
-            # Save account (will preserve existing paths or use None for new)
-            self.account_manager.save_account(
-                username, 
-                str(session_file), 
-                download_path=download_path,
-                ig_username=username, 
-                thumbnails_path=thumbnails_path,
-                topics_root_path=topics_root_path,
-                root_folder=root_folder,
-                debug_path=debug_path
-            )
-            
-            # Try to login with the session
-            if self.instagram_manager.login(username, "", session_file):
-                self.current_username = username
-                self.account_status.setText(f"✓ Logged in as {username}")
-                self.account_status.setStyleSheet(
-                    "font-weight: bold; padding: 10px; color: green;"
-                )
-                # Initialize content database manager
-                self.content_db = ContentDatabaseManager(str(config.DATA_DIR), username)
-                
-                # Load paths from database
-                if download_path:
-                    self.download_path_input.setText(download_path)
-                    self.thumbnails_path = thumbnails_path
-                    logger.info(f"Loaded existing paths from database")
-                else:
-                    self.download_path_input.setText("")
-                    self.download_path_input.setPlaceholderText("⚠️ Set download path in Settings tab")
-                    self.thumbnails_path = None
-                    logger.warning(f"No paths configured - user must set in Settings tab")
-                
-                self.load_accounts()
-                # Load saved content from database
-                self.load_database_entries()
-                
-                QMessageBox.information(
-                    self,
-                    "Success",
-                    f"Session imported successfully!\n\n"
-                    f"Logged in as {username}\n"
-                    f"Session saved to: {session_file.name}"
-                )
-                self.statusBar().showMessage(f"Session imported for {username}")
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Session Invalid",
-                    f"Session file created but login test failed.\n\n"
-                    f"The cookies may be expired or invalid.\n"
-                    f"Try logging into Instagram in your browser first."
-                )
+                detail = str(result.get('message') or 'Session import failed.')
+                recommendation = str(result.get('recommendation') or '')
+                if recommendation:
+                    detail = f"{detail}\n\nNext: {recommendation}"
+                QMessageBox.warning(self, "Session Invalid", detail)
         
         except json.JSONDecodeError:
             QMessageBox.critical(
@@ -12409,17 +12736,8 @@ class InstagramDownloaderGUI(QMainWindow):
             
             self.statusBar().showMessage(f"Extracting cookies from {browser_name}...")
             
-            # Try to extract cookies
-            sessionid = None
-            csrftoken = None
-            
             try:
                 cookies = browser_func(domain_name='instagram.com')
-                for cookie in cookies:
-                    if cookie.name == 'sessionid':
-                        sessionid = cookie.value
-                    elif cookie.name == 'csrftoken':
-                        csrftoken = cookie.value
             except Exception as e:
                 # Check for admin rights error
                 if 'RequiresAdminError' in str(type(e).__name__) or 'admin' in str(e).lower():
@@ -12439,11 +12757,12 @@ class InstagramDownloaderGUI(QMainWindow):
                 else:
                     raise
             
-            if not sessionid or not csrftoken:
+            cookie_names = {getattr(cookie, 'name', '') for cookie in cookies}
+            if 'sessionid' not in cookie_names or 'csrftoken' not in cookie_names:
                 missing = []
-                if not sessionid:
+                if 'sessionid' not in cookie_names:
                     missing.append('sessionid')
-                if not csrftoken:
+                if 'csrftoken' not in cookie_names:
                     missing.append('csrftoken')
                 
                 QMessageBox.critical(
@@ -12459,97 +12778,27 @@ class InstagramDownloaderGUI(QMainWindow):
                 )
                 self.statusBar().showMessage(f"No cookies found in {browser_name}")
                 return
-            
-            # Create session file with both required cookies
-            session_data = {
-                'sessionid': sessionid,
-                'csrftoken': csrftoken
-            }
-            
+
             session_file = config.SESSIONS_DIR / f"{username}.session"
-            session_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(session_file, 'wb') as f:
-                pickle.dump(session_data, f)
-            
-            # Check if account already exists in database
-            existing_account = self.account_manager.get_account(username)
-            if existing_account:
-                # Preserve existing paths from database
-                logger.info(f"Account {username} exists - preserving paths from database")
-                download_path = existing_account.get('download_path')
-                thumbnails_path = existing_account.get('thumbnails_path')
-                topics_root_path = existing_account.get('topics_root_path')
-                root_folder = existing_account.get('root_folder')
-                debug_path = existing_account.get('debug_path')
-            else:
-                # New account - no paths yet
-                logger.info(f"New account {username} - user must set paths in Settings tab")
-                download_path = None
-                thumbnails_path = None
-                topics_root_path = None
-                root_folder = None
-                debug_path = None
-            
-            # Save account (will preserve existing paths or use None for new)
-            self.account_manager.save_account(
-                username, 
-                str(session_file), 
-                download_path=download_path,
-                ig_username=username, 
-                thumbnails_path=thumbnails_path,
-                topics_root_path=topics_root_path,
-                root_folder=root_folder,
-                debug_path=debug_path
-            )
-            
-            # Try to login with the session
-            if self.instagram_manager.login(username, "", session_file):
-                self.current_username = username
-                self.account_status.setText(f"✓ Logged in as {username}")
-                self.account_status.setStyleSheet(
-                    "font-weight: bold; padding: 10px; color: green;"
-                )
-                # Initialize content database manager
-                self.content_db = ContentDatabaseManager(str(config.DATA_DIR), username)
-                
-                # Load paths from database
-                if download_path:
-                    self.download_path_input.setText(download_path)
-                    self.thumbnails_path = thumbnails_path
-                    logger.info(f"Loaded existing paths from database")
-                else:
-                    self.download_path_input.setText("")
-                    self.download_path_input.setPlaceholderText("⚠️ Set download path in Settings tab")
-                    self.thumbnails_path = None
-                    logger.warning(f"No paths configured - user must set in Settings tab")
-                
-                self.load_accounts()
-                # Load saved content from database
-                self.load_database_entries()
-                
+            result = self.instagram_manager.import_session_from_cookies(username, cookies, session_file)
+            self._apply_instagram_manager_status()
+            if result.get('success'):
+                resolved_ig_username = result.get('ig_username') or username
+                self._activate_account_session(username, resolved_ig_username, result.get('message') or f"Session extracted from {browser_name}")
                 QMessageBox.information(
                     self,
                     "Success",
-                    f"✅ Session imported successfully!\n\n"
-                    f"Logged in as {username}\n"
+                    f"✅ {result.get('message') or 'Session imported successfully!'}\n\n"
                     f"Cookies extracted from: {browser_name}\n"
-                    f"Session saved to: {session_file.name}\n\n"
-                    f"You can now download posts!"
+                    f"Session saved to: {session_file.name}"
                 )
-                self.statusBar().showMessage(f"Session extracted from {browser_name}")
             else:
-                QMessageBox.warning(
-                    self,
-                    "Session Invalid",
-                    f"Session file created but login test failed.\n\n"
-                    f"The cookies from {browser_name} may be expired or invalid.\n\n"
-                    f"Try:\n"
-                    f"• Logging into Instagram in {browser_name} again\n"
-                    f"• Getting fresh cookies\n"
-                    f"• Using the '🔧 Manual Import (F12)' button instead"
-                )
-                self.statusBar().showMessage(f"{browser_name} cookies invalid")
+                detail = str(result.get('message') or f'{browser_name} cookies invalid')
+                recommendation = str(result.get('recommendation') or '')
+                if recommendation:
+                    detail = f"{detail}\n\nNext: {recommendation}"
+                QMessageBox.warning(self, "Session Invalid", detail)
+                self.statusBar().showMessage(detail)
         
         except ImportError:
             QMessageBox.critical(
@@ -12685,92 +12934,29 @@ class InstagramDownloaderGUI(QMainWindow):
             return
         
         try:
-            # Create session file
-            session_data = {
+            cookie_dict = {
                 'sessionid': sessionid,
                 'csrftoken': csrftoken
             }
             
             session_file = config.SESSIONS_DIR / f"{username}.session"
-            session_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(session_file, 'wb') as f:
-                pickle.dump(session_data, f)
-            
-            # Check if account already exists in database
-            existing_account = self.account_manager.get_account(username)
-            if existing_account:
-                # Preserve existing paths from database
-                logger.info(f"Account {username} exists - preserving paths from database")
-                download_path = existing_account.get('download_path')
-                thumbnails_path = existing_account.get('thumbnails_path')
-                topics_root_path = existing_account.get('topics_root_path')
-                root_folder = existing_account.get('root_folder')
-                debug_path = existing_account.get('debug_path')
-            else:
-                # New account - no paths yet
-                logger.info(f"New account {username} - user must set paths in Settings tab")
-                download_path = None
-                thumbnails_path = None
-                topics_root_path = None
-                root_folder = None
-                debug_path = None
-            
-            # Save account (will preserve existing paths or use None for new)
-            self.account_manager.save_account(
-                username, 
-                str(session_file), 
-                download_path=download_path,
-                ig_username=username, 
-                thumbnails_path=thumbnails_path,
-                topics_root_path=topics_root_path,
-                root_folder=root_folder,
-                debug_path=debug_path
-            )
-            
-            # Try to login with the session
-            if self.instagram_manager.login(username, "", session_file):
-                self.current_username = username
-                self.account_status.setText(f"✓ Logged in as {username}")
-                self.account_status.setStyleSheet(
-                    "font-weight: bold; padding: 10px; color: green;"
-                )
-                # Initialize content database manager
-                self.content_db = ContentDatabaseManager(str(config.DATA_DIR), username)
-                
-                # Load paths from database
-                if download_path:
-                    self.download_path_input.setText(download_path)
-                    self.thumbnails_path = thumbnails_path
-                    logger.info(f"Loaded existing paths from database")
-                else:
-                    self.download_path_input.setText("")
-                    self.download_path_input.setPlaceholderText("⚠️ Set download path in Settings tab")
-                    self.thumbnails_path = None
-                    logger.warning(f"No paths configured - user must set in Settings tab")
-                
-                self.load_accounts()
-                # Load saved content from database
-                self.load_database_entries()
-                
+            result = self.instagram_manager.import_session_from_cookies(username, cookie_dict, session_file)
+            self._apply_instagram_manager_status()
+            if result.get('success'):
+                resolved_ig_username = result.get('ig_username') or username
+                self._activate_account_session(username, resolved_ig_username, result.get('message') or f"Manually imported session for {resolved_ig_username}")
                 QMessageBox.information(
                     self,
                     "Success",
-                    f"✅ Session imported successfully!\n\n"
-                    f"Logged in as {username}\n"
-                    f"Session saved to: {session_file.name}\n\n"
-                    f"You can now download posts!"
+                    f"✅ {result.get('message') or 'Session imported successfully!'}\n\n"
+                    f"Session saved to: {session_file.name}"
                 )
-                self.statusBar().showMessage(f"Manually imported session for {username}")
-                self.update_session_status()
             else:
-                QMessageBox.warning(
-                    self,
-                    "Session Invalid",
-                    f"Session file created but login test failed.\n\n"
-                    f"The cookies may be expired or invalid.\n\n"
-                    f"Try copying fresh cookies from your browser."
-                )
+                detail = str(result.get('message') or 'Session import failed.')
+                recommendation = str(result.get('recommendation') or '')
+                if recommendation:
+                    detail = f"{detail}\n\nNext: {recommendation}"
+                QMessageBox.warning(self, "Session Invalid", detail)
         
         except Exception as e:
             QMessageBox.critical(
@@ -12911,70 +13097,96 @@ class InstagramDownloaderGUI(QMainWindow):
             self.accounts_list.addItem(item)
     
     def switch_account(self, item):
-        """Switch to a different saved account"""
+        """Switch to a different saved account - with choice of online or offline mode"""
         account = item.data(Qt.UserRole)
         username = account['username']
         ig_username = account.get('ig_username') or username  # Use IG username, fallback to account name
         session_file = Path(account['session_file'])
         
-        self.statusBar().showMessage(f"Switching to {username}...")
+        # Ask user: connect to Instagram or offline mode?
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Account Access Mode")
+        msg_box.setText(f"How would you like to access account '{username}'?")
+        msg_box.setInformativeText(
+            "• Connect to Instagram: Required to fetch new posts\n"
+            "• Local Data Only: Browse already-downloaded content offline"
+        )
+        
+        online_btn = msg_box.addButton("Connect to Instagram", QMessageBox.ActionRole)
+        offline_btn = msg_box.addButton("Local Data Only", QMessageBox.ActionRole)
+        cancel_btn = msg_box.addButton(QMessageBox.Cancel)
+        
+        msg_box.exec_()
+        clicked = msg_box.clickedButton()
+        
+        if clicked == cancel_btn:
+            return
+        
+        if clicked == offline_btn:
+            # Offline mode - no Instagram authentication required
+            self.select_account_for_local_access(account, load_database=True)
+            return
+        
+        # Online mode - attempt Instagram authentication
+        self.statusBar().showMessage(f"Connecting to Instagram as {username}...")
+        
+        if not session_file.exists():
+            QMessageBox.warning(
+                self,
+                "Session File Missing",
+                f"Session file not found for {username}.\n\n"
+                f"You'll need to log in again or import a new session."
+            )
+            # Fall back to offline mode
+            self.select_account_for_local_access(account, load_database=True)
+            return
         
         # Try to login with saved session
-        if self.instagram_manager.login(ig_username, "", session_file):
-            self.current_username = username
-            self.account_status.setText(f"✓ Logged in as {username}")
+        login_result = self.instagram_manager.login_detailed(ig_username, "", session_file)
+        self._apply_instagram_manager_status()
+        
+        if login_result.get('success'):
+            # Instagram authentication successful
+            self.instagram_authenticated = True
+            self.account_status.setText(f"✓ {username} (Instagram Connected)")
             self.account_status.setStyleSheet(
                 "font-weight: bold; padding: 10px; color: green;"
             )
-            # Initialize content database manager
-            self.content_db = ContentDatabaseManager(str(config.DATA_DIR), username)
-            self.statusBar().showMessage(f"Switched to {username}")
+            self.statusBar().showMessage(f"Connected to Instagram as {username}")
             
-            # Load account's download path
-            download_path = account.get('download_path')
-            if download_path:
-                self.download_path_input.setText(download_path)
-                logger.info(f"Loaded download path: {download_path}")
-            
-            # Load account's thumbnails path
-            thumbnails_path = account.get('thumbnails_path')
-            if thumbnails_path:
-                self.thumbnails_path = thumbnails_path
-                logger.info(f"Loaded thumbnails path: {thumbnails_path}")
-            else:
-                # No thumbnails path set - user must configure in Settings
-                if download_path:
-                    # Try to calculate from download_path
-                    dl_path = Path(download_path)
-                    if dl_path.name == 'content':
-                        self.thumbnails_path = str(dl_path.parent / ".thumbnails")
-                    else:
-                        self.thumbnails_path = str(dl_path / ".thumbnails")
-                    logger.warning(f"No thumbnails_path in account data, calculated from download_path: {self.thumbnails_path}")
-                else:
-                    # No download_path either - leave as None
-                    self.thumbnails_path = None
-                    logger.error("⚠️ No thumbnails_path OR download_path set - user MUST configure paths in Settings tab")
-            
-            # Load UI settings for this account
-            self.load_ui_settings()
-            
-            # Refresh Settings tab with account paths
-            self.refresh_settings_paths()
-            logger.info("Settings tab paths refreshed after account switch")
-            
-            # Load saved content from database
-            self.load_database_entries()
+            # Initialize account data
+            self.select_account_for_local_access(account, load_database=True)
         else:
-            QMessageBox.warning(
-                self,
-                "Session Expired",
-                f"Session expired for {username}. Please login again."
+            # Instagram login failed - offer to continue offline or retry
+            detail = str(login_result.get('message') or f'Session expired for {username}.')
+            recommendation = str(login_result.get('recommendation') or '')
+            
+            retry_msg_box = QMessageBox(self)
+            retry_msg_box.setWindowTitle("Instagram Connection Failed")
+            retry_msg_box.setText(f"Could not connect to Instagram for '{username}'.")
+            retry_msg_box.setInformativeText(
+                f"{detail}\n\n"
+                f"{recommendation}\n\n"
+                f"You can still access your local data offline, or refresh your session and try again."
             )
-            self.username_input.setText(username)
-            accounts_tab_index = self.tabs.indexOf(self.accounts_tab)
-            if accounts_tab_index >= 0:
-                self.tabs.setCurrentIndex(accounts_tab_index)
+            
+            offline_btn2 = retry_msg_box.addButton("Use Offline Mode", QMessageBox.ActionRole)
+            refresh_btn = retry_msg_box.addButton("Refresh Session", QMessageBox.ActionRole)
+            cancel_btn2 = retry_msg_box.addButton(QMessageBox.Cancel)
+            
+            retry_msg_box.exec_()
+            retry_clicked = retry_msg_box.clickedButton()
+            
+            if retry_clicked == offline_btn2:
+                # Continue in offline mode
+                self.select_account_for_local_access(account, load_database=True)
+            elif retry_clicked == refresh_btn:
+                # Go to accounts tab for session refresh
+                self.username_input.setText(username)
+                accounts_tab_index = self.tabs.indexOf(self.accounts_tab)
+                if accounts_tab_index >= 0:
+                    self.tabs.setCurrentIndex(accounts_tab_index)
+            # else: cancel - do nothing
     
     def delete_account(self):
         """Delete selected account"""
@@ -13354,19 +13566,19 @@ class InstagramDownloaderGUI(QMainWindow):
     
     def load_saved_posts(self):
         """Load saved posts from Instagram"""
-        if not self.instagram_manager.logged_in:
+        if not self.instagram_authenticated:
             QMessageBox.warning(
                 self,
-                "Not Logged In",
-                "Please login to an account first"
+                "Instagram Connection Required",
+                "Fetching new posts from Instagram requires an active connection.\n\n"
+                "Please switch to your account and choose 'Connect to Instagram' mode,\n"
+                "or log in with a valid session.\n\n"
+                "Note: You can browse already-downloaded content in 'Local Data Only' mode."
             )
             accounts_tab_index = self.tabs.indexOf(self.accounts_tab)
             if accounts_tab_index >= 0:
                 self.tabs.setCurrentIndex(accounts_tab_index)
             return
-        
-        # Show hourglass cursor for this blocking operation
-        QApplication.setOverrideCursor(Qt.WaitCursor)
         
         # Build set of already-loaded shortcodes for faster duplicate checking
         existing_shortcodes = {post.get('shortcode') for post in self.saved_posts}
@@ -13390,9 +13602,21 @@ class InstagramDownloaderGUI(QMainWindow):
             'Database ingest: Fetching and inserting saved posts',
             thread=None
         )
+        self.process_manager.update_process(
+            self.load_saved_process_id,
+            status='Connecting to Instagram saved posts...',
+            current=0,
+            total=0
+        )
         
         # Run in background thread
-        self.load_thread = LoadSavedThread(self.instagram_manager, self.content_db, self.stop_at_first_duplicate, existing_shortcodes)
+        self.load_thread = LoadSavedThread(
+            self.instagram_manager,
+            self.content_db,
+            self.stop_at_first_duplicate,
+            existing_shortcodes,
+            batch_size=self.saved_posts_batch_size,
+        )
         self.load_thread.post_loaded.connect(self.add_post_to_list)
         self.load_thread.duplicate_post_loaded.connect(self.add_duplicate_post_to_list)
         self.load_thread.progress.connect(self.update_load_progress)
@@ -13458,6 +13682,23 @@ class InstagramDownloaderGUI(QMainWindow):
         
         # Column 0: Thumbnail
         shortcode = post.get('shortcode', 'unknown')
+
+        # Surface shortcode-level progress while ingesting saved posts.
+        if self.fetch_in_progress and hasattr(self, 'load_saved_process_id'):
+            process = self.process_manager.get_process(self.load_saved_process_id) or {}
+            current = int(process.get('current', 0) or 0)
+            total = int(process.get('total', 0) or 0)
+            if total > 0:
+                status_msg = f"Processing row {current} of {total}: loaded {shortcode}"
+            else:
+                status_msg = f"Loaded row for {shortcode}"
+            self.process_manager.update_process(
+                self.load_saved_process_id,
+                status=status_msg,
+                current=current,
+                total=total,
+            )
+
         thumbnail_label = self.create_thumbnail_widget(shortcode, post)
         self.posts_table.setCellWidget(row, 0, thumbnail_label)
         
@@ -13692,6 +13933,22 @@ class InstagramDownloaderGUI(QMainWindow):
         
         # Column 0: Thumbnail
         shortcode = post.get('shortcode', 'unknown')
+
+        if self.fetch_in_progress and hasattr(self, 'load_saved_process_id'):
+            process = self.process_manager.get_process(self.load_saved_process_id) or {}
+            current = int(process.get('current', 0) or 0)
+            total = int(process.get('total', 0) or 0)
+            if total > 0:
+                status_msg = f"Processing row {current} of {total}: skipped duplicate {shortcode}"
+            else:
+                status_msg = f"Skipped duplicate {shortcode}"
+            self.process_manager.update_process(
+                self.load_saved_process_id,
+                status=status_msg,
+                current=current,
+                total=total,
+            )
+
         thumbnail_label = self.create_thumbnail_widget(shortcode, post)
         self.posts_table.setCellWidget(row, 0, thumbnail_label)
         
@@ -13770,31 +14027,24 @@ class InstagramDownloaderGUI(QMainWindow):
         font.setBold(True)
         return font
     
-    def update_load_progress(self, processed_count, total_count, new_count, skipped_count, batch_size):
+    def update_load_progress(self, processed_count, discovered_count, new_count, existing_db_count, skipped_ui_count, batch_size):
         """Update Process Manager with loading progress"""
         if hasattr(self, 'load_saved_process_id'):
-            # Update process with status showing progress
-            status_msg = (
-                f"Processing {processed_count} of {total_count}, "
-                f"{new_count} new, {skipped_count} skipped. "
-                f"Batch size {batch_size}"
-            )
+            if discovered_count > 0:
+                status_msg = (
+                    f"Processing row {processed_count} of {discovered_count} found so far "
+                    f"({new_count} new saved, {existing_db_count} already in DB, "
+                    f"{skipped_ui_count} already in list)"
+                )
+            else:
+                status_msg = f"Discovering saved posts... found {processed_count} so far"
+
             self.process_manager.update_process(
                 self.load_saved_process_id,
-                status='running',
+                status=status_msg,
                 current=processed_count,
-                total=total_count
+                total=discovered_count
             )
-            # Update process description dynamically
-            if self.load_saved_process_id in self.process_manager.processes:
-                self.process_manager.processes[self.load_saved_process_id]['description'] = status_msg
-                # Emit update to refresh UI
-                self.process_manager.process_updated.emit(
-                    self.load_saved_process_id,
-                    'running',
-                    processed_count,
-                    total_count
-                )
     
     def load_posts_finished(self, count):
         """Handle posts loading completion"""
@@ -13822,9 +14072,6 @@ class InstagramDownloaderGUI(QMainWindow):
             self.update_pagination_controls()
             self.posts_added_since_pagination_update = 0
             logger.info(f"Final pagination update: total_items={self.total_items}")
-        
-        # Restore cursor after operation completes
-        QApplication.restoreOverrideCursor()
         
         # Update filtered posts after fetching from Instagram
         self.filtered_posts = self.saved_posts.copy()
@@ -13881,9 +14128,6 @@ class InstagramDownloaderGUI(QMainWindow):
             self.posts_added_since_pagination_update = 0
             logger.info(f"Final pagination update (error): total_items={self.total_items}")
         
-        # Restore cursor
-        QApplication.restoreOverrideCursor()
-        
         self.browse_status.setText("Error loading posts")
         QMessageBox.critical(self, "Error", error)
 
@@ -13928,7 +14172,32 @@ class InstagramDownloaderGUI(QMainWindow):
             f'Thumbnail update: Backfilling missing thumbnails ({len(candidates)} items)',
             None
         )
-        self.process_manager.update_process(process_id, status='running', current=0, total=len(candidates))
+        self.process_manager.update_process(
+            process_id,
+            status=self._format_thumbnail_process_status(
+                "thumbnail-backfill",
+                current=0,
+                total=len(candidates),
+                saved=0,
+                failed=0,
+                skipped=0,
+            ),
+            current=0,
+            total=len(candidates),
+        )
+        self.process_manager.update_process(
+            process_id,
+            status=self._format_thumbnail_process_status(
+                "thumbnail-backfill",
+                current=0,
+                total=len(candidates),
+                saved=0,
+                failed=0,
+                skipped=0,
+            ),
+            current=0,
+            total=len(candidates)
+        )
 
         if self.stop_thumbnail_downloads:
             self.stop_thumbnail_downloads = False
@@ -13946,7 +14215,9 @@ class InstagramDownloaderGUI(QMainWindow):
             cooldown_min_s = 12.0
             cooldown_max_s = 24.0
 
-            completed = 0
+            saved_count = 0
+            failed_count = 0
+            reason_counts = self._new_thumbnail_reason_counts()
             requests_since_break = 0
             next_break_after = random.randint(burst_min, burst_max)
 
@@ -13957,17 +14228,64 @@ class InstagramDownloaderGUI(QMainWindow):
             for index, (shortcode, post) in enumerate(candidates):
                 if self.stop_thumbnail_downloads:
                     logger.info("[THUMBNAIL_BACKFILL] Stopped by user")
-                    self.process_manager.update_process(process_id, status='cancelled', current=completed, total=len(candidates))
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-backfill-cancelled",
+                            current=saved_count + failed_count,
+                            total=len(candidates),
+                            saved=saved_count,
+                            failed=failed_count,
+                            skipped=max(0, len(candidates) - (saved_count + failed_count)),
+                            reason_counts=reason_counts,
+                        ),
+                        current=saved_count + failed_count,
+                        total=len(candidates)
+                    )
                     QTimer.singleShot(3000, lambda: self.process_manager.remove_process(process_id))
                     return
 
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-backfill",
+                        current=index,
+                        total=len(candidates),
+                        saved=saved_count,
+                        failed=failed_count,
+                        skipped=0,
+                        shortcode=shortcode,
+                            reason_counts=reason_counts,
+                    ),
+                    current=index,
+                    total=len(candidates)
+                )
+
                 try:
-                    self.download_thumbnail_async(shortcode, post)
-                    completed += 1
+                    success = self.download_thumbnail_async(shortcode, post, reason_counts=reason_counts)
+                    if success:
+                        saved_count += 1
+                    else:
+                        failed_count += 1
                 except Exception as e:
                     logger.error(f"[THUMBNAIL_BACKFILL] Error for {shortcode}: {e}")
+                    failed_count += 1
                 finally:
-                    self.process_manager.update_process(process_id, current=index + 1, total=len(candidates))
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-backfill",
+                            current=index + 1,
+                            total=len(candidates),
+                            saved=saved_count,
+                            failed=failed_count,
+                            skipped=0,
+                            shortcode=shortcode,
+                            reason_counts=reason_counts,
+                        ),
+                        current=index + 1,
+                        total=len(candidates)
+                    )
 
                 if index >= len(candidates) - 1:
                     continue
@@ -13985,16 +14303,24 @@ class InstagramDownloaderGUI(QMainWindow):
 
             self.process_manager.update_process(
                 process_id,
-                status='completed',
+                status=self._format_thumbnail_process_status(
+                    "thumbnail-backfill-complete",
+                    current=len(candidates),
+                    total=len(candidates),
+                    saved=saved_count,
+                    failed=failed_count,
+                    skipped=0,
+                    reason_counts=reason_counts,
+                ),
                 current=len(candidates),
                 total=len(candidates)
             )
             QTimer.singleShot(3000, lambda: self.process_manager.remove_process(process_id))
-            logger.info(f"[THUMBNAIL_BACKFILL] Completed {completed}/{len(candidates)}")
+            logger.info(f"[THUMBNAIL_BACKFILL] Completed saved={saved_count}, failed={failed_count}, total={len(candidates)}")
 
             try:
                 self.statusBar().showMessage(
-                    f"Thumbnail backfill complete: {completed}/{len(candidates)}",
+                    f"Thumbnail backfill complete: saved {saved_count}, failed {failed_count}, total {len(candidates)}",
                     5000
                 )
             except RuntimeError:
@@ -14509,8 +14835,72 @@ class InstagramDownloaderGUI(QMainWindow):
             self.topic_filter_combo.addItem("All Topics", None)
         
         self.topic_filter_combo.blockSignals(False)
+
+    def _format_thumbnail_process_status(self, phase, current, total, saved=0, failed=0, skipped=0, shortcode='', reason_counts=None):
+        """Build a compact, consistent thumbnail process status line."""
+        total_safe = max(0, int(total or 0))
+        current_safe = max(0, int(current or 0))
+        saved_safe = max(0, int(saved or 0))
+        failed_safe = max(0, int(failed or 0))
+        skipped_safe = max(0, int(skipped or 0))
+        base = (
+            f"{phase} [{current_safe}/{total_safe}] "
+            f"saved:{saved_safe} failed:{failed_safe} skipped:{skipped_safe}"
+        )
+
+        if isinstance(reason_counts, dict):
+            c_403 = int(reason_counts.get('403', 0) or 0)
+            c_parse = int(reason_counts.get('parse-miss', 0) or 0)
+            c_timeout = int(reason_counts.get('timeout', 0) or 0)
+            c_decode = int(reason_counts.get('decode-fail', 0) or 0)
+            reason_pairs = [
+                ('403', c_403),
+                ('parse-miss', c_parse),
+                ('timeout', c_timeout),
+                ('decode-fail', c_decode),
+            ]
+            nonzero_pairs = [pair for pair in reason_pairs if pair[1] > 0]
+            if nonzero_pairs:
+                top_reason, top_count = max(nonzero_pairs, key=lambda item: item[1])
+                base += (
+                    f" reasons:403={c_403},parse={c_parse},timeout={c_timeout},decode={c_decode}"
+                    f" top:{top_reason}={top_count}"
+                )
+
+        short = str(shortcode or '').strip()
+        return f"{base} | {short}" if short else base
+
+    def _normalize_thumbnail_failure_reason(self, reason: str) -> str:
+        """Normalize raw thumbnail failure reason into tracked buckets."""
+        value = str(reason or '').strip().lower()
+        if value == '403':
+            return '403'
+        if value == 'parse-miss':
+            return 'parse-miss'
+        if value == 'timeout':
+            return 'timeout'
+        if value == 'decode-fail':
+            return 'decode-fail'
+        return 'other'
+
+    def _new_thumbnail_reason_counts(self):
+        """Create a fresh reason counter map for thumbnail processes."""
+        return {
+            '403': 0,
+            'parse-miss': 0,
+            'timeout': 0,
+            'decode-fail': 0,
+            'other': 0,
+        }
+
+    def _increment_thumbnail_reason_count(self, reason_counts, reason):
+        """Increment reason counter in-place after normalizing label."""
+        if not isinstance(reason_counts, dict):
+            return
+        key = self._normalize_thumbnail_failure_reason(reason)
+        reason_counts[key] = int(reason_counts.get(key, 0) or 0) + 1
     
-    def download_thumbnail_async(self, shortcode, post, process_id=None, force_redownload=False):
+    def download_thumbnail_async(self, shortcode, post, process_id=None, force_redownload=False, reason_counts=None):
         """Download thumbnail in background thread
         
         Args:
@@ -14523,15 +14913,43 @@ class InstagramDownloaderGUI(QMainWindow):
         from pathlib import Path
         from threading import current_thread
         
+        clean_shortcode = str(shortcode or '').replace('✓ ', '').strip()
+
         # Update process status if tracking
         if process_id:
-            self.process_manager.update_process(process_id, status='running', current=0, total=1)
+            self.process_manager.update_process(
+                process_id,
+                status=self._format_thumbnail_process_status(
+                    "thumbnail",
+                    current=0,
+                    total=1,
+                    saved=0,
+                    failed=0,
+                    skipped=0,
+                    shortcode=clean_shortcode or shortcode,
+                ),
+                current=0,
+                total=1,
+            )
         
         # Check if thumbnails are stopped
         if self.stop_thumbnail_downloads:
             logger.debug(f"Thumbnail download stopped for {shortcode}")
             if process_id:
-                self.process_manager.update_process(process_id, status='cancelled')
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-cancelled",
+                        current=1,
+                        total=1,
+                        saved=0,
+                        failed=0,
+                        skipped=1,
+                        shortcode=clean_shortcode or shortcode,
+                    ),
+                    current=1,
+                    total=1,
+                )
                 self.process_manager.remove_process(process_id)
             # Remove this thread from tracking
             try:
@@ -14542,7 +14960,20 @@ class InstagramDownloaderGUI(QMainWindow):
         
         if not self.instagram_manager or not self.content_db:
             if process_id:
-                self.process_manager.update_process(process_id, status='failed')
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-failed",
+                        current=1,
+                        total=1,
+                        saved=0,
+                        failed=1,
+                        skipped=0,
+                        shortcode=clean_shortcode or shortcode,
+                    ),
+                    current=1,
+                    total=1,
+                )
                 self.process_manager.remove_process(process_id)
             # Remove this thread from tracking
             try:
@@ -14550,9 +14981,6 @@ class InstagramDownloaderGUI(QMainWindow):
             except ValueError:
                 pass
             return False
-        
-        # Strip any prefix markers (✓, etc.)
-        clean_shortcode = shortcode.replace('✓ ', '').strip()
         
         # Use thumbnails_path from account if available, otherwise calculate default
         if hasattr(self, 'thumbnails_path') and self.thumbnails_path:
@@ -14572,7 +15000,20 @@ class InstagramDownloaderGUI(QMainWindow):
                     error_msg + "\n\nPlease set a download path in the Settings tab."
                 )
                 if process_id:
-                    self.process_manager.update_process(process_id, status='failed')
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-failed",
+                            current=1,
+                            total=1,
+                            saved=0,
+                            failed=1,
+                            skipped=0,
+                            shortcode=clean_shortcode,
+                        ),
+                        current=1,
+                        total=1,
+                    )
                     self.process_manager.remove_process(process_id)
                 try:
                     self.thumbnail_threads.remove(current_thread())
@@ -14612,6 +15053,9 @@ class InstagramDownloaderGUI(QMainWindow):
                 
                 # Clear in-memory cache so UI won't reuse stale pixmap
                 self.thumbnail_cache.pop(clean_shortcode, None)
+                
+                # Clear failed status for retry
+                self.failed_thumbnail_downloads.discard(clean_shortcode)
             except Exception as e:
                 logger.warning(f"Failed preparing force thumbnail re-download for {clean_shortcode}: {e}")
         
@@ -14619,13 +15063,41 @@ class InstagramDownloaderGUI(QMainWindow):
         if thumbnail_path.exists() and not force_redownload:
             logger.debug(f"Thumbnail already exists: {thumbnail_path}")
             if process_id:
-                self.process_manager.update_process(process_id, status='completed', current=1, total=1)
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail",
+                        current=1,
+                        total=1,
+                        saved=0,
+                        failed=0,
+                        skipped=1,
+                        shortcode=clean_shortcode,
+                    ),
+                    current=1,
+                    total=1,
+                )
                 # Auto-remove after brief delay
                 QTimer.singleShot(2000, lambda: self.process_manager.remove_process(process_id))
             return True
         
         # Download thumbnail
         try:
+            if process_id:
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-downloading",
+                        current=0,
+                        total=1,
+                        saved=0,
+                        failed=0,
+                        skipped=0,
+                        shortcode=clean_shortcode,
+                    ),
+                    current=0,
+                    total=1,
+                )
             success, dimensions = self.instagram_manager.download_thumbnail(
                 clean_shortcode,
                 thumbnail_path,
@@ -14638,6 +15110,21 @@ class InstagramDownloaderGUI(QMainWindow):
                 file_size = thumbnail_path.stat().st_size
                 
                 # Save to database (use clean shortcode for database)
+                if process_id:
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-saving",
+                            current=0,
+                            total=1,
+                            saved=0,
+                            failed=0,
+                            skipped=0,
+                            shortcode=clean_shortcode,
+                        ),
+                        current=0,
+                        total=1,
+                    )
                 self.content_db.db.add_thumbnail(
                     content_id=clean_shortcode,
                     file_name=thumbnail_filename,
@@ -14649,9 +15136,25 @@ class InstagramDownloaderGUI(QMainWindow):
                 
                 logger.info(f"Thumbnail downloaded and saved: {clean_shortcode}")
                 
+                # Remove from failed set if it was previously failed
+                self.failed_thumbnail_downloads.discard(clean_shortcode)
+                
                 # Update process status
                 if process_id:
-                    self.process_manager.update_process(process_id, status='completed', current=1, total=1)
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-complete",
+                            current=1,
+                            total=1,
+                            saved=1,
+                            failed=0,
+                            skipped=0,
+                            shortcode=clean_shortcode,
+                        ),
+                        current=1,
+                        total=1,
+                    )
                     # Auto-remove after brief delay
                     QTimer.singleShot(2000, lambda: self.process_manager.remove_process(process_id))
                 
@@ -14667,9 +15170,20 @@ class InstagramDownloaderGUI(QMainWindow):
                                            Q_ARG(str, clean_shortcode))
                 return True
             else:
-                # Download failed
+                # Download failed - track it and update UI
+                fail_reason = self.instagram_manager.get_last_thumbnail_failure_reason()
+                self._increment_thumbnail_reason_count(reason_counts, fail_reason)
+                
+                # Add to failed thumbnails set
+                self.failed_thumbnail_downloads.add(clean_shortcode)
+                
+                # Schedule UI update to show red indicator
+                QMetaObject.invokeMethod(self, "_update_thumbnail_widget_on_main_thread",
+                                       Qt.QueuedConnection,
+                                       Q_ARG(str, clean_shortcode))
+                
                 category = self.instagram_manager.classify_failure_category(
-                    f"thumbnail download returned unsuccessful result for {clean_shortcode}"
+                    f"thumbnail download returned unsuccessful result for {clean_shortcode} ({fail_reason})"
                 )
                 QMetaObject.invokeMethod(
                     self,
@@ -14678,14 +15192,49 @@ class InstagramDownloaderGUI(QMainWindow):
                     Q_ARG(str, category),
                     Q_ARG(str, clean_shortcode),
                     Q_ARG(str, "thumbnail_download"),
-                    Q_ARG(str, "thumbnail download returned unsuccessful result"),
+                    Q_ARG(str, f"thumbnail download returned unsuccessful result ({fail_reason})"),
                 )
                 if process_id:
-                    self.process_manager.update_process(process_id, status='failed')
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-failed",
+                            current=1,
+                            total=1,
+                            saved=0,
+                            failed=1,
+                            skipped=0,
+                            shortcode=clean_shortcode,
+                            reason_counts=reason_counts,
+                        ),
+                        current=1,
+                        total=1,
+                    )
                     QTimer.singleShot(5000, lambda: self.process_manager.remove_process(process_id))
                 return False
         except Exception as e:
             logger.error(f"Failed to download thumbnail for {clean_shortcode}: {e}")
+            fail_reason = self.instagram_manager.get_last_thumbnail_failure_reason()
+            if not fail_reason:
+                error_text = str(e).lower()
+                if 'timeout' in error_text or 'timed out' in error_text:
+                    fail_reason = 'timeout'
+                elif '403' in error_text or 'forbidden' in error_text:
+                    fail_reason = '403'
+                elif 'decode' in error_text or 'cannot identify image file' in error_text:
+                    fail_reason = 'decode-fail'
+                else:
+                    fail_reason = 'other'
+            self._increment_thumbnail_reason_count(reason_counts, fail_reason)
+            
+            # Add to failed thumbnails set
+            self.failed_thumbnail_downloads.add(clean_shortcode)
+            
+            # Schedule UI update to show red indicator
+            QMetaObject.invokeMethod(self, "_update_thumbnail_widget_on_main_thread",
+                                   Qt.QueuedConnection,
+                                   Q_ARG(str, clean_shortcode))
+            
             category = self.instagram_manager.classify_failure_category(e)
             QMetaObject.invokeMethod(
                 self,
@@ -14697,7 +15246,21 @@ class InstagramDownloaderGUI(QMainWindow):
                 Q_ARG(str, str(e)),
             )
             if process_id:
-                self.process_manager.update_process(process_id, status='failed')
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-failed",
+                        current=1,
+                        total=1,
+                        saved=0,
+                        failed=1,
+                        skipped=0,
+                        shortcode=clean_shortcode,
+                            reason_counts=reason_counts,
+                    ),
+                    current=1,
+                    total=1,
+                )
                 QTimer.singleShot(5000, lambda: self.process_manager.remove_process(process_id))
             return False
         finally:
@@ -14740,6 +15303,66 @@ class InstagramDownloaderGUI(QMainWindow):
     def _hide_stop_thumbnails_btn(self):
         """Hide the stop thumbnails button when all threads complete (called on main thread)"""
         self.stop_thumbnails_btn.setVisible(False)
+
+    def view_stored_thumbnail_full(self, shortcode):
+        """Open stored thumbnail at natural size in a scrollable popup."""
+        clean_shortcode = (shortcode or '').replace('✓ ', '').replace('⊘ SKIP: ', '').strip()
+        if not clean_shortcode:
+            QMessageBox.warning(self, "View Full Thumbnail", "Missing shortcode for thumbnail lookup.")
+            return
+
+        pixmap = None
+        thumb_path = None
+
+        if self.content_db and self.content_db.db:
+            try:
+                thumbnail = self.content_db.db.get_thumbnail(clean_shortcode)
+                if thumbnail:
+                    thumb_path = thumbnail.get('file_path')
+                    if thumb_path and os.path.exists(thumb_path):
+                        pixmap = QPixmap(thumb_path)
+            except Exception as e:
+                logger.error(f"Failed loading stored thumbnail for {clean_shortcode}: {e}")
+
+        if (pixmap is None or pixmap.isNull()) and clean_shortcode in self.thumbnail_cache:
+            cached = self.thumbnail_cache.get(clean_shortcode)
+            if cached is not None and not cached.isNull():
+                pixmap = cached
+
+        if pixmap is None or pixmap.isNull():
+            QMessageBox.information(
+                self,
+                "View Full Thumbnail",
+                f"No stored thumbnail was found for {clean_shortcode}."
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Thumbnail: {clean_shortcode}")
+        dialog.setModal(False)
+        dialog.resize(min(1100, max(520, pixmap.width() + 40)), min(900, max(420, pixmap.height() + 80)))
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        info_text = f"Natural size: {pixmap.width()} x {pixmap.height()}"
+        if thumb_path:
+            info_text += f" | {thumb_path}"
+        info_label = QLabel(info_text)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        image_label = QLabel()
+        image_label.setPixmap(pixmap)
+        image_label.setFixedSize(pixmap.size())
+        image_label.setAlignment(Qt.AlignCenter)
+        scroll.setWidget(image_label)
+        layout.addWidget(scroll)
+
+        dialog.show()
     
     def toggle_thumbnail_downloads(self):
         """Toggle thumbnail downloads on/off"""
@@ -14851,9 +15474,16 @@ class InstagramDownloaderGUI(QMainWindow):
                 label.setText("🎥")
             else:
                 label.setText("📸")
-            label.setStyleSheet("border: 1px solid #ccc; font-size: 24px;")
+            
+            # Check if this thumbnail failed to download
+            if shortcode in self.failed_thumbnail_downloads:
+                label.setStyleSheet("border: 3px solid #ff0000; font-size: 24px; background-color: #ffcccc;")
+                label.setToolTip("Thumbnail download failed - Click to retry")
+            else:
+                label.setStyleSheet("border: 1px solid #ccc; font-size: 24px;")
+                label.setToolTip("Click to download thumbnail")
+            
             label.setCursor(QCursor(Qt.PointingHandCursor))
-            label.setToolTip("Click to download thumbnail")
             
             # Make clickable
             label.mousePressEvent = lambda event: self.download_single_thumbnail(shortcode, post)
@@ -14866,6 +15496,11 @@ class InstagramDownloaderGUI(QMainWindow):
         from threading import Thread
         
         logger.info(f"Manual thumbnail download requested for {shortcode}")
+        
+        # Remove from failed set if retrying
+        if shortcode in self.failed_thumbnail_downloads:
+            self.failed_thumbnail_downloads.discard(shortcode)
+            logger.info(f"Retrying previously failed thumbnail: {shortcode}")
         
         # Create process entry for individual thumbnail download
         process_id = self.process_manager.add_process(
@@ -14924,8 +15559,22 @@ class InstagramDownloaderGUI(QMainWindow):
                 if shortcode:
                     candidate_posts[shortcode] = post
 
-        if not candidate_posts:
+        # Fallback for tile mode only: derive strictly from current tile page slice.
+        # Do NOT fall back to all table rows, or "Page" mode can accidentally target
+        # the entire account when page cache is cold.
+        if self.current_view_mode == 'tiles' and not candidate_posts and self.filtered_posts:
+            start = max(0, self.current_page * self.tiles_per_page)
+            end = min(start + self.tiles_per_page, len(self.filtered_posts))
+            for post in self.filtered_posts[start:end]:
+                shortcode = (post.get('shortcode') or '').strip()
+                if shortcode:
+                    candidate_posts[shortcode] = post
+
+        # Table mode fallback: only include currently visible rows.
+        if self.current_view_mode != 'tiles' and not candidate_posts:
             for row in range(self.posts_table.rowCount()):
+                if self.posts_table.isRowHidden(row):
+                    continue
                 shortcode_item = self.posts_table.item(row, 2)
                 if not shortcode_item:
                     continue
@@ -14974,26 +15623,42 @@ class InstagramDownloaderGUI(QMainWindow):
         return candidate_posts
 
     def _collect_remaining_posts_for_thumbnails(self):
-        """Collect only entries that are missing thumbnail records (fast DB-side filter)."""
+        """Collect entries still needing thumbnail work (missing or unusable)."""
         candidate_posts = {}
 
         if self.content_db and self.content_db.db:
             try:
+                # Pass 1: fast DB-side filter for rows without thumbnail records.
+                missing_record_entries = []
                 if hasattr(self.content_db.db, 'get_entries_missing_thumbnails'):
-                    entries = self.content_db.db.get_entries_missing_thumbnails()
+                    missing_record_entries = self.content_db.db.get_entries_missing_thumbnails()
                 else:
-                    # Fallback: lightweight scan list, filtered in Python.
-                    entries = self.content_db.db.get_thumbnail_scan_entries()
+                    missing_record_entries = self.content_db.db.get_thumbnail_scan_entries()
 
-                for entry in entries:
+                for entry in missing_record_entries:
                     shortcode = (entry.get('shortcode') or entry.get('id') or '').strip()
                     if not shortcode:
                         continue
 
-                    if not hasattr(self.content_db.db, 'get_entries_missing_thumbnails'):
-                        existing_thumbnail = self.content_db.db.get_thumbnail(shortcode)
-                        if existing_thumbnail:
-                            continue
+                    candidate_posts[shortcode] = {
+                        'shortcode': shortcode,
+                        'typename': entry.get('typename', entry.get('type', 'GraphImage')),
+                        'caption': entry.get('text', ''),
+                        'owner_username': entry.get('account_name', self.current_username or 'unknown'),
+                        'local_media_path': entry.get('local_media_path'),
+                    }
+
+                # Pass 2: include rows with stale/broken thumbnail records (file missing/corrupt).
+                # This fixes "remaining" mode silently skipping entries that have a thumbnail
+                # DB row but no usable file on disk.
+                scan_entries = self.content_db.db.get_thumbnail_scan_entries()
+                for entry in scan_entries:
+                    shortcode = (entry.get('shortcode') or entry.get('id') or '').strip()
+                    if not shortcode or shortcode in candidate_posts:
+                        continue
+
+                    if self._has_usable_thumbnail(shortcode):
+                        continue
 
                     candidate_posts[shortcode] = {
                         'shortcode': shortcode,
@@ -15036,7 +15701,19 @@ class InstagramDownloaderGUI(QMainWindow):
             f'Thumbnail Download ({scope_label}, {missing_count} items)',
             None
         )
-        self.process_manager.update_process(process_id, status='running', current=0, total=missing_count)
+        self.process_manager.update_process(
+            process_id,
+            status=self._format_thumbnail_process_status(
+                "thumbnail-batch",
+                current=0,
+                total=missing_count,
+                saved=0,
+                failed=0,
+                skipped=0,
+            ),
+            current=0,
+            total=missing_count,
+        )
 
         if process_id in self.process_manager.processes:
             self.process_manager.processes[process_id]['description'] = (
@@ -15061,6 +15738,7 @@ class InstagramDownloaderGUI(QMainWindow):
             cooldown_max_s = 24.0
 
             completed = 0
+            reason_counts = self._new_thumbnail_reason_counts()
             requests_since_break = 0
             next_break_after = random.randint(burst_min, burst_max)
 
@@ -15074,15 +15752,39 @@ class InstagramDownloaderGUI(QMainWindow):
                         )
                     self.process_manager.update_process(
                         process_id,
-                        status='cancelled',
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-batch-cancelled",
+                            current=completed,
+                            total=missing_count,
+                            saved=completed,
+                            failed=0,
+                            skipped=max(0, missing_count - completed),
+                            reason_counts=reason_counts,
+                        ),
                         current=completed,
                         total=missing_count
                     )
                     QTimer.singleShot(3000, lambda: self.process_manager.remove_process(process_id))
                     return
 
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-batch",
+                        current=i,
+                        total=missing_count,
+                        saved=completed,
+                        failed=0,
+                        skipped=0,
+                        shortcode=shortcode,
+                        reason_counts=reason_counts,
+                    ),
+                    current=i,
+                    total=missing_count,
+                )
+
                 try:
-                    success = self.download_thumbnail_async(shortcode, post)
+                    success = self.download_thumbnail_async(shortcode, post, reason_counts=reason_counts)
                     if success:
                         completed += 1
                 except Exception as e:
@@ -15093,7 +15795,21 @@ class InstagramDownloaderGUI(QMainWindow):
                             f"Thumbnail update ({scope_label}): Processing {i + 1} of {missing_count}, "
                             f"{completed} saved"
                         )
-                    self.process_manager.update_process(process_id, current=i + 1, total=missing_count)
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-batch",
+                            current=i + 1,
+                            total=missing_count,
+                            saved=completed,
+                            failed=max(0, (i + 1) - completed),
+                            skipped=0,
+                            shortcode=shortcode,
+                            reason_counts=reason_counts,
+                        ),
+                        current=i + 1,
+                        total=missing_count,
+                    )
 
                 if i >= missing_count - 1:
                     continue
@@ -15111,7 +15827,15 @@ class InstagramDownloaderGUI(QMainWindow):
 
             self.process_manager.update_process(
                 process_id,
-                status='completed',
+                status=self._format_thumbnail_process_status(
+                    "thumbnail-batch-complete",
+                    current=missing_count,
+                    total=missing_count,
+                    saved=completed,
+                    failed=max(0, missing_count - completed),
+                    skipped=0,
+                    reason_counts=reason_counts,
+                ),
                 current=missing_count,
                 total=missing_count
             )
@@ -15139,6 +15863,15 @@ class InstagramDownloaderGUI(QMainWindow):
 
     def download_missing_thumbnails_page(self):
         """Download missing thumbnails for the current page only."""
+        if not self.instagram_authenticated:
+            QMessageBox.warning(
+                self,
+                "Instagram Connection Required",
+                "Downloading thumbnails from Instagram requires an active connection.\n\n"
+                "Please switch to your account and choose 'Connect to Instagram' mode."
+            )
+            return
+        
         if not self.content_db or not self.content_db.db:
             QMessageBox.warning(self, "No Database", "No database is loaded.")
             return
@@ -15159,6 +15892,15 @@ class InstagramDownloaderGUI(QMainWindow):
         """Download missing thumbnails for remaining entries in the account without blocking the UI."""
         from threading import Thread
 
+        if not self.instagram_authenticated:
+            QMessageBox.warning(
+                self,
+                "Instagram Connection Required",
+                "Downloading thumbnails from Instagram requires an active connection.\n\n"
+                "Please switch to your account and choose 'Connect to Instagram' mode."
+            )
+            return
+
         if not self.content_db or not self.content_db.db:
             QMessageBox.warning(self, "No Database", "No database is loaded.")
             return
@@ -15168,7 +15910,19 @@ class InstagramDownloaderGUI(QMainWindow):
             'Thumbnail update (remaining entries): preparing scan...',
             None
         )
-        self.process_manager.update_process(process_id, status='running', current=0, total=0)
+        self.process_manager.update_process(
+            process_id,
+            status=self._format_thumbnail_process_status(
+                "thumbnail-remaining",
+                current=0,
+                total=0,
+                saved=0,
+                failed=0,
+                skipped=0,
+            ),
+            current=0,
+            total=0,
+        )
 
         if self.stop_thumbnail_downloads:
             self.stop_thumbnail_downloads = False
@@ -15187,14 +15941,38 @@ class InstagramDownloaderGUI(QMainWindow):
                     self.process_manager.processes[process_id]['description'] = (
                         f"Thumbnail update (remaining entries): scanning 0 of {total_candidates}"
                     )
-                self.process_manager.update_process(process_id, status='running', current=0, total=total_candidates)
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-remaining",
+                        current=0,
+                        total=total_candidates,
+                        saved=0,
+                        failed=0,
+                        skipped=0,
+                    ),
+                    current=0,
+                    total=total_candidates,
+                )
 
                 if total_candidates == 0:
                     if process_id in self.process_manager.processes:
                         self.process_manager.processes[process_id]['description'] = (
                             'Thumbnail update (remaining entries): nothing to process'
                         )
-                    self.process_manager.update_process(process_id, status='completed', current=0, total=0)
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-remaining-complete",
+                            current=0,
+                            total=0,
+                            saved=0,
+                            failed=0,
+                            skipped=0,
+                        ),
+                        current=0,
+                        total=0,
+                    )
                     QTimer.singleShot(3000, lambda: self.process_manager.remove_process(process_id))
                     return
 
@@ -15208,7 +15986,9 @@ class InstagramDownloaderGUI(QMainWindow):
 
                 scanned = 0
                 downloaded = 0
+                failed_count = 0
                 skipped = 0
+                reason_counts = self._new_thumbnail_reason_counts()
                 requests_since_break = 0
                 next_break_after = random.randint(burst_min, burst_max)
 
@@ -15221,7 +16001,15 @@ class InstagramDownloaderGUI(QMainWindow):
                             )
                         self.process_manager.update_process(
                             process_id,
-                            status='cancelled',
+                            status=self._format_thumbnail_process_status(
+                                "thumbnail-remaining-cancelled",
+                                current=scanned,
+                                total=total_candidates,
+                                saved=downloaded,
+                                failed=failed_count,
+                                skipped=skipped,
+                                reason_counts=reason_counts,
+                            ),
                             current=scanned,
                             total=total_candidates
                         )
@@ -15229,15 +16017,48 @@ class InstagramDownloaderGUI(QMainWindow):
                         return
 
                     scanned += 1
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-remaining",
+                            current=scanned - 1,
+                            total=total_candidates,
+                            saved=downloaded,
+                            failed=failed_count,
+                            skipped=skipped,
+                            shortcode=shortcode,
+                            reason_counts=reason_counts,
+                        ),
+                        current=scanned - 1,
+                        total=total_candidates,
+                    )
+                    if self._has_usable_thumbnail(shortcode):
+                        skipped += 1
+                        self.process_manager.update_process(
+                            process_id,
+                            status=self._format_thumbnail_process_status(
+                                "thumbnail-remaining",
+                                current=scanned,
+                                total=total_candidates,
+                                saved=downloaded,
+                                failed=failed_count,
+                                skipped=skipped,
+                                shortcode=shortcode,
+                                reason_counts=reason_counts,
+                            ),
+                            current=scanned,
+                            total=total_candidates,
+                        )
+                        continue
                     try:
-                        success = self.download_thumbnail_async(shortcode, post)
+                        success = self.download_thumbnail_async(shortcode, post, reason_counts=reason_counts)
                         if success:
                             downloaded += 1
                         else:
-                            skipped += 1
+                            failed_count += 1
                     except Exception as e:
                         logger.error(f"Safe REM thumbnail error for {shortcode}: {e}")
-                        skipped += 1
+                        failed_count += 1
 
                     # Only pace when we make an Instagram request.
                     requests_since_break += 1
@@ -15258,7 +16079,16 @@ class InstagramDownloaderGUI(QMainWindow):
                         )
                     self.process_manager.update_process(
                         process_id,
-                        status='running',
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-remaining",
+                            current=scanned,
+                            total=total_candidates,
+                            saved=downloaded,
+                            failed=failed_count,
+                            skipped=skipped,
+                            shortcode=shortcode,
+                            reason_counts=reason_counts,
+                        ),
                         current=scanned,
                         total=total_candidates
                     )
@@ -15270,7 +16100,15 @@ class InstagramDownloaderGUI(QMainWindow):
                     )
                 self.process_manager.update_process(
                     process_id,
-                    status='completed',
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-remaining-complete",
+                        current=total_candidates,
+                        total=total_candidates,
+                        saved=downloaded,
+                        failed=failed_count,
+                        skipped=skipped,
+                        reason_counts=reason_counts,
+                    ),
                     current=total_candidates,
                     total=total_candidates
                 )
@@ -15281,7 +16119,19 @@ class InstagramDownloaderGUI(QMainWindow):
                     self.process_manager.processes[process_id]['description'] = (
                         f"Thumbnail update (remaining entries) failed: {e}"
                     )
-                self.process_manager.update_process(process_id, status='failed', current=0, total=0)
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-remaining-failed",
+                        current=0,
+                        total=0,
+                        saved=0,
+                        failed=1,
+                        skipped=0,
+                    ),
+                    current=0,
+                    total=0,
+                )
                 QTimer.singleShot(5000, lambda: self.process_manager.remove_process(process_id))
 
         worker_thread = Thread(target=worker, daemon=True)
@@ -15347,34 +16197,98 @@ class InstagramDownloaderGUI(QMainWindow):
         
         def redownload_worker():
             logger.info(f"[THUMBNAIL_REDOWNLOAD_PAGE] Starting page {self.current_page + 1} for {len(posts_to_download)} posts")
-            self.process_manager.update_process(process_id, status='running', current=0, total=len(posts_to_download))
+            self.process_manager.update_process(
+                process_id,
+                status=self._format_thumbnail_process_status(
+                    "thumbnail-redownload",
+                    current=0,
+                    total=len(posts_to_download),
+                    saved=0,
+                    failed=0,
+                    skipped=0,
+                ),
+                current=0,
+                total=len(posts_to_download),
+            )
             
-            completed = 0
+            saved_count = 0
+            failed_count = 0
+            reason_counts = self._new_thumbnail_reason_counts()
+            total_count = len(posts_to_download)
             for i, (shortcode, post) in enumerate(posts_to_download):
+                self.process_manager.update_process(
+                    process_id,
+                    status=self._format_thumbnail_process_status(
+                        "thumbnail-redownload",
+                        current=i,
+                        total=total_count,
+                        saved=saved_count,
+                        failed=failed_count,
+                        skipped=0,
+                        shortcode=shortcode,
+                        reason_counts=reason_counts,
+                    ),
+                    current=i,
+                    total=total_count,
+                )
                 try:
-                    self.download_thumbnail_async(shortcode, post, force_redownload=True)
-                    completed += 1
+                    success = self.download_thumbnail_async(shortcode, post, force_redownload=True, reason_counts=reason_counts)
+                    if success:
+                        saved_count += 1
+                    else:
+                        failed_count += 1
                 except Exception as e:
                     logger.error(f"Error re-downloading thumbnail for {shortcode}: {e}")
+                    failed_count += 1
                 finally:
-                    self.process_manager.update_process(process_id, current=i + 1, total=len(posts_to_download))
+                    self.process_manager.update_process(
+                        process_id,
+                        status=self._format_thumbnail_process_status(
+                            "thumbnail-redownload",
+                            current=i + 1,
+                            total=total_count,
+                            saved=saved_count,
+                            failed=failed_count,
+                            skipped=0,
+                            shortcode=shortcode,
+                            reason_counts=reason_counts,
+                        ),
+                        current=i + 1,
+                        total=total_count,
+                    )
                 
                 # Rate limit requests to avoid hammering Instagram
                 if i < len(posts_to_download) - 1:
                     time.sleep(0.5)
             
-            self.process_manager.update_process(process_id, status='completed', current=len(posts_to_download), total=len(posts_to_download))
+            self.process_manager.update_process(
+                process_id,
+                status=self._format_thumbnail_process_status(
+                    "thumbnail-redownload-complete",
+                    current=total_count,
+                    total=total_count,
+                    saved=saved_count,
+                    failed=failed_count,
+                    skipped=0,
+                    reason_counts=reason_counts,
+                ),
+                current=total_count,
+                total=total_count
+            )
             QTimer.singleShot(3000, lambda: self.process_manager.remove_process(process_id))
             
             try:
                 self.statusBar().showMessage(
-                    f"Re-downloaded thumbnails for page {self.current_page + 1}: {completed}/{len(posts_to_download)}",
+                    f"Re-downloaded thumbnails page {self.current_page + 1}: saved {saved_count}, failed {failed_count}",
                     5000
                 )
             except RuntimeError:
                 pass
             
-            logger.info(f"[THUMBNAIL_REDOWNLOAD_PAGE] Completed page {self.current_page + 1}: {completed}/{len(posts_to_download)}")
+            logger.info(
+                f"[THUMBNAIL_REDOWNLOAD_PAGE] Completed page {self.current_page + 1}: "
+                f"saved={saved_count}, failed={failed_count}, total={total_count}"
+            )
         
         worker_thread = Thread(target=redownload_worker, daemon=True)
         self.thumbnail_threads.append(worker_thread)
@@ -18756,8 +19670,13 @@ class InstagramDownloaderGUI(QMainWindow):
             QMessageBox.information(self, "No Selection", "Select one or more tiles first.")
             return
         
-        if not self.instagram_manager:
-            QMessageBox.warning(self, "Not Logged In", "Please log in first.")
+        if not self.instagram_authenticated:
+            QMessageBox.warning(
+                self,
+                "Instagram Connection Required",
+                "Downloading content from Instagram requires an active connection.\n\n"
+                "Please switch to your account and choose 'Connect to Instagram' mode."
+            )
             return
         
         target_dir_str = self.download_path_input.text()
@@ -18918,8 +19837,13 @@ class InstagramDownloaderGUI(QMainWindow):
     
     def download_page_now(self):
         """Download all posts on current page immediately"""
-        if not self.instagram_manager:
-            QMessageBox.warning(self, "Not Logged In", "Please log in first.")
+        if not self.instagram_authenticated:
+            QMessageBox.warning(
+                self,
+                "Instagram Connection Required",
+                "Downloading content from Instagram requires an active connection.\n\n"
+                "Please switch to your account and choose 'Connect to Instagram' mode."
+            )
             return
         
         target_dir_str = self.download_path_input.text()
@@ -18994,8 +19918,13 @@ class InstagramDownloaderGUI(QMainWindow):
     
     def download_topic_assigned_now(self):
         """Download all topic-assigned posts on current page immediately"""
-        if not self.instagram_manager:
-            QMessageBox.warning(self, "Not Logged In", "Please log in first.")
+        if not self.instagram_authenticated:
+            QMessageBox.warning(
+                self,
+                "Instagram Connection Required",
+                "Downloading content from Instagram requires an active connection.\n\n"
+                "Please switch to your account and choose 'Connect to Instagram' mode."
+            )
             return
         
         target_dir_str = self.download_path_input.text()
@@ -19152,6 +20081,16 @@ class InstagramDownloaderGUI(QMainWindow):
     def download_post_now(self, post):
         """Download a single post immediately in a background thread"""
         if not post or not self.instagram_manager:
+            return
+        
+        # Check if authenticated with Instagram
+        if not self.instagram_authenticated:
+            QMessageBox.warning(
+                self,
+                "Instagram Connection Required",
+                "Downloading content from Instagram requires an active connection.\n\n"
+                "Please switch to your account and choose 'Connect to Instagram' mode."
+            )
             return
         
         shortcode = post.get('shortcode', '')
@@ -22147,7 +23086,7 @@ class InstagramDownloaderGUI(QMainWindow):
             thumb_label = HoverImageLabel(file_path) if not is_video else QLabel()
             thumb_label.is_carousel_image = True
             thumb_label.setFixedSize(thumb_size, media_height)
-            thumb_label.setScaledContents(True)
+            thumb_label.setScaledContents(False)
             thumb_label.setStyleSheet("border: 1px solid #ccc;")
             thumb_label.setAlignment(Qt.AlignCenter)
             
@@ -22460,7 +23399,7 @@ class InstagramDownloaderGUI(QMainWindow):
         thumb_label = HoverImageLabel(current_file['path']) if not is_video else QLabel()
         thumb_label.is_carousel_image = True
         thumb_label.setFixedSize(thumb_size, media_height)  # Match container height
-        thumb_label.setScaledContents(True)
+        thumb_label.setScaledContents(False)
         thumb_label.setStyleSheet("border: 1px solid #ccc;")
         thumb_label.setAlignment(Qt.AlignCenter)
         
@@ -22643,7 +23582,7 @@ class InstagramDownloaderGUI(QMainWindow):
         # Video thumbnail
         thumb_label = QLabel()
         thumb_label.setFixedSize(thumb_size, video_height)
-        thumb_label.setScaledContents(True)
+        thumb_label.setScaledContents(False)
         thumb_label.setStyleSheet("border: 1px solid #ccc;")
         thumb_label.setAlignment(Qt.AlignCenter)
         
@@ -22739,7 +23678,7 @@ class InstagramDownloaderGUI(QMainWindow):
         """Add image display with hover tooltip"""
         thumb_label = HoverImageLabel(image_file['path'])
         thumb_label.setFixedSize(thumb_size, thumb_size)
-        thumb_label.setScaledContents(True)
+        thumb_label.setScaledContents(False)
         thumb_label.setStyleSheet("border: 1px solid #ccc;")
         thumb_label.setAlignment(Qt.AlignCenter)
         thumb_label.setToolTip("Hover to view full size")
@@ -22758,7 +23697,7 @@ class InstagramDownloaderGUI(QMainWindow):
         thumb_label = QLabel()
         thumb_label.is_placeholder_thumbnail = True
         thumb_label.setFixedSize(thumb_size, thumb_size)
-        thumb_label.setScaledContents(True)
+        thumb_label.setScaledContents(False)
         thumb_label.setStyleSheet("border: 1px solid #ccc;")
         thumb_label.setAlignment(Qt.AlignCenter)
         
@@ -23013,6 +23952,8 @@ class InstagramDownloaderGUI(QMainWindow):
         
         typename = post.get('typename', 'Unknown')
         status = post.get('download_status', 'not_downloaded')
+        is_downloaded_status = status in ['downloaded', 'completed', 're-downloaded']
+        downloaded_files = self.get_downloaded_files(shortcode) if is_downloaded_status else []
         # Extract topic_id from ContentInformation (nested structure)
         content_info = post.get('ContentInformation', {})
         topic_id = content_info.get('topicID')  # Get topic_id from nested ContentInformation
@@ -23158,8 +24099,7 @@ class InstagramDownloaderGUI(QMainWindow):
         _style_content_tile_action_button(classify_btn)
         
         # Open In Explorer button (only show if content is downloaded)
-        if status in ['downloaded', 'completed', 're-downloaded']:
-            downloaded_files = self.get_downloaded_files(shortcode)
+        if is_downloaded_status:
             if downloaded_files:
                 explorer_btn = QPushButton("📁")
                 explorer_btn.setMaximumWidth(35)
@@ -23176,6 +24116,14 @@ class InstagramDownloaderGUI(QMainWindow):
                     explorer_btn.clicked.connect(lambda checked=False, sc=shortcode: self.open_downloaded_file(sc))
                 button_row.addWidget(explorer_btn)
                 _style_content_tile_action_button(explorer_btn)
+        else:
+            view_full_btn = QPushButton("🔎")
+            view_full_btn.setMaximumWidth(35)
+            view_full_btn.setMaximumHeight(24)
+            view_full_btn.setToolTip("View Full stored thumbnail")
+            view_full_btn.clicked.connect(lambda checked=False, sc=shortcode: self.view_stored_thumbnail_full(sc))
+            button_row.addWidget(view_full_btn)
+            _style_content_tile_action_button(view_full_btn)
         
         # Re-copy to Topics button (only show if content has topic assignments)
         if self.content_db and self.content_db.db:
@@ -23279,9 +24227,7 @@ class InstagramDownloaderGUI(QMainWindow):
         else:
             layout.addLayout(button_row)
         
-        # Check if content is downloaded and get files
-        # Accept 'downloaded', 'completed', and 're-downloaded' status values
-        downloaded_files = self.get_downloaded_files(shortcode) if status in ['downloaded', 'completed', 're-downloaded'] else []
+        # downloaded_files was resolved earlier for button/media decisions.
         
         # DEBUG: Log file retrieval for downloaded posts
         if status in ['downloaded', 'completed', 're-downloaded']:

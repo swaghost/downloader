@@ -26,19 +26,56 @@ class InstagramManager:
     
     def __init__(self):
         # Authenticated loader (used for saved posts, stories, private accounts)
-        self.loader = instaloader.Instaloader(
-            download_videos=True,
-            download_video_thumbnails=False,  # Don't need thumbnails
-            download_comments=False,
-            save_metadata=False,  # Don't save JSON metadata files
-            compress_json=False,
-            post_metadata_txt_pattern='',  # Don't create txt files
-            max_connection_attempts=config.RETRY_ATTEMPTS,
-            filename_pattern='{shortcode}'  # Use simple shortcode-based naming
-        )
+        self.loader = self._create_loader()
+
+        # Anonymous loader (used only for lightweight public probes/fallbacks)
+        self.anon_loader = self._create_loader()
         
-        # Anonymous loader (used for public posts to reduce rate limiting)
-        self.anon_loader = instaloader.Instaloader(
+        self.username: Optional[str] = None
+        self.logged_in = False
+        self.session_file: Optional[Path] = None
+        self.last_session_check: Optional[float] = None
+        self.last_runtime_status: Dict[str, Any] = {
+            'step': 'idle',
+            'code': 'idle',
+            'message': 'Idle',
+            'recommendation': '',
+            'username': None,
+        }
+        # Protect process-wide state used by instaloader download flow (os.chdir).
+        self._download_lock = threading.Lock()
+        # Backoff state for GraphQL thumbnail lookups when Instagram returns 403.
+        self.thumbnail_graphql_block_until: float = 0.0
+        self.thumbnail_graphql_failures: int = 0
+        # Lightweight global cap to prevent bursty thumbnail network requests.
+        self._thumbnail_request_semaphore = threading.BoundedSemaphore(value=2)
+        # Thread-local thumbnail failure reason for UI diagnostics.
+        self._thumbnail_thread_state = threading.local()
+
+    def _set_last_thumbnail_failure_reason(self, reason: str):
+        """Store per-thread thumbnail failure reason for GUI process diagnostics."""
+        self._thumbnail_thread_state.thumbnail_failure_reason = str(reason or '')
+
+    def get_last_thumbnail_failure_reason(self) -> str:
+        """Read per-thread thumbnail failure reason set by download_thumbnail."""
+        return str(getattr(self._thumbnail_thread_state, 'thumbnail_failure_reason', '') or '')
+
+    def _classify_thumbnail_failure_reason(self, error: Exception | str) -> str:
+        """Classify thumbnail failure reason into concise UI-friendly buckets."""
+        msg = str(error).lower() if error is not None else ''
+        if 'parse-miss' in msg or 'opengraph preview image not found' in msg or 'preview image url was empty' in msg:
+            return 'parse-miss'
+        if '403' in msg or 'forbidden' in msg:
+            return '403'
+        if 'timed out' in msg or 'timeout' in msg:
+            return 'timeout'
+        if 'cannot identify image file' in msg or 'decode-fail' in msg or 'truncated image' in msg:
+            return 'decode-fail'
+        return 'other'
+
+    def _create_loader(self):
+        """Create an Instaloader instance with app-standard settings."""
+        return instaloader.Instaloader(
             download_videos=True,
             download_video_thumbnails=False,
             download_comments=False,
@@ -48,16 +85,188 @@ class InstagramManager:
             max_connection_attempts=config.RETRY_ATTEMPTS,
             filename_pattern='{shortcode}'
         )
-        
-        self.username: Optional[str] = None
+
+    def _set_runtime_status(self, step: str, code: str, message: str, recommendation: str = ''):
+        """Record the latest high-level runtime state for UI diagnostics."""
+        self.last_runtime_status = {
+            'step': str(step),
+            'code': str(code),
+            'message': str(message),
+            'recommendation': str(recommendation or ''),
+            'username': self.username,
+        }
+        logger.info("InstagramManager status [%s/%s]: %s", step, code, message)
+
+    def get_runtime_status(self) -> Dict[str, Any]:
+        """Return the latest runtime status snapshot for the UI."""
+        return dict(self.last_runtime_status)
+
+    def _clear_login_state(self):
+        """Clear active authenticated session state."""
+        self.username = None
         self.logged_in = False
-        self.session_file: Optional[Path] = None
-        self.last_session_check: Optional[float] = None
-        # Protect process-wide state used by instaloader download flow (os.chdir).
-        self._download_lock = threading.Lock()
-        # Backoff state for GraphQL thumbnail lookups when Instagram returns 403.
-        self.thumbnail_graphql_block_until: float = 0.0
-        self.thumbnail_graphql_failures: int = 0
+        self.session_file = None
+
+    def _reset_authenticated_loader(self):
+        """Reset authenticated loader after invalid session/login state."""
+        self.loader = self._create_loader()
+        self._clear_login_state()
+
+    def _validate_authenticated_session(self, expected_username: Optional[str] = None) -> tuple[bool, str, Optional[str]]:
+        """Validate the active authenticated Instaloader session."""
+        try:
+            resolved_username = self.loader.test_login()
+        except Exception as e:
+            return False, f"Session validation failed: {e}", None
+
+        if not resolved_username:
+            return False, "Session validation failed: Instaloader could not confirm a logged-in user.", None
+
+        if expected_username and resolved_username.lower() != str(expected_username).strip().lower():
+            return (
+                False,
+                f"Session belongs to @{resolved_username}, not @{expected_username}.",
+                resolved_username,
+            )
+
+        self.username = resolved_username
+        self.logged_in = True
+        self.last_session_check = time.time()
+        return True, f"Session validated for @{resolved_username}.", resolved_username
+
+    def login_detailed(self, username: str, password: str, session_file: Optional[Path] = None) -> Dict[str, Any]:
+        """Login and return a detailed result for UI diagnostics."""
+        requested_username = str(username or '').strip()
+        session_path = Path(session_file) if session_file else None
+
+        try:
+            if session_path and session_path.exists():
+                self._set_runtime_status(
+                    'loading_session',
+                    'session_load_started',
+                    f"Loading Instaloader session for @{requested_username} from {session_path.name}.",
+                )
+                self.loader.load_session_from_file(requested_username, str(session_path))
+                self.session_file = session_path
+                self._set_runtime_status(
+                    'validating_session',
+                    'session_validation_started',
+                    f"Validating session for @{requested_username}.",
+                )
+                ok, message, resolved_username = self._validate_authenticated_session(requested_username)
+                if ok:
+                    self.session_file = session_path
+                    self._set_runtime_status('session_valid', 'session_valid', message)
+                    return {
+                        'success': True,
+                        'message': message,
+                        'ig_username': resolved_username,
+                        'step': 'session_valid',
+                        'code': 'session_valid',
+                    }
+
+                recommendation = 'Refresh cookies from your browser and recreate the session.'
+                self._reset_authenticated_loader()
+                self._set_runtime_status('session_invalid', 'session_invalid', message, recommendation)
+                return {
+                    'success': False,
+                    'message': message,
+                    'ig_username': resolved_username,
+                    'step': 'session_invalid',
+                    'code': 'session_invalid',
+                    'recommendation': recommendation,
+                }
+
+            if not requested_username or not password:
+                message = 'Username and password are required when no valid session file is available.'
+                self._set_runtime_status('login_blocked', 'missing_credentials', message)
+                return {
+                    'success': False,
+                    'message': message,
+                    'ig_username': None,
+                    'step': 'login_blocked',
+                    'code': 'missing_credentials',
+                }
+
+            self._set_runtime_status('logging_in', 'password_login_started', f"Logging in as @{requested_username}.")
+            self.loader.login(requested_username, password)
+            ok, message, resolved_username = self._validate_authenticated_session(requested_username)
+            if not ok:
+                recommendation = 'Try importing browser cookies instead of password login.'
+                self._reset_authenticated_loader()
+                self._set_runtime_status('login_failed', 'session_validation_failed', message, recommendation)
+                return {
+                    'success': False,
+                    'message': message,
+                    'ig_username': resolved_username,
+                    'step': 'login_failed',
+                    'code': 'session_validation_failed',
+                    'recommendation': recommendation,
+                }
+
+            if session_path:
+                session_path.parent.mkdir(parents=True, exist_ok=True)
+                self.loader.save_session_to_file(str(session_path))
+                self.session_file = session_path
+                logger.info("Session saved to %s", session_path)
+
+            self._set_runtime_status('session_valid', 'login_success', message)
+            return {
+                'success': True,
+                'message': message,
+                'ig_username': resolved_username,
+                'step': 'session_valid',
+                'code': 'login_success',
+            }
+
+        except instaloader.exceptions.BadCredentialsException:
+            message = 'Invalid Instagram username or password.'
+            self._reset_authenticated_loader()
+            self._set_runtime_status('login_failed', 'bad_credentials', message, 'Check credentials or use browser cookie import.')
+            return {
+                'success': False,
+                'message': message,
+                'ig_username': None,
+                'step': 'login_failed',
+                'code': 'bad_credentials',
+                'recommendation': 'Check credentials or use browser cookie import.',
+            }
+        except instaloader.exceptions.TwoFactorAuthRequiredException:
+            message = 'Two-factor authentication is required and is not implemented in this flow.'
+            self._reset_authenticated_loader()
+            self._set_runtime_status('login_failed', 'two_factor_required', message, 'Import a browser session instead.')
+            return {
+                'success': False,
+                'message': message,
+                'ig_username': None,
+                'step': 'login_failed',
+                'code': 'two_factor_required',
+                'recommendation': 'Import a browser session instead.',
+            }
+        except instaloader.exceptions.ConnectionException as e:
+            message = f'Instagram connection error: {e}'
+            self._reset_authenticated_loader()
+            self._set_runtime_status('login_failed', 'connection_error', message, 'Retry later or refresh browser cookies.')
+            return {
+                'success': False,
+                'message': message,
+                'ig_username': None,
+                'step': 'login_failed',
+                'code': 'connection_error',
+                'recommendation': 'Retry later or refresh browser cookies.',
+            }
+        except Exception as e:
+            message = f'Login failed: {e}'
+            self._reset_authenticated_loader()
+            self._set_runtime_status('login_failed', 'unexpected_login_error', message, 'Inspect logs and validate the session source.')
+            return {
+                'success': False,
+                'message': message,
+                'ig_username': None,
+                'step': 'login_failed',
+                'code': 'unexpected_login_error',
+                'recommendation': 'Inspect logs and validate the session source.',
+            }
     
     def login(self, username: str, password: str, session_file: Optional[Path] = None) -> bool:
         """
@@ -71,59 +280,95 @@ class InstagramManager:
         Returns:
             True if login successful, False otherwise
         """
+        result = self.login_detailed(username, password, session_file)
+        return bool(result.get('success'))
+
+    def import_session_from_cookies(self, expected_username: str, cookie_source: Any, session_file: Path) -> Dict[str, Any]:
+        """Create and validate an Instaloader-native session from browser cookies."""
+        expected_username = str(expected_username or '').strip()
+        session_path = Path(session_file)
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._set_runtime_status(
+            'importing_cookies',
+            'cookie_import_started',
+            f"Importing browser cookies for @{expected_username or 'unknown'}.",
+        )
+
         try:
-            # Try loading existing session first
-            if session_file and session_file.exists():
-                logger.info(f"Loading session from {session_file}")
-                self.loader.load_session_from_file(username, str(session_file))
-                self.username = username
-                self.logged_in = True
-                self.session_file = session_file
-                logger.info(f"Logged in as {username} (from session)")
-                return True
-            
-            # Fresh login
-            logger.info(f"Logging in as {username}")
-            self.loader.login(username, password)
-            self.username = username
+            temp_loader = self._create_loader()
+            if isinstance(cookie_source, dict):
+                cookie_dict = {str(key): str(value) for key, value in cookie_source.items() if value is not None}
+                temp_loader.context._session.cookies.update(cookie_dict)
+            else:
+                cookie_dict = {}
+                temp_loader.context._session.cookies.update(cookie_source)
+                cookie_dict = temp_loader.context._session.cookies.get_dict().copy()
+
+            if not cookie_dict.get('sessionid') or not cookie_dict.get('csrftoken'):
+                message = 'Browser cookies are missing required Instagram session cookies (sessionid/csrftoken).'
+                self._set_runtime_status('session_invalid', 'missing_required_cookies', message, 'Export fresh instagram.com cookies and retry.')
+                return {
+                    'success': False,
+                    'message': message,
+                    'ig_username': None,
+                    'step': 'session_invalid',
+                    'code': 'missing_required_cookies',
+                    'recommendation': 'Export fresh instagram.com cookies and retry.',
+                }
+
+            if cookie_dict.get('csrftoken'):
+                temp_loader.context._session.headers.update({'X-CSRFToken': cookie_dict['csrftoken']})
+
+            resolved_username = temp_loader.test_login()
+            if not resolved_username:
+                message = 'Cookie import failed: Instaloader could not validate a logged-in Instagram user from the provided cookies.'
+                self._set_runtime_status('session_invalid', 'cookie_validation_failed', message, 'Refresh browser cookies and make sure you are logged into Instagram.')
+                return {
+                    'success': False,
+                    'message': message,
+                    'ig_username': None,
+                    'step': 'session_invalid',
+                    'code': 'cookie_validation_failed',
+                    'recommendation': 'Refresh browser cookies and make sure you are logged into Instagram.',
+                }
+
+            temp_loader.context.username = resolved_username
+            temp_loader.save_session_to_file(str(session_path))
+
+            self.loader = temp_loader
+            self.username = resolved_username
             self.logged_in = True
-            
-            # Save session for future use
-            if session_file:
-                session_file.parent.mkdir(parents=True, exist_ok=True)
-                self.loader.save_session_to_file(str(session_file))
-                logger.info(f"Session saved to {session_file}")
-            
-            return True
-            
-        except instaloader.exceptions.BadCredentialsException:
-            logger.error("Invalid username or password")
-            return False
-        except instaloader.exceptions.TwoFactorAuthRequiredException:
-            logger.error("Two-factor authentication required - not yet implemented")
-            return False
-        except instaloader.exceptions.ConnectionException as e:
-            logger.error(f"Instagram connection error: {e}")
-            logger.error("Instagram may be blocking automated logins. Try using session import from browser.")
-            return False
+            self.session_file = session_path
+            self.last_session_check = time.time()
+
+            if expected_username and resolved_username.lower() != expected_username.lower():
+                message = f"Cookies validated for @{resolved_username}. Updated account username from @{expected_username}."
+                code = 'cookie_username_mismatch'
+            else:
+                message = f"Browser cookies validated and session saved for @{resolved_username}."
+                code = 'cookie_import_success'
+
+            self._set_runtime_status('session_valid', code, message)
+            return {
+                'success': True,
+                'message': message,
+                'ig_username': resolved_username,
+                'step': 'session_valid',
+                'code': code,
+            }
+
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Login failed: {error_msg}")
-            
-            # Provide helpful guidance for common Instagram blocks
-            if "null login result" in error_msg.lower() or "fail" in error_msg.lower():
-                logger.error("╔═══════════════════════════════════════════════════════════════╗")
-                logger.error("║ Instagram is blocking automated login attempts.              ║")
-                logger.error("║                                                               ║")
-                logger.error("║ WORKAROUND: Import session from browser                      ║")
-                logger.error("║ 1. Login to Instagram in Chrome/Firefox                      ║")
-                logger.error("║ 2. Use instaloader --login from command line                 ║")
-                logger.error("║ 3. Or manually copy cookies to session file                  ║")
-                logger.error("║                                                               ║")
-                logger.error("║ See TROUBLESHOOTING.md for detailed instructions             ║")
-                logger.error("╚═══════════════════════════════════════════════════════════════╝")
-            
-            return False
+            message = f'Cookie import failed: {e}'
+            self._set_runtime_status('session_invalid', 'cookie_import_error', message, 'Use fresh browser cookies and retry.')
+            return {
+                'success': False,
+                'message': message,
+                'ig_username': None,
+                'step': 'session_invalid',
+                'code': 'cookie_import_error',
+                'recommendation': 'Use fresh browser cookies and retry.',
+            }
     
     def get_saved_posts(self) -> Generator[Dict, None, None]:
         """
@@ -173,21 +418,35 @@ class InstagramManager:
             return False, "Not logged in"
         
         try:
-            # Validate session by resolving the authenticated profile directly.
-            profile = instaloader.Profile.own_profile(self.loader.context)
-            # If we can get basic info without error, session is valid
-            _ = profile.username
-            
-            import time
-            self.last_session_check = time.time()
-            
-            return True, "Session is valid"
+            self._set_runtime_status('validating_session', 'session_validation_started', f"Validating session for @{self.username or 'unknown'}.")
+            ok, message, resolved_username = self._validate_authenticated_session(self.username)
+            if ok:
+                self._set_runtime_status('session_valid', 'session_valid', message)
+                return True, message
+            self._set_runtime_status('session_invalid', 'session_invalid', message, 'Refresh browser cookies and retry.')
+            if resolved_username and not self.username:
+                self.username = resolved_username
+            return False, message
         except instaloader.exceptions.BadResponseException:
             return False, "Session expired - cookies are no longer valid"
         except instaloader.exceptions.ConnectionException as e:
             return False, f"Connection error: {str(e)}"
         except Exception as e:
             return False, f"Session test failed: {str(e)}"
+
+    def resolve_post_authenticated(self, shortcode: str) -> instaloader.Post:
+        """Resolve a post shortcode with the authenticated loader only."""
+        if not self.logged_in:
+            raise RuntimeError('A valid authenticated Instagram session is required before resolving a post.')
+
+        shortcode = str(shortcode or '').strip()
+        self._set_runtime_status('resolving_post', 'post_resolution_started', f"Resolving Instagram post {shortcode} with authenticated session.")
+
+        post = self._get_post_with_fallback(shortcode, authenticated=True)
+        owner = self._safe_post_attr(post, 'owner_username', 'unknown') or 'unknown'
+        typename = self._safe_post_attr(post, 'typename', 'Unknown') or 'Unknown'
+        self._set_runtime_status('post_resolved', 'post_resolved', f"Resolved {shortcode} as {typename} by @{owner}.")
+        return post
     
     def get_session_age(self) -> Optional[float]:
         """Get the age of the session file in seconds.
@@ -287,6 +546,20 @@ class InstagramManager:
     def classify_failure_category(self, error: Exception | str) -> str:
         """Classify a failure into a UI-friendly diagnostics bucket."""
         msg = str(error).lower() if error is not None else ""
+
+        thumbnail_fetch_markers = [
+            "parse-miss",
+            "decode-fail",
+            "cannot identify image file",
+            "timeout:",
+            "timed out",
+            "thumbnail fetch",
+            "opengraph preview image",
+        ]
+        if any(marker in msg for marker in thumbnail_fetch_markers):
+            # Thumbnail retrieval failures are usually rate-limit/challenge/CDN gating
+            # when anonymous endpoints return HTML/non-image payloads.
+            return "rate_limit_gating_issue"
 
         hard_not_found_markers = [
             "post not found",
@@ -427,68 +700,181 @@ class InstagramManager:
 
         return None
 
-    def _extract_opengraph_media(self, shortcode: str) -> Optional[Dict[str, str]]:
+    def _extract_opengraph_media(self, shortcode: str) -> Optional[Dict[str, Any]]:
         """Extract public media URLs from Instagram post HTML OpenGraph tags."""
-        page_url = f"https://www.instagram.com/p/{shortcode}/"
-        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
         headers = {
             'User-Agent': 'Mozilla/5.0',
             'Accept-Language': 'en-US,en;q=0.9',
         }
 
-        try:
-            response = requests.get(page_url, headers=headers, timeout=15)
-        except Exception as e:
-            logger.debug(f"OpenGraph fetch failed for {shortcode}: {e}")
-            return None
+        def _decode_candidate_url(raw_url: str) -> str:
+            value = str(raw_url or '').strip()
+            if not value:
+                return ''
+            try:
+                value = value.encode('utf-8').decode('unicode_escape')
+            except Exception:
+                pass
+            value = html.unescape(value)
+            value = value.replace('\\/', '/').replace('\\u0026', '&').strip()
+            return value
 
-        if int(response.status_code) != 200:
-            logger.debug(f"OpenGraph fetch returned HTTP {response.status_code} for {shortcode}")
-            return None
+        def _extract_ranked_image_candidates(*html_chunks: str) -> List[str]:
+            """Find and score image URLs embedded in page payloads.
 
-        html_text = response.text or ''
+            Prefer non-cropped variants and larger dimensions when available.
+            """
+            all_candidates: List[str] = []
+            patterns = [
+                r'\\"display_url\\"\s*:\s*\\"([^\\\"]+)\\"',
+                r'\\"thumbnail_src\\"\s*:\s*\\"([^\\\"]+)\\"',
+                r'\\"image_url\\"\s*:\s*\\"([^\\\"]+)\\"',
+                r'\\"src\\"\s*:\s*\\"([^\\\"]+)\\"',
+                r'"display_url"\s*:\s*"([^"]+)"',
+                r'"thumbnail_src"\s*:\s*"([^"]+)"',
+                r'"image_url"\s*:\s*"([^"]+)"',
+                r'"src"\s*:\s*"([^"]+)"',
+            ]
 
-        def _meta_content(prop_name: str) -> str:
-            pattern = rf'<meta[^>]+property="{prop_name}"[^>]+content="([^"]*)"'
-            match = re.search(pattern, html_text, flags=re.IGNORECASE)
-            return html.unescape(match.group(1)).strip() if match else ''
-
-        image_url = _meta_content('og:image')
-        video_url = _meta_content('og:video')
-        description = _meta_content('og:description')
-        is_video_hint = False
-
-        # Some post pages omit og:video for reels/videos. The embed page often
-        # includes escaped JSON with video_url and is_video markers.
-        try:
-            embed_resp = requests.get(embed_url, headers=headers, timeout=15)
-            if int(embed_resp.status_code) == 200:
-                embed_html = embed_resp.text or ''
-                if re.search(r'\\"is_video\\"\s*:\s*true', embed_html, flags=re.IGNORECASE):
-                    is_video_hint = True
-
-                video_match = re.search(r'\\"video_url\\"\s*:\s*\\"([^\\"]+)\\"', embed_html)
-                if video_match and not video_url:
-                    raw_url = video_match.group(1)
-                    # Decode escaped JSON URL fragments such as \/ and \u0026.
+            for chunk in html_chunks:
+                if not chunk:
+                    continue
+                for pattern in patterns:
                     try:
-                        video_url = raw_url.encode('utf-8').decode('unicode_escape')
+                        for match in re.findall(pattern, chunk, flags=re.IGNORECASE):
+                            decoded = _decode_candidate_url(match)
+                            lowered = decoded.lower()
+                            if decoded.startswith('http') and (
+                                'cdninstagram.com' in lowered
+                                or 'fbcdn.net' in lowered
+                                or 'instagram.' in lowered
+                            ):
+                                all_candidates.append(decoded)
                     except Exception:
-                        video_url = raw_url
-                    video_url = video_url.replace('\\/', '/').replace('\\u0026', '&').strip()
-        except Exception as e:
-            logger.debug(f"Embed OpenGraph fetch failed for {shortcode}: {e}")
+                        continue
 
-        if not image_url and not video_url:
-            return None
+            if not all_candidates:
+                return []
 
-        return {
-            'image_url': image_url,
-            'video_url': video_url,
-            'description': description,
-            'page_url': page_url,
-            'is_video_hint': 'true' if is_video_hint else 'false',
-        }
+            def _score(url: str) -> int:
+                score = 0
+                lowered = url.lower()
+
+                # Favor URLs that look like full media variants.
+                if 'display' in lowered:
+                    score += 4
+                if 'p1080x1080' in lowered or 's1080x1080' in lowered:
+                    score += 6
+                elif 'p750x750' in lowered or 's750x750' in lowered:
+                    score += 4
+                elif 'p640x640' in lowered or 's640x640' in lowered:
+                    score += 2
+
+                # Prefer non-square dimensions that often preserve full framing.
+                if re.search(r'(?:p|s)(?:1080|750|640)x(?:1350|1440|1920)', lowered):
+                    score += 8
+
+                # Penalize explicitly cropped transforms like stp=c288.0.864.864a
+                if 'stp=c' in lowered or '/stp/c' in lowered:
+                    score -= 14
+
+                # Favor fit transforms over crop transforms when present.
+                if 'stp=dst-jpg' in lowered or '/stp/dst-jpg' in lowered:
+                    score += 3
+
+                # Slightly favor larger query payload URLs (often richer transforms).
+                score += min(4, len(url) // 150)
+                return score
+
+            unique = list(dict.fromkeys(all_candidates))
+            return sorted(unique, key=_score, reverse=True)
+
+        page_candidates = [
+            f"https://www.instagram.com/p/{shortcode}/",
+            f"https://www.instagram.com/reel/{shortcode}/",
+        ]
+
+        for page_url in page_candidates:
+            try:
+                response = requests.get(page_url, headers=headers, timeout=15)
+            except Exception as e:
+                logger.debug(f"OpenGraph fetch failed for {shortcode} via {page_url}: {e}")
+                continue
+
+            if int(response.status_code) != 200:
+                logger.debug(f"OpenGraph fetch returned HTTP {response.status_code} for {shortcode} via {page_url}")
+                continue
+
+            html_text = response.text or ''
+
+            def _meta_content(prop_name: str) -> str:
+                pattern = rf'<meta[^>]+property="{prop_name}"[^>]+content="([^"]*)"'
+                match = re.search(pattern, html_text, flags=re.IGNORECASE)
+                return html.unescape(match.group(1)).strip() if match else ''
+
+            image_url = _meta_content('og:image')
+            video_url = _meta_content('og:video')
+            description = _meta_content('og:description')
+            is_video_hint = False
+            payload_image_url = ''
+            image_candidates: List[str] = []
+
+            embed_url = page_url.rstrip('/') + '/embed/captioned/'
+            embed_html = ''
+
+            # Some post pages omit og:video for reels/videos. The embed page often
+            # includes escaped JSON with video_url and is_video markers.
+            try:
+                embed_resp = requests.get(embed_url, headers=headers, timeout=15)
+                if int(embed_resp.status_code) == 200:
+                    embed_html = embed_resp.text or ''
+                    if re.search(r'\\"is_video\\"\s*:\s*true', embed_html, flags=re.IGNORECASE):
+                        is_video_hint = True
+
+                    video_match = re.search(r'\\"video_url\\"\s*:\s*\\"([^\\"]+)\\"', embed_html)
+                    if video_match and not video_url:
+                        raw_url = video_match.group(1)
+                        # Decode escaped JSON URL fragments such as \/ and \u0026.
+                        try:
+                            video_url = raw_url.encode('utf-8').decode('unicode_escape')
+                        except Exception:
+                            video_url = raw_url
+                        video_url = video_url.replace('\\/', '/').replace('\\u0026', '&').strip()
+            except Exception as e:
+                logger.debug(f"Embed OpenGraph fetch failed for {shortcode} via {embed_url}: {e}")
+
+            # Prefer richer page payload image URLs over og:image when available.
+            payload_candidates = _extract_ranked_image_candidates(html_text, embed_html)
+            if payload_candidates:
+                image_candidates.extend(payload_candidates)
+                payload_image_url = payload_candidates[0]
+                image_url = payload_image_url
+                logger.debug(
+                    "OpenGraph thumbnail source for %s selected payload candidate: %s",
+                    shortcode,
+                    payload_image_url[:220],
+                )
+            elif image_url:
+                logger.debug(
+                    "OpenGraph thumbnail source for %s using og:image fallback: %s",
+                    shortcode,
+                    image_url[:220],
+                )
+
+            if image_url and image_url not in image_candidates:
+                image_candidates.append(image_url)
+
+            if image_url or video_url:
+                return {
+                    'image_url': image_url,
+                    'image_candidates': image_candidates,
+                    'video_url': video_url,
+                    'description': description,
+                    'page_url': page_url,
+                    'is_video_hint': 'true' if is_video_hint else 'false',
+                }
+
+        return None
 
     def _download_url_to_file(self, file_url: str, output_path: Path) -> bool:
         """Download a URL directly to a local file path."""
@@ -627,37 +1013,8 @@ class InstagramManager:
         """
         if not self.logged_in:
             raise RuntimeError("Must be logged in to download")
-        
-        # Try anonymous download first for public posts
-        try:
-            return self._download_post_anonymous(shortcode, target_dir)
-        except instaloader.exceptions.LoginRequiredException:
-            logger.info(f"Post {shortcode} requires login → Using authenticated session for fallback")
-            return self._download_post_authenticated(shortcode, target_dir)
-        except Exception as e:
-            # For most anonymous failures, try authenticated fallback before failing.
-            error_msg = str(e).lower()
-            hard_not_found_markers = [
-                'post not found',
-                '404',
-                'invalid or incorrect shortcode',
-                'never existed',
-            ]
-
-            if any(marker in error_msg for marker in hard_not_found_markers):
-                raise
-
-            logger.warning(
-                f"Anonymous download failed for {shortcode}; attempting authenticated fallback. Error: {e}",
-                exc_info=True,
-            )
-            try:
-                return self._download_post_authenticated(shortcode, target_dir)
-            except Exception as auth_error:
-                raise Exception(
-                    f"Download failed in both anonymous and authenticated modes for {shortcode}. "
-                    f"Anonymous error: {e} | Auth error: {auth_error}"
-                ) from auth_error
+        self._set_runtime_status('resolving_post', 'download_started', f"Starting authenticated download for {shortcode}.")
+        return self._download_post_authenticated(shortcode, target_dir)
     
     def _download_post_anonymous(self, shortcode: str, target_dir: Path) -> tuple:
         """
@@ -1070,7 +1427,7 @@ class InstagramManager:
             Dict with post info, or None if failed
         """
         try:
-            post = instaloader.Post.from_shortcode(self.loader.context, shortcode)
+            post = self.resolve_post_authenticated(shortcode) if self.logged_in else self._get_post_with_fallback(shortcode, authenticated=False)
             return self._post_to_dict(post)
         except Exception as e:
             logger.error(f"Failed to get post info for {shortcode}: {e}")
@@ -1097,6 +1454,110 @@ class InstagramManager:
         import requests
         from PIL import Image
         from io import BytesIO
+
+        def _build_image_request_headers(page_url: str = '') -> Dict[str, str]:
+            lang = random.choice(['en-US,en;q=0.9', 'en-US,en;q=0.8', 'en;q=0.9'])
+            headers = {
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/126.0.0.0 Safari/537.36'
+                ),
+                'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                'Accept-Language': lang,
+                'DNT': random.choice(['1', '0']),
+            }
+            if page_url:
+                headers['Referer'] = page_url
+            return headers
+
+        def _retry_delay(attempt: int, base_min: float = 0.9, base_max: float = 1.8) -> float:
+            return min(8.0, random.uniform(base_min, base_max) + (attempt * 0.7))
+
+        def _build_cropless_thumbnail_url(url: str) -> str:
+            value = str(url or '').strip()
+            if not value:
+                return ''
+
+            # Remove explicit crop transform query token.
+            value = re.sub(r'([?&])stp=c[^&]*&?', r'\1', value, flags=re.IGNORECASE)
+            # Remove explicit crop transform path token.
+            value = re.sub(r'/stp/c[^/]+/', '/', value, flags=re.IGNORECASE)
+
+            # Normalize separators after query edits.
+            value = value.replace('?&', '?')
+            value = re.sub(r'[?&]$', '', value)
+            value = re.sub(r'&&+', '&', value)
+            return value
+
+        def _fetch_image_bytes_with_retries(
+            image_url: str,
+            headers: Optional[Dict[str, str]],
+            mode_label: str,
+            max_attempts: int = 3,
+            page_url: str = '',
+            session: Optional[requests.Session] = None,
+        ) -> bytes:
+            last_error = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    request_headers = dict(headers or _build_image_request_headers(page_url))
+                    if page_url and 'Referer' not in request_headers:
+                        request_headers['Referer'] = page_url
+
+                    http_client = session if session is not None else requests
+                    response = http_client.get(image_url, headers=request_headers, timeout=30)
+                    response.raise_for_status()
+
+                    final_url = str(response.url or '').lower()
+                    if '/accounts/login' in final_url or '/challenge/' in final_url:
+                        raise Exception(f"403: challenge/login interstitial for thumbnail URL ({mode_label})")
+
+                    content_type = str(response.headers.get('Content-Type') or '').lower()
+                    body_head_bytes = (response.content or b'')[:1024]
+                    body_head_text = body_head_bytes.decode('utf-8', errors='ignore').lower()
+
+                    if body_head_text.startswith('<!doctype html') or '<html' in body_head_text:
+                        raise Exception(
+                            f"decode-fail: html response for thumbnail URL content-type={content_type or 'unknown'} ({mode_label})"
+                        )
+
+                    if content_type and not content_type.startswith('image/'):
+                        # Instagram sometimes returns HTML/challenge content for blocked anonymous requests.
+                        if '<html' in body_head_text or 'instagram' in body_head_text:
+                            raise Exception(
+                                f"decode-fail: non-image content-type={content_type} ({mode_label})"
+                            )
+
+                    # Validate image decodability before writing to disk.
+                    with Image.open(BytesIO(response.content)) as img:
+                        img.load()
+
+                    return response.content
+                except Exception as e:
+                    last_error = e
+                    error_text = str(e).lower()
+                    non_retry_markers = [
+                        'challenge/login interstitial',
+                        'decode-fail: non-image content-type',
+                        'decode-fail: html response',
+                        'cannot identify image file',
+                        '403:',
+                    ]
+                    if any(marker in error_text for marker in non_retry_markers):
+                        break
+                    if attempt >= max_attempts:
+                        break
+                    delay = _retry_delay(attempt)
+                    logger.warning(
+                        f"Thumbnail fetch retry for {shortcode} ({mode_label}) attempt {attempt}/{max_attempts} failed: {e}. "
+                        f"Retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+
+            if last_error is not None:
+                raise last_error
+            raise Exception(f"Thumbnail fetch failed with unknown error ({mode_label})")
 
         def _extract_from_local_file(source_file: Path):
             """Extract/create thumbnail from an existing local media file."""
@@ -1144,78 +1605,108 @@ class InstagramManager:
             thumbnail_url = post.url
 
             logger.info(f"Downloading thumbnail for {shortcode} from {thumbnail_url} ({mode_label})")
-            response = requests.get(thumbnail_url, timeout=30)
-            response.raise_for_status()
+            page_url = f"https://www.instagram.com/p/{shortcode}/"
+            headers = _build_image_request_headers(page_url)
+            image_bytes = _fetch_image_bytes_with_retries(
+                thumbnail_url,
+                headers=headers,
+                mode_label=f"{mode_label}-graphql-image",
+                max_attempts=3,
+                page_url=page_url,
+            )
 
-            img = Image.open(BytesIO(response.content))
+            img = Image.open(BytesIO(image_bytes))
             width, height = img.size
 
             target_path.parent.mkdir(parents=True, exist_ok=True)
             with open(target_path, 'wb') as f:
-                f.write(response.content)
+                f.write(image_bytes)
 
             logger.info(f"Thumbnail saved: {target_path} ({width}x{height})")
             return (True, (width, height))
 
-        def _download_from_page_meta(url: str, mode_label: str):
-            """Fetch og:image from Instagram page HTML and save it as thumbnail."""
-            if not url:
-                raise Exception("No URL available for page-meta thumbnail lookup")
+        def _download_from_opengraph(shortcode_value: str, mode_label: str):
+            """Fetch preview image anonymously from resilient OpenGraph extraction."""
+            og = self._extract_opengraph_media(shortcode_value)
+            if not og:
+                raise Exception("parse-miss: OpenGraph preview image not found in public Instagram HTML")
 
-            session = None
-            if self.logged_in and hasattr(self.loader, 'context') and hasattr(self.loader.context, '_session'):
-                session = self.loader.context._session
+            page_url = og.get('page_url') or f"https://www.instagram.com/p/{shortcode_value}/"
+            logger.info(f"Attempting OpenGraph thumbnail fetch for {shortcode_value} via {page_url} ({mode_label})")
 
-            logger.info(f"Attempting page-meta thumbnail fetch for {shortcode} via {url} ({mode_label})")
-            headers = {
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/126.0.0.0 Safari/537.36'
-                )
-            }
+            thumbnail_url = str(og.get('image_url') or '').strip()
+            if not thumbnail_url:
+                raise Exception("parse-miss: OpenGraph preview image URL was empty")
 
-            if session is not None:
-                page_resp = session.get(url, headers=headers, timeout=30)
-            else:
-                page_resp = requests.get(url, headers=headers, timeout=30)
+            headers = _build_image_request_headers(page_url)
+            image_bytes = None
+            last_error = None
+            session = requests.Session()
 
-            page_resp.raise_for_status()
-            html_text = page_resp.text
+            # Warm-up anonymous page session so image CDN requests carry related cookies.
+            try:
+                session.get(page_url, headers=_build_image_request_headers(page_url), timeout=15)
+                embed_url = page_url.rstrip('/') + '/embed/captioned/'
+                session.get(embed_url, headers=_build_image_request_headers(page_url), timeout=15)
+            except Exception as warm_err:
+                logger.debug(f"Anonymous thumbnail session warm-up failed for {shortcode_value}: {warm_err}")
 
-            match = re.search(
-                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-                html_text,
-                re.IGNORECASE
-            )
-            if not match:
-                match = re.search(
-                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-                    html_text,
-                    re.IGNORECASE
-                )
+            ranked_candidates = [url for url in (og.get('image_candidates') or []) if str(url).strip()]
+            if thumbnail_url not in ranked_candidates:
+                ranked_candidates.insert(0, thumbnail_url)
 
-            if not match:
-                raise Exception("og:image not found in page HTML")
+            candidate_urls: List[str] = []
+            for candidate in ranked_candidates[:4]:
+                candidate_urls.append(candidate)
+                cropped_fallback_url = _build_cropless_thumbnail_url(candidate)
+                if cropped_fallback_url and cropped_fallback_url != candidate:
+                    candidate_urls.append(cropped_fallback_url)
 
-            thumbnail_url = html.unescape(match.group(1))
-            if session is not None:
-                img_resp = session.get(thumbnail_url, headers=headers, timeout=30)
-            else:
-                img_resp = requests.get(thumbnail_url, headers=headers, timeout=30)
-            img_resp.raise_for_status()
+            unique_candidate_urls = list(dict.fromkeys([u for u in candidate_urls if u]))
 
-            img = Image.open(BytesIO(img_resp.content))
+            for index, candidate_url in enumerate(unique_candidate_urls, start=1):
+                try:
+                    logger.debug(
+                        "OpenGraph thumbnail candidate %s/%s for %s: %s",
+                        index,
+                        len(unique_candidate_urls),
+                        shortcode_value,
+                        candidate_url[:220],
+                    )
+                    image_bytes = _fetch_image_bytes_with_retries(
+                        candidate_url,
+                        headers=headers,
+                        mode_label=f"{mode_label}-candidate-{index}",
+                        max_attempts=2,
+                        page_url=page_url,
+                        session=session,
+                    )
+                    if image_bytes:
+                        break
+                except Exception as e:
+                    last_error = e
+                    continue
+
+            if image_bytes is None:
+                if last_error is not None:
+                    raise last_error
+                raise Exception("decode-fail: OpenGraph image download returned empty payload")
+
+            img = Image.open(BytesIO(image_bytes))
             width, height = img.size
 
             target_path.parent.mkdir(parents=True, exist_ok=True)
             with open(target_path, 'wb') as f:
-                f.write(img_resp.content)
+                f.write(image_bytes)
 
             logger.info(f"Thumbnail saved via page meta: {target_path} ({width}x{height})")
             return (True, (width, height))
         
         try:
+            self._set_last_thumbnail_failure_reason('')
+            skip_graphql_after_opengraph = False
+            opengraph_failure_text = ''
+
             # Method 0: Prefer local media extraction when a known local file exists.
             if local_media_path:
                 local_file = Path(local_media_path)
@@ -1225,32 +1716,82 @@ class InstagramManager:
                     except Exception as local_extract_err:
                         logger.debug(f"Local media thumbnail extraction failed for {shortcode}: {local_extract_err}")
 
-            # Method 1: Try getting thumbnail from Instagram GraphQL contexts.
-            graphql_allowed = time.time() >= self.thumbnail_graphql_block_until
+            network_slot_acquired = self._thumbnail_request_semaphore.acquire(timeout=20)
+            if not network_slot_acquired:
+                raise Exception("timeout: waiting for thumbnail request slot")
+
+            # Method 1: Prefer anonymous HTML OpenGraph extraction. This is the
+            # least invasive network path and does not rely on a logged-in session.
+            try:
+                return _download_from_opengraph(shortcode, "opengraph-anonymous")
+            except Exception as e:
+                logger.debug(f"Anonymous OpenGraph thumbnail fetch failed for {shortcode}: {e}")
+                opengraph_failure_text = str(e or '')
+                opengraph_error_text = str(e).lower()
+                if (
+                    'decode-fail: html response' in opengraph_error_text
+                    or 'challenge/login interstitial' in opengraph_error_text
+                    or 'decode-fail: non-image content-type' in opengraph_error_text
+                    or '403:' in opengraph_error_text
+                ):
+                    skip_graphql_after_opengraph = True
+                    self.thumbnail_graphql_block_until = max(self.thumbnail_graphql_block_until, time.time() + 300)
+                    logger.info(
+                        f"Skipping anonymous GraphQL thumbnail fallback for {shortcode}: OpenGraph indicates gating/challenge"
+                    )
+
+            # Method 2: Cookie/session-backed fallback (no password prompt).
+            # If an authenticated/cookie session is already active, use it before
+            # hitting anonymous GraphQL fallback paths.
+            if self.logged_in:
+                try:
+                    logger.info(f"Trying cookie-session thumbnail fallback for {shortcode}")
+                    result = _download_from_post_context(self.loader.context, "cookie-session")
+                    return result
+                except Exception as e:
+                    logger.debug(f"Cookie-session thumbnail fallback failed for {shortcode}: {e}")
+                    if self.classify_failure_category(e) == 'auth_session_issue':
+                        logger.info(
+                            f"Cookie-session thumbnail fallback for {shortcode} failed due to auth/session issue; "
+                            "continuing with anonymous fallbacks without prompting for password"
+                        )
+
+            # Method 3: Try anonymous Instaloader GraphQL context.
+            graphql_allowed = (time.time() >= self.thumbnail_graphql_block_until) and not skip_graphql_after_opengraph
             if graphql_allowed:
                 graph_errors = []
+                opengraph_parse_miss = 'parse-miss' in opengraph_failure_text.lower()
+                max_graphql_attempts = 1 if opengraph_parse_miss else 3
+                if opengraph_parse_miss:
+                    logger.info(
+                        f"OpenGraph parse-miss for {shortcode}; limiting anonymous GraphQL thumbnail fallback to {max_graphql_attempts} attempt"
+                    )
 
-                # Prefer authenticated first; anonymous often hits 403 earlier.
-                if self.logged_in:
+                for attempt in range(1, max_graphql_attempts + 1):
                     try:
-                        result = _download_from_post_context(self.loader.context, "authenticated")
+                        result = _download_from_post_context(self.anon_loader.context, f"anonymous-attempt-{attempt}")
                         self.thumbnail_graphql_failures = 0
                         return result
+                    except instaloader.exceptions.LoginRequiredException:
+                        logger.info(f"Thumbnail for {shortcode} requires login; anonymous mode rejected")
+                        break
                     except Exception as e:
                         graph_errors.append(e)
-                        logger.debug(f"Authenticated thumbnail fetch failed for {shortcode}: {e}")
+                        logger.debug(f"Anonymous thumbnail fetch failed for {shortcode} attempt {attempt}: {e}")
+                        category = self.classify_failure_category(e)
+                        if category == 'rate_limit_gating_issue':
+                            logger.info(
+                                f"Anonymous GraphQL thumbnail fallback for {shortcode} hit rate-limit/gating; stopping retries"
+                            )
+                            break
+                        if attempt < max_graphql_attempts:
+                            delay = _retry_delay(attempt, base_min=1.2, base_max=2.6)
+                            time.sleep(delay)
 
-                try:
-                    result = _download_from_post_context(self.anon_loader.context, "anonymous")
-                    self.thumbnail_graphql_failures = 0
-                    return result
-                except instaloader.exceptions.LoginRequiredException:
-                    logger.info(f"Thumbnail for {shortcode} requires login; anonymous mode rejected")
-                except Exception as e:
-                    graph_errors.append(e)
-                    logger.debug(f"Anonymous thumbnail fetch failed for {shortcode}: {e}")
-
-                if any('403' in str(err) or 'Forbidden' in str(err) for err in graph_errors):
+                if any(
+                    ('403' in str(err) or 'Forbidden' in str(err) or self.classify_failure_category(err) == 'rate_limit_gating_issue')
+                    for err in graph_errors
+                ):
                     self.thumbnail_graphql_failures += 1
                     cooldown_s = 900 if self.thumbnail_graphql_failures >= 1 else 300
                     self.thumbnail_graphql_block_until = time.time() + cooldown_s
@@ -1259,26 +1800,9 @@ class InstagramManager:
                     )
             else:
                 remaining = int(self.thumbnail_graphql_block_until - time.time())
-                logger.info(f"GraphQL thumbnail lookup backoff active ({remaining}s remaining); using fallback methods")
+                logger.info(f"Anonymous GraphQL thumbnail lookup backoff active ({remaining}s remaining); using local fallbacks")
 
-            # Method 2: Try page HTML og:image extraction (no GraphQL).
-            candidate_urls = []
-            if post_url:
-                candidate_urls.append(post_url)
-            candidate_urls.append(f"https://www.instagram.com/p/{shortcode}/")
-            candidate_urls.append(f"https://www.instagram.com/reel/{shortcode}/")
-
-            seen = set()
-            for url in candidate_urls:
-                if not url or url in seen:
-                    continue
-                seen.add(url)
-                try:
-                    return _download_from_page_meta(url, "page-meta")
-                except Exception as e:
-                    logger.debug(f"Page-meta thumbnail fetch failed for {shortcode} via {url}: {e}")
-
-            # Method 3: Try to extract from downloaded files in the same directory
+            # Method 4: Try to extract from downloaded files in the same directory
             # Look for downloaded files with this shortcode
             download_dir = target_path.parent.parent  # Go up from .thumbnails to account dir
             logger.info(f"Searching for downloaded files in: {download_dir}")
@@ -1303,11 +1827,18 @@ class InstagramManager:
                         logger.debug(f"Could not extract thumbnail from local file {source_file}: {local_extract_err}")
 
             # If we got here, no methods worked
-            raise Exception(f"Could not fetch thumbnail from Instagram or extract from local files")
+            raise Exception("parse-miss: Could not fetch thumbnail from Instagram or extract from local files")
         
         except Exception as e:
+            self._set_last_thumbnail_failure_reason(self._classify_thumbnail_failure_reason(e))
             logger.error(f"Failed to download thumbnail for {shortcode}: {e}")
             return (False, None)
+        finally:
+            if 'network_slot_acquired' in locals() and network_slot_acquired:
+                try:
+                    self._thumbnail_request_semaphore.release()
+                except ValueError:
+                    pass
     
     def _post_to_dict(self, post, fetch_full_metadata=False) -> Dict:
         """
@@ -1354,11 +1885,15 @@ class InstagramManager:
             except:
                 result['date'] = datetime.now().isoformat()
             
-            # Video URL
-            try:
-                result['video_url'] = post.video_url if is_video else None
-            except:
-                result['video_url'] = None
+            # Avoid triggering extra GraphQL video metadata calls during list ingest.
+            # `video_url` is not required for browse rows and can emit noisy warnings
+            # for otherwise valid saved posts when Instagram gates metadata endpoints.
+            result['video_url'] = None
+            if fetch_full_metadata and is_video:
+                try:
+                    result['video_url'] = post.video_url
+                except:
+                    result['video_url'] = None
             
             # Media count for carousels
             try:

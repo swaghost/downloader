@@ -486,7 +486,6 @@ class DatabaseManagerSQLServer:
             )
             rows = cursor.fetchall()
             conn.commit()
-
             for row in rows:
                 shortcode = row[0]
                 is_inserted = bool(row[1])
@@ -1326,10 +1325,19 @@ class DatabaseManagerSQLServer:
         cursor = conn.cursor()
 
         cursor.execute('''
-            SELECT id, account_name, text, content_type
-            FROM DL.content_entries
-            WHERE account_name = ?
-            ORDER BY row_number ASC
+            SELECT
+                ce.id,
+                ce.account_name,
+                ce.text,
+                ce.type,
+                CASE
+                    WHEN ce.type = 'reel' THEN 'GraphVideo'
+                    WHEN ce.type = 'carousel' THEN 'GraphSidecar'
+                    ELSE 'GraphImage'
+                END AS typename
+            FROM DL.content_entries ce
+            WHERE ce.account_name = ?
+            ORDER BY ce.row_number ASC
         ''', (self.account_name,))
 
         rows = []
@@ -3262,6 +3270,19 @@ class DatabaseManagerSQLServer:
             conn.rollback()
             raise Exception(f"Failed to delete thumbnail: {e}")
 
+    def _get_video_output_vidid_sql_type(self, cursor):
+        cursor.execute('''
+            SELECT TOP 1 TYPE_NAME(c.user_type_id)
+            FROM sys.columns c
+            INNER JOIN sys.tables t ON t.object_id = c.object_id
+            INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+            WHERE s.name = 'VIDEO' AND t.name = 'VideoOutput' AND c.name = 'VidID'
+        ''')
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0].upper()
+        return 'INT'
+
     def ensure_video_output_tables(self):
         """Ensure VIDEO.VideoOutput, VIDEO.AudioTracks, and VIDEO.FileAssembly tables exist."""
         conn = self._get_connection()
@@ -3330,9 +3351,11 @@ class DatabaseManagerSQLServer:
             ''')
             conn.commit()
 
-            cursor.execute('''
+            vidid_sql_type = self._get_video_output_vidid_sql_type(cursor)
+
+            cursor.execute(f'''
                 IF COL_LENGTH('VIDEO.AudioTracks', 'VidID') IS NULL
-                    ALTER TABLE VIDEO.AudioTracks ADD VidID INT NULL;
+                    ALTER TABLE VIDEO.AudioTracks ADD VidID {vidid_sql_type} NULL;
                 IF COL_LENGTH('VIDEO.AudioTracks', 'TrackOrder') IS NULL
                     ALTER TABLE VIDEO.AudioTracks ADD TrackOrder INT NULL;
                 IF COL_LENGTH('VIDEO.AudioTracks', 'TrackPath') IS NULL
@@ -3357,6 +3380,110 @@ class DatabaseManagerSQLServer:
                     ALTER TABLE VIDEO.AudioTracks ADD Muted BIT NOT NULL CONSTRAINT DF_AudioTracks_Muted DEFAULT 0;
                 IF COL_LENGTH('VIDEO.AudioTracks', 'CreatedAt') IS NULL
                     ALTER TABLE VIDEO.AudioTracks ADD CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_AudioTracks_CreatedAt DEFAULT GETDATE();
+            ''')
+            conn.commit()
+
+            cursor.execute(f'''
+                DECLARE @audioTracksNeedsRebuild BIT = 0;
+
+                IF EXISTS (
+                    SELECT 1
+                    FROM sys.tables t
+                    INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = 'VIDEO' AND t.name = 'AudioTracks'
+                )
+                BEGIN
+                    IF COL_LENGTH('VIDEO.AudioTracks', 'AudioTrackID') IS NULL
+                    BEGIN
+                        SET @audioTracksNeedsRebuild = 1;
+                    END
+                    ELSE IF EXISTS (
+                        SELECT 1
+                        FROM sys.key_constraints kc
+                        INNER JOIN sys.tables t ON t.object_id = kc.parent_object_id
+                        INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+                        INNER JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id
+                        INNER JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                        WHERE kc.type = 'PK'
+                          AND s.name = 'VIDEO'
+                          AND t.name = 'AudioTracks'
+                        GROUP BY kc.name
+                        HAVING SUM(CASE WHEN c.name = 'AudioTrackID' THEN 1 ELSE 0 END) = 0
+                            OR COUNT(*) <> 1
+                    )
+                    BEGIN
+                        SET @audioTracksNeedsRebuild = 1;
+                    END
+                END
+
+                IF @audioTracksNeedsRebuild = 1
+                BEGIN
+                    IF OBJECT_ID('VIDEO.AudioTracks_Migrated', 'U') IS NOT NULL
+                        DROP TABLE VIDEO.AudioTracks_Migrated;
+
+                    CREATE TABLE VIDEO.AudioTracks_Migrated (
+                        AudioTrackID INT IDENTITY(1,1) PRIMARY KEY,
+                        VidID {vidid_sql_type} NOT NULL,
+                        TrackOrder INT NOT NULL,
+                        TrackPath NVARCHAR(1000) NOT NULL,
+                        TrackName NVARCHAR(255) NULL,
+                        VolumePercent FLOAT NULL,
+                        ClipStartSeconds FLOAT NULL,
+                        ClipEndSeconds FLOAT NULL,
+                        EnterFrame INT NULL,
+                        ExitFrame INT NULL,
+                        FadeInSeconds FLOAT NULL,
+                        FadeOutSeconds FLOAT NULL,
+                        Muted BIT NOT NULL CONSTRAINT DF_AudioTracks_Migrated_Muted DEFAULT 0,
+                        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_AudioTracks_Migrated_CreatedAt DEFAULT GETDATE(),
+                        CONSTRAINT FK_AudioTracks_Migrated_VideoOutput FOREIGN KEY (VidID)
+                            REFERENCES VIDEO.VideoOutput(VidID) ON DELETE CASCADE
+                    );
+
+                    INSERT INTO VIDEO.AudioTracks_Migrated (
+                        VidID,
+                        TrackOrder,
+                        TrackPath,
+                        TrackName,
+                        VolumePercent,
+                        ClipStartSeconds,
+                        ClipEndSeconds,
+                        EnterFrame,
+                        ExitFrame,
+                        FadeInSeconds,
+                        FadeOutSeconds,
+                        Muted,
+                        CreatedAt
+                    )
+                    SELECT
+                        CAST(ISNULL(VidID, 0) AS {vidid_sql_type}) AS VidID,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY CAST(ISNULL(VidID, 0) AS {vidid_sql_type})
+                            ORDER BY ISNULL(TrackOrder, 0), ISNULL(TrackName, ''), ISNULL(TrackPath, '')
+                        ) AS TrackOrder,
+                        CAST(ISNULL(TrackPath, '') AS NVARCHAR(1000)) AS TrackPath,
+                        CAST(TrackName AS NVARCHAR(255)) AS TrackName,
+                        TRY_CAST(VolumePercent AS FLOAT) AS VolumePercent,
+                        TRY_CAST(ClipStartSeconds AS FLOAT) AS ClipStartSeconds,
+                        TRY_CAST(ClipEndSeconds AS FLOAT) AS ClipEndSeconds,
+                        TRY_CAST(EnterFrame AS INT) AS EnterFrame,
+                        TRY_CAST(ExitFrame AS INT) AS ExitFrame,
+                        TRY_CAST(FadeInSeconds AS FLOAT) AS FadeInSeconds,
+                        TRY_CAST(FadeOutSeconds AS FLOAT) AS FadeOutSeconds,
+                        CAST(ISNULL(Muted, 0) AS BIT) AS Muted,
+                        ISNULL(CreatedAt, GETDATE()) AS CreatedAt
+                    FROM VIDEO.AudioTracks
+                    WHERE ISNULL(VidID, 0) > 0
+                                            AND ISNULL(LTRIM(RTRIM(CAST(TrackPath AS NVARCHAR(1000)))), '') <> ''
+                                            AND EXISTS (
+                                                    SELECT 1
+                                                    FROM VIDEO.VideoOutput vo
+                                        WHERE vo.VidID = CAST(ISNULL(VIDEO.AudioTracks.VidID, 0) AS {vidid_sql_type})
+                                            );
+
+                    DROP TABLE VIDEO.AudioTracks;
+                    EXEC sp_rename 'VIDEO.AudioTracks_Migrated', 'AudioTracks';
+                END
             ''')
             conn.commit()
 
@@ -3477,7 +3604,7 @@ class DatabaseManagerSQLServer:
             ''')
             conn.commit()
 
-            cursor.execute('''
+            cursor.execute(f'''
                 IF NOT EXISTS (
                     SELECT 1
                     FROM sys.tables t
@@ -3487,7 +3614,7 @@ class DatabaseManagerSQLServer:
                 BEGIN
                     CREATE TABLE VIDEO.AudioTracks (
                         AudioTrackID INT IDENTITY(1,1) PRIMARY KEY,
-                        VidID INT NOT NULL,
+                        VidID {vidid_sql_type} NOT NULL,
                         TrackOrder INT NOT NULL,
                         TrackPath NVARCHAR(1000) NOT NULL,
                         TrackName NVARCHAR(255) NULL,
@@ -3507,9 +3634,9 @@ class DatabaseManagerSQLServer:
             ''')
             conn.commit()
 
-            cursor.execute('''
+            cursor.execute(f'''
                 IF COL_LENGTH('VIDEO.FileAssembly', 'VidID') IS NULL
-                    ALTER TABLE VIDEO.FileAssembly ADD VidID INT NULL;
+                    ALTER TABLE VIDEO.FileAssembly ADD VidID {vidid_sql_type} NULL;
                 IF COL_LENGTH('VIDEO.FileAssembly', 'FileID') IS NULL
                     ALTER TABLE VIDEO.FileAssembly ADD FileID INT NULL;
                 IF COL_LENGTH('VIDEO.FileAssembly', 'AssemblyOrder') IS NULL
@@ -3545,7 +3672,7 @@ class DatabaseManagerSQLServer:
             ''')
             conn.commit()
 
-            cursor.execute('''
+            cursor.execute(f'''
                 IF NOT EXISTS (
                     SELECT 1
                     FROM sys.tables t
@@ -3555,7 +3682,7 @@ class DatabaseManagerSQLServer:
                 BEGIN
                     CREATE TABLE VIDEO.FileAssembly (
                         FileAssemblyID INT IDENTITY(1,1) PRIMARY KEY,
-                        VidID INT NOT NULL,
+                        VidID {vidid_sql_type} NOT NULL,
                         AssemblyOrder INT NOT NULL,
                         AssemblyStage NVARCHAR(100) NOT NULL,
                         InputPath NVARCHAR(1000) NULL,
@@ -3585,7 +3712,7 @@ class DatabaseManagerSQLServer:
             ''')
             conn.commit()
 
-            cursor.execute('''
+            cursor.execute(f'''
                 IF NOT EXISTS (
                     SELECT 1
                     FROM sys.tables t
@@ -3595,7 +3722,7 @@ class DatabaseManagerSQLServer:
                 BEGIN
                     CREATE TABLE VIDEO.Applications (
                         VidAID BIGINT IDENTITY(1,1) PRIMARY KEY,
-                        VidID INT NOT NULL,
+                        VidID {vidid_sql_type} NOT NULL,
                         TechniqueClassID INT NOT NULL,
                         TechniqueTypeID INT NOT NULL,
                         TSID BIGINT NULL,
