@@ -18,6 +18,7 @@ import time
 import random
 import wave
 from pathlib import Path
+from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QListWidget,
@@ -38,6 +39,8 @@ import config
 from account_manager import AccountManager
 from instagram_manager import InstagramManager
 from content_database_manager import ContentDatabaseManager
+from shot_breakdown_manager import ShotBreakdownManager
+from beat_composer_manager import BeatComposerManager
 
 logger = logging.getLogger(__name__)
 
@@ -1859,7 +1862,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self._framevid_audio_track_editor_updating = False
         self._framevid_state_loading = False
         self.framevid_last_preview_path = None
-        self.framevid_display_name = "Composer"
+        self.framevid_display_name = "Frame Composer"
 
         # Extract Audio state
         self.audio_extract_source_path = None
@@ -1921,6 +1924,8 @@ class InstagramDownloaderGUI(QMainWindow):
         self.create_vid_prep_tab()
         self.create_extract_audio_tab()
         self.create_framevid_tab()
+        self.create_shot_breakdown_tab()
+        self.create_beat_composer_tab()
         self.create_topics_tab()
         self.create_settings_tab()
         self.create_account_tab()
@@ -6318,8 +6323,8 @@ class InstagramDownloaderGUI(QMainWindow):
                     'path': path,
                     'type': file_type,
                     'duration_seconds': float(data.get('duration_seconds') or 7.0),
-                    'fade_in_seconds': float(data.get('fade_in_seconds') or 0.25),
-                    'fade_out_seconds': float(data.get('fade_out_seconds') or 0.25),
+                    'fade_in_seconds': float(data.get('fade_in_seconds') if data.get('fade_in_seconds') is not None else 0.25),
+                    'fade_out_seconds': float(data.get('fade_out_seconds') if data.get('fade_out_seconds') is not None else 0.25),
                     'clip_start_seconds': float(data.get('clip_start_seconds') or 0.0),
                     'source_media_duration_seconds': float(data.get('source_media_duration_seconds') or 0.0),
                 })
@@ -6398,8 +6403,8 @@ class InstagramDownloaderGUI(QMainWindow):
                     'path': file_path,
                     'type': file_type,
                     'duration_seconds': float(entry.get('duration_seconds') or 7.0),
-                    'fade_in_seconds': float(entry.get('fade_in_seconds') or 0.25),
-                    'fade_out_seconds': float(entry.get('fade_out_seconds') or 0.25),
+                    'fade_in_seconds': float(entry.get('fade_in_seconds') if entry.get('fade_in_seconds') is not None else 0.25),
+                    'fade_out_seconds': float(entry.get('fade_out_seconds') if entry.get('fade_out_seconds') is not None else 0.25),
                     'clip_start_seconds': float(entry.get('clip_start_seconds') or 0.0),
                     'source_media_duration_seconds': float(entry.get('source_media_duration_seconds') or 0.0),
                 })
@@ -6847,8 +6852,11 @@ class InstagramDownloaderGUI(QMainWindow):
             data = self._framevid_clamp_video_timing(data)
             item.setData(Qt.UserRole, data)
             self.framevid_source_duration_spin.setValue(float(data.get('duration_seconds') or 3.0))
-            self.framevid_source_fade_in_spin.setValue(float(data.get('fade_in_seconds') or 0.25))
-            self.framevid_source_fade_out_spin.setValue(float(data.get('fade_out_seconds') or 0.25))
+            # Use 'if not None' to properly preserve 0.0 fade values
+            fade_in = data.get('fade_in_seconds')
+            self.framevid_source_fade_in_spin.setValue(float(fade_in) if fade_in is not None else 0.25)
+            fade_out = data.get('fade_out_seconds')
+            self.framevid_source_fade_out_spin.setValue(float(fade_out) if fade_out is not None else 0.25)
             file_path = str(data.get('path') or '')
             file_type = str(data.get('type') or self._framevid_file_type(file_path))
             self._framevid_update_input_preview(file_path, file_type)
@@ -6902,7 +6910,12 @@ class InstagramDownloaderGUI(QMainWindow):
             item.setData(Qt.UserRole, data)
             updated += 1
 
-        self.framevid_status_text(f"Applied frame timing to {updated} source(s).")
+        # Refresh the editor to show the updated values for the currently selected frame
+        current_item = self.framevid_source_list.currentItem()
+        if current_item:
+            self.on_framevid_source_selection_changed(current_item, None)
+        
+        self.framevid_status_text(f"Applied frame timing (duration: {duration_seconds}s, fade in: {fade_in_seconds}s, fade out: {fade_out_seconds}s) to {updated} source(s).")
         self._save_framevid_state_setting()
 
     def apply_framevid_timing_to_selected_sources(self):
@@ -6928,7 +6941,12 @@ class InstagramDownloaderGUI(QMainWindow):
             item.setData(Qt.UserRole, data)
             updated += 1
 
-        self.framevid_status_text(f"Applied frame timing to {updated} selected source(s).")
+        # Refresh the editor to show the updated values for the currently selected frame
+        current_item = self.framevid_source_list.currentItem()
+        if current_item:
+            self.on_framevid_source_selection_changed(current_item, None)
+        
+        self.framevid_status_text(f"Applied frame timing (duration: {duration_seconds}s, fade in: {fade_in_seconds}s, fade out: {fade_out_seconds}s) to {updated} selected source(s).")
         self._save_framevid_state_setting()
 
     def on_framevid_section_type_changed(self, section_type):
@@ -7420,12 +7438,14 @@ class InstagramDownloaderGUI(QMainWindow):
                     f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black"
                 )
-            vf = (
-                f"{scale_and_frame_vf},"
-                f"fps={fps},format=yuv420p,"
-                f"fade=t=in:st=0:d={min(fade_in_s, duration_s):.3f},"
-                f"fade=t=out:st={fade_out_start:.3f}:d={min(fade_out_s, duration_s):.3f}"
-            )
+            
+            # Build video filter chain - only add fade filters when duration > 0
+            vf_parts = [scale_and_frame_vf, f"fps={fps}", "format=yuv420p"]
+            if fade_in_s > 0:
+                vf_parts.append(f"fade=t=in:st=0:d={min(fade_in_s, duration_s):.3f}")
+            if fade_out_s > 0:
+                vf_parts.append(f"fade=t=out:st={fade_out_start:.3f}:d={min(fade_out_s, duration_s):.3f}")
+            vf = ','.join(vf_parts)
 
             cmd = [ffmpeg_bin, '-y']
             if is_image:
@@ -11753,6 +11773,2319 @@ class InstagramDownloaderGUI(QMainWindow):
             )
         else:
             QMessageBox.information(self, "Vid Prep", f"Saved output:\n{output_path}")
+    
+    def create_shot_breakdown_tab(self):
+        """Create the Shot Breakdown tab for video analysis"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Initialize Shot Breakdown Manager
+        self.shot_breakdown_manager = ShotBreakdownManager()
+        self.shot_breakdown_current_video = None
+        self.shot_breakdown_results = None
+        self.shot_breakdown_current_shot = None
+        
+        # Header
+        header = QLabel("🎬 Shot Breakdown - Cinematic Video Analysis")
+        header.setStyleSheet("font-size: 18pt; font-weight: bold; color: #3b82f6;")
+        layout.addWidget(header)
+        
+        description = QLabel(
+            "Automated shot detection, frame extraction, scene labeling, dependency mapping, "
+            "and AI prompt generation for cinematic video tools (Runway, Pika, Luma, Kling, etc.)"
+        )
+        description.setWordWrap(True)
+        description.setStyleSheet("color: #9ca3af; font-size: 10pt;")
+        layout.addWidget(description)
+        
+        # Main content splitter
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Left panel: Video input and controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setSpacing(10)
+        
+        # Video Input Section
+        input_group = QGroupBox("Step 1: Video Ingestion")
+        input_layout = QVBoxLayout()
+        
+        self.shot_breakdown_video_path_label = QLabel("No video selected")
+        self.shot_breakdown_video_path_label.setStyleSheet(
+            "padding: 10px; background-color: #1e293b; border-radius: 5px; color: #cbd5e1;"
+        )
+        self.shot_breakdown_video_path_label.setWordWrap(True)
+        input_layout.addWidget(self.shot_breakdown_video_path_label)
+        
+        btn_layout = QHBoxLayout()
+        
+        select_video_btn = QPushButton("📂 Select Video")
+        select_video_btn.clicked.connect(self.shot_breakdown_select_video)
+        select_video_btn.setStyleSheet(
+            "QPushButton { background-color: #3b82f6; color: white; padding: 10px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #2563eb; }"
+        )
+        btn_layout.addWidget(select_video_btn)
+        
+        self.shot_breakdown_video_info_btn = QPushButton("ℹ️ Video Info")
+        self.shot_breakdown_video_info_btn.clicked.connect(self.shot_breakdown_show_video_info)
+        self.shot_breakdown_video_info_btn.setEnabled(False)
+        btn_layout.addWidget(self.shot_breakdown_video_info_btn)
+        
+        input_layout.addLayout(btn_layout)
+        input_group.setLayout(input_layout)
+        left_layout.addWidget(input_group)
+        
+        # Detection Settings Section
+        settings_group = QGroupBox("Step 2: Shot Detection Settings")
+        settings_layout = QVBoxLayout()
+        
+        # Detection method
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("Detection Method:"))
+        self.shot_breakdown_method_combo = QComboBox()
+        self.shot_breakdown_method_combo.addItems(["Auto", "PySceneDetect", "OpenCV"])
+        self.shot_breakdown_method_combo.setToolTip(
+            "Auto: Use PySceneDetect if available, otherwise OpenCV\n"
+            "PySceneDetect: Professional scene detection (requires scenedetect package)\n"
+            "OpenCV: Basic frame difference method (always available)"
+        )
+        method_layout.addWidget(self.shot_breakdown_method_combo)
+        method_layout.addStretch()
+        settings_layout.addLayout(method_layout)
+        
+        # Threshold
+        threshold_layout = QHBoxLayout()
+        threshold_layout.addWidget(QLabel("Sensitivity:"))
+        self.shot_breakdown_threshold_slider = QSlider(Qt.Horizontal)
+        self.shot_breakdown_threshold_slider.setMinimum(10)
+        self.shot_breakdown_threshold_slider.setMaximum(50)
+        self.shot_breakdown_threshold_slider.setValue(27)
+        self.shot_breakdown_threshold_slider.setToolTip(
+            "Lower values = more sensitive (more shots detected)\n"
+            "Higher values = less sensitive (fewer shots detected)"
+        )
+        self.shot_breakdown_threshold_slider.valueChanged.connect(
+            lambda v: self.shot_breakdown_threshold_value_label.setText(f"{v}")
+        )
+        threshold_layout.addWidget(self.shot_breakdown_threshold_slider)
+        self.shot_breakdown_threshold_value_label = QLabel("27")
+        self.shot_breakdown_threshold_value_label.setMinimumWidth(30)
+        threshold_layout.addWidget(self.shot_breakdown_threshold_value_label)
+        settings_layout.addLayout(threshold_layout)
+        
+        settings_group.setLayout(settings_layout)
+        left_layout.addWidget(settings_group)
+        
+        # Process Button
+        self.shot_breakdown_process_btn = QPushButton("🎬 Process Video")
+        self.shot_breakdown_process_btn.clicked.connect(self.shot_breakdown_process_video)
+        self.shot_breakdown_process_btn.setEnabled(False)
+        self.shot_breakdown_process_btn.setStyleSheet(
+            "QPushButton { background-color: #10b981; color: white; padding: 15px; "
+            "font-size: 14pt; font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #059669; } "
+            "QPushButton:disabled { background-color: #374151; color: #6b7280; }"
+        )
+        left_layout.addWidget(self.shot_breakdown_process_btn)
+        
+        # Progress
+        self.shot_breakdown_progress = QProgressBar()
+        self.shot_breakdown_progress.setVisible(False)
+        left_layout.addWidget(self.shot_breakdown_progress)
+        
+        # Status
+        self.shot_breakdown_status = QLabel("Ready to process video")
+        self.shot_breakdown_status.setStyleSheet(
+            "padding: 10px; background-color: #1e293b; border-radius: 5px; color: #94a3b8;"
+        )
+        self.shot_breakdown_status.setWordWrap(True)
+        left_layout.addWidget(self.shot_breakdown_status)
+        
+        # Export Section
+        export_group = QGroupBox("Step 4: Export Results")
+        export_layout = QVBoxLayout()
+        
+        export_btn_layout = QHBoxLayout()
+        
+        self.shot_breakdown_export_json_btn = QPushButton("📄 Preview & Export JSON")
+        self.shot_breakdown_export_json_btn.clicked.connect(self.shot_breakdown_export_json)
+        self.shot_breakdown_export_json_btn.setEnabled(False)
+        self.shot_breakdown_export_json_btn.setToolTip("Preview and edit JSON before exporting")
+        export_btn_layout.addWidget(self.shot_breakdown_export_json_btn)
+        
+        self.shot_breakdown_export_prompts_btn = QPushButton("📝 Preview & Export Prompts")
+        self.shot_breakdown_export_prompts_btn.clicked.connect(self.shot_breakdown_export_prompts)
+        self.shot_breakdown_export_prompts_btn.setEnabled(False)
+        self.shot_breakdown_export_prompts_btn.setToolTip("Preview and edit prompts before exporting")
+        export_btn_layout.addWidget(self.shot_breakdown_export_prompts_btn)
+        
+        self.shot_breakdown_open_folder_btn = QPushButton("📁 Open Project Folder")
+        self.shot_breakdown_open_folder_btn.clicked.connect(self.shot_breakdown_open_project_folder)
+        self.shot_breakdown_open_folder_btn.setEnabled(False)
+        export_btn_layout.addWidget(self.shot_breakdown_open_folder_btn)
+        
+        export_layout.addLayout(export_btn_layout)
+        export_group.setLayout(export_layout)
+        left_layout.addWidget(export_group)
+        
+        left_layout.addStretch()
+        
+        # Right panel: Results display
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setSpacing(10)
+        
+        results_label = QLabel("Step 3: Analysis Results")
+        results_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        right_layout.addWidget(results_label)
+        
+        # Shot list
+        self.shot_breakdown_shot_list = QListWidget()
+        self.shot_breakdown_shot_list.itemClicked.connect(self.shot_breakdown_show_shot_details)
+        right_layout.addWidget(self.shot_breakdown_shot_list)
+        
+        # Create tabbed interface for details, prompt, and JSON
+        self.shot_breakdown_details_tabs = QTabWidget()
+        self.shot_breakdown_details_tabs.setMaximumHeight(300)
+        
+        # Tab 1: Shot Details
+        self.shot_breakdown_details_text = QTextEdit()
+        self.shot_breakdown_details_text.setReadOnly(True)
+        self.shot_breakdown_details_text.setStyleSheet(
+            "QTextEdit { background-color: #1e293b; color: #e2e8f0; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 9pt; "
+            "border-radius: 5px; padding: 10px; }"
+        )
+        self.shot_breakdown_details_tabs.addTab(self.shot_breakdown_details_text, "📋 Shot Details")
+        
+        # Tab 2: Prompt Preview
+        self.shot_breakdown_prompt_preview = QTextEdit()
+        self.shot_breakdown_prompt_preview.setReadOnly(True)
+        self.shot_breakdown_prompt_preview.setStyleSheet(
+            "QTextEdit { background-color: #1e293b; color: #e2e8f0; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 9pt; "
+            "border-radius: 5px; padding: 10px; }"
+        )
+        self.shot_breakdown_details_tabs.addTab(self.shot_breakdown_prompt_preview, "📝 Prompt Preview")
+        
+        # Tab 3: JSON Preview
+        self.shot_breakdown_json_preview = QTextEdit()
+        self.shot_breakdown_json_preview.setReadOnly(True)
+        self.shot_breakdown_json_preview.setStyleSheet(
+            "QTextEdit { background-color: #1e293b; color: #e2e8f0; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 9pt; "
+            "border-radius: 5px; padding: 10px; }"
+        )
+        self.shot_breakdown_details_tabs.addTab(self.shot_breakdown_json_preview, "📄 JSON Preview")
+        
+        right_layout.addWidget(self.shot_breakdown_details_tabs)
+        
+        # Keyframe preview area with save button
+        keyframe_header_layout = QHBoxLayout()
+        keyframe_label = QLabel("Keyframes:")
+        keyframe_label.setStyleSheet("font-weight: bold;")
+        keyframe_header_layout.addWidget(keyframe_label)
+        keyframe_header_layout.addStretch()
+        
+        self.shot_breakdown_save_keyframes_btn = QPushButton("💾 Save Keyframes to Folder")
+        self.shot_breakdown_save_keyframes_btn.clicked.connect(self.shot_breakdown_save_keyframes)
+        self.shot_breakdown_save_keyframes_btn.setEnabled(False)
+        self.shot_breakdown_save_keyframes_btn.setToolTip("Save current shot's keyframes to a folder")
+        self.shot_breakdown_save_keyframes_btn.setStyleSheet(
+            "QPushButton { background-color: #8b5cf6; color: white; padding: 5px 10px; "
+            "border-radius: 5px; font-weight: bold; } "
+            "QPushButton:hover { background-color: #7c3aed; } "
+            "QPushButton:disabled { background-color: #374151; color: #6b7280; }"
+        )
+        keyframe_header_layout.addWidget(self.shot_breakdown_save_keyframes_btn)
+        right_layout.addLayout(keyframe_header_layout)
+        
+        self.shot_breakdown_keyframe_container = QWidget()
+        self.shot_breakdown_keyframe_layout = QHBoxLayout(self.shot_breakdown_keyframe_container)
+        self.shot_breakdown_keyframe_layout.setSpacing(10)
+        right_layout.addWidget(self.shot_breakdown_keyframe_container)
+        
+        # Store current shot data for keyframe saving
+        self.shot_breakdown_current_shot = None
+        
+        # Add panels to splitter
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([400, 600])
+        
+        # Add splitter to layout with stretch to fill available space
+        layout.addWidget(splitter, 1)
+        
+        # Add tab
+        self.tabs.addTab(tab, "🎬 Shot Breakdown")
+        
+        logger.info("Shot Breakdown tab initialized")
+    
+    def shot_breakdown_select_video(self):
+        """Open file dialog to select a video file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video File",
+            str(Path.home()),
+            "Video Files (*.mp4 *.mov *.mkv *.m4v *.webm *.avi *.flv);;All Files (*.*)"
+        )
+        
+        if file_path:
+            self.shot_breakdown_current_video = file_path
+            self.shot_breakdown_video_path_label.setText(file_path)
+            self.shot_breakdown_video_info_btn.setEnabled(True)
+            self.shot_breakdown_process_btn.setEnabled(True)
+            self.shot_breakdown_status.setText(f"Video loaded: {Path(file_path).name}")
+            logger.info(f"Selected video: {file_path}")
+    
+    def shot_breakdown_show_video_info(self):
+        """Display video metadata"""
+        if not self.shot_breakdown_current_video:
+            return
+        
+        try:
+            info = self.shot_breakdown_manager.get_video_info(self.shot_breakdown_current_video)
+            
+            info_text = (
+                f"Video Information\n\n"
+                f"File: {Path(self.shot_breakdown_current_video).name}\n\n"
+                f"Resolution: {info['width']}x{info['height']}\n"
+                f"FPS: {info['fps']:.2f}\n"
+                f"Duration: {info['duration_seconds']:.2f} seconds\n"
+                f"Frame Count: {info['frame_count']:,}\n"
+                f"File Size: {info['file_size_mb']:.2f} MB\n"
+            )
+            
+            QMessageBox.information(self, "Video Info", info_text)
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read video info:\n{e}")
+            logger.error(f"Video info error: {e}")
+    
+    def shot_breakdown_process_video(self):
+        """Process the video through the full pipeline"""
+        if not self.shot_breakdown_current_video:
+            return
+        
+        # Get settings
+        method = self.shot_breakdown_method_combo.currentText().lower()
+        threshold = self.shot_breakdown_threshold_slider.value()
+        
+        # Disable controls during processing
+        self.shot_breakdown_process_btn.setEnabled(False)
+        self.shot_breakdown_progress.setVisible(True)
+        self.shot_breakdown_progress.setRange(0, 0)  # Indeterminate
+        self.shot_breakdown_status.setText("Processing video...")
+        
+        # Run in thread to avoid blocking UI
+        from PyQt5.QtCore import QThread, pyqtSignal
+        
+        class ProcessThread(QThread):
+            finished = pyqtSignal(dict)
+            error = pyqtSignal(str)
+            
+            def __init__(self, manager, video_path, method, threshold):
+                super().__init__()
+                self.manager = manager
+                self.video_path = video_path
+                self.method = method
+                self.threshold = threshold
+            
+            def run(self):
+                try:
+                    results = self.manager.process_video(
+                        self.video_path,
+                        threshold=self.threshold,
+                        method=self.method
+                    )
+                    self.finished.emit(results)
+                except Exception as e:
+                    self.error.emit(str(e))
+        
+        self.shot_breakdown_thread = ProcessThread(
+            self.shot_breakdown_manager,
+            self.shot_breakdown_current_video,
+            method,
+            threshold
+        )
+        self.shot_breakdown_thread.finished.connect(self.shot_breakdown_processing_complete)
+        self.shot_breakdown_thread.error.connect(self.shot_breakdown_processing_error)
+        self.shot_breakdown_thread.start()
+    
+    def shot_breakdown_processing_complete(self, results):
+        """Handle successful processing completion"""
+        self.shot_breakdown_results = results
+        
+        # Re-enable controls
+        self.shot_breakdown_process_btn.setEnabled(True)
+        self.shot_breakdown_progress.setVisible(False)
+        self.shot_breakdown_export_json_btn.setEnabled(True)
+        self.shot_breakdown_export_prompts_btn.setEnabled(True)
+        self.shot_breakdown_open_folder_btn.setEnabled(True)
+        
+        # Update status
+        shot_count = results['shot_count']
+        duration = results['total_duration']
+        self.shot_breakdown_status.setText(
+            f"✅ Analysis complete! Detected {shot_count} shots in {duration:.2f}s video"
+        )
+        
+        # Populate shot list
+        self.shot_breakdown_shot_list.clear()
+        for shot in results['shots']:
+            shot_num = shot['shot_number']
+            start_time = shot['start_time']
+            end_time = shot['end_time']
+            duration = shot['duration']
+            shot_type = shot['labels'].get('shot_type_name', 'Unknown')
+            
+            item_text = f"Shot {shot_num:03d} | {start_time:.2f}s - {end_time:.2f}s | {duration:.2f}s | {shot_type}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, shot)
+            self.shot_breakdown_shot_list.addItem(item)
+        
+        # Auto-select first shot
+        if self.shot_breakdown_shot_list.count() > 0:
+            self.shot_breakdown_shot_list.setCurrentRow(0)
+            self.shot_breakdown_show_shot_details(self.shot_breakdown_shot_list.item(0))
+        
+        logger.info(f"Processing complete: {shot_count} shots detected")
+        QMessageBox.information(
+            self,
+            "Processing Complete",
+            f"Shot breakdown analysis complete!\n\n"
+            f"Shots detected: {shot_count}\n"
+            f"Project folder: {results['project_dir']}"
+        )
+    
+    def shot_breakdown_processing_error(self, error_msg):
+        """Handle processing error"""
+        self.shot_breakdown_process_btn.setEnabled(True)
+        self.shot_breakdown_progress.setVisible(False)
+        self.shot_breakdown_status.setText(f"❌ Error: {error_msg}")
+        
+        QMessageBox.critical(self, "Processing Error", f"Failed to process video:\n\n{error_msg}")
+        logger.error(f"Shot breakdown processing error: {error_msg}")
+    
+    def shot_breakdown_show_shot_details(self, item):
+        """Display detailed information for selected shot"""
+        if not item:
+            return
+        
+        shot = item.data(Qt.UserRole)
+        if not shot:
+            return
+        
+        # Store current shot for keyframe saving
+        self.shot_breakdown_current_shot = shot
+        
+        # Build details text
+        labels = shot.get('labels', {})
+        comp = shot.get('composition', {})
+        movement = shot.get('movement', {})
+        deps = shot.get('dependencies', {})
+        
+        details = f"""SHOT {shot['shot_number']:03d} DETAILS
+{'=' * 60}
+
+TIMING:
+  Start: {shot['start_time']:.2f}s (frame {shot['start_frame']})
+  End: {shot['end_time']:.2f}s (frame {shot['end_frame']})
+  Duration: {shot['duration']:.2f}s ({shot['frame_count']} frames)
+
+CINEMATOGRAPHY:
+  Shot Type: {labels.get('shot_type_name', 'Unknown')}
+  Camera Angle: {labels.get('camera_angle_name', 'Unknown')}
+  Camera Movement: {labels.get('camera_movement_name', 'Unknown')}
+  Movement Direction: {movement.get('direction', 'none')}
+
+COMPOSITION:
+  Resolution: {comp.get('width', 0)}x{comp.get('height', 0)}
+  Aspect Ratio: {comp.get('aspect_ratio', 0)}
+  Lighting: {labels.get('lighting', 'unknown').title()}
+  Color Temperature: {labels.get('color_temperature', 'unknown').title()}
+  Brightness: {comp.get('avg_brightness', 0):.1f}/255
+
+DEPENDENCIES:
+  Visual: {len(deps.get('visual', []))} matches
+  Motion: {len(deps.get('motion', []))} matches
+  Narrative: {len(deps.get('narrative', []))} connections
+"""
+        
+        self.shot_breakdown_details_text.setPlainText(details)
+        
+        # Update prompt preview
+        prompt_text = shot.get('prompt', 'No prompt generated')
+        self.shot_breakdown_prompt_preview.setPlainText(prompt_text)
+        
+        # Update JSON preview
+        try:
+            json_text = json.dumps(shot, indent=2, ensure_ascii=False)
+            self.shot_breakdown_json_preview.setPlainText(json_text)
+        except Exception as e:
+            self.shot_breakdown_json_preview.setPlainText(f"Error formatting JSON: {e}")
+            logger.error(f"JSON preview error: {e}")
+        
+        # Display keyframes
+        keyframes = shot.get('keyframes', [])
+        self.shot_breakdown_display_keyframes(keyframes)
+        
+        # Enable save keyframes button if keyframes exist
+        self.shot_breakdown_save_keyframes_btn.setEnabled(len(keyframes) > 0)
+    
+    def shot_breakdown_display_keyframes(self, keyframe_paths):
+        """Display keyframe thumbnails"""
+        # Clear existing keyframes
+        while self.shot_breakdown_keyframe_layout.count():
+            child = self.shot_breakdown_keyframe_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        
+        if not keyframe_paths:
+            no_frames_label = QLabel("No keyframes available")
+            no_frames_label.setStyleSheet("color: #6b7280; font-style: italic;")
+            self.shot_breakdown_keyframe_layout.addWidget(no_frames_label)
+            return
+        
+        # Display each keyframe
+        for kf_path in keyframe_paths:
+            if not os.path.exists(kf_path):
+                continue
+            
+            label = QLabel()
+            pixmap = QPixmap(kf_path)
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(200, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                label.setPixmap(scaled)
+                label.setToolTip(Path(kf_path).name)
+                label.setStyleSheet("border: 2px solid #3b82f6; border-radius: 5px;")
+                self.shot_breakdown_keyframe_layout.addWidget(label)
+        
+        self.shot_breakdown_keyframe_layout.addStretch()
+    
+    def shot_breakdown_preview_and_export_json(self):
+        """Preview and edit JSON before exporting"""
+        if not self.shot_breakdown_results:
+            return
+        
+        # Create preview dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Preview & Edit JSON - Shot Breakdown")
+        dialog.setMinimumWidth(800)
+        dialog.setMinimumHeight(600)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Instructions
+        info_label = QLabel("Review and edit the JSON data below before exporting:")
+        info_label.setStyleSheet("font-weight: bold; color: #3b82f6;")
+        layout.addWidget(info_label)
+        
+        # JSON editor
+        json_editor = QTextEdit()
+        json_editor.setStyleSheet(
+            "QTextEdit { background-color: #1e293b; color: #e2e8f0; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 10pt; "
+            "border-radius: 5px; padding: 10px; }"
+        )
+        
+        # Format JSON with proper indentation
+        try:
+            json_text = json.dumps(self.shot_breakdown_results, indent=2, ensure_ascii=False)
+            json_editor.setPlainText(json_text)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to format JSON:\n{e}")
+            logger.error(f"JSON formatting error: {e}")
+            return
+        
+        layout.addWidget(json_editor)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        validate_btn = QPushButton("✓ Validate JSON")
+        validate_btn.clicked.connect(lambda: self.shot_breakdown_validate_json(json_editor))
+        validate_btn.setStyleSheet("background-color: #6366f1; color: white; padding: 8px;")
+        button_layout.addWidget(validate_btn)
+        
+        button_layout.addStretch()
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        export_btn = QPushButton("💾 Export JSON")
+        export_btn.setStyleSheet("background-color: #10b981; color: white; padding: 8px; font-weight: bold;")
+        export_btn.clicked.connect(lambda: self.shot_breakdown_save_edited_json(json_editor, dialog))
+        button_layout.addWidget(export_btn)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.exec_()
+    
+    def shot_breakdown_validate_json(self, editor):
+        """Validate JSON syntax"""
+        try:
+            json.loads(editor.toPlainText())
+            QMessageBox.information(self, "Valid JSON", "✓ JSON syntax is valid!")
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "Invalid JSON", f"JSON syntax error:\n\n{e}")
+    
+    def shot_breakdown_save_edited_json(self, editor, dialog):
+        """Save edited JSON to file"""
+        # Validate JSON first
+        try:
+            edited_data = json.loads(editor.toPlainText())
+        except json.JSONDecodeError as e:
+            QMessageBox.critical(self, "Invalid JSON", f"Cannot export invalid JSON:\n\n{e}")
+            return
+        
+        # Get save path
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export JSON",
+            f"shot_breakdown_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            "JSON Files (*.json)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(edited_data, f, indent=2, ensure_ascii=False)
+                
+                QMessageBox.information(self, "Export Complete", f"JSON exported to:\n{file_path}")
+                logger.info(f"Exported edited JSON to: {file_path}")
+                dialog.accept()
+            
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to export JSON:\n{e}")
+                logger.error(f"JSON export error: {e}")
+    
+    def shot_breakdown_preview_and_export_prompts(self):
+        """Preview and edit prompts before exporting"""
+        if not self.shot_breakdown_results:
+            return
+        
+        # Create preview dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Preview & Edit Prompts - Shot Breakdown")
+        dialog.setMinimumWidth(900)
+        dialog.setMinimumHeight(700)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Instructions
+        info_label = QLabel("Review and edit the AI prompts below before exporting:")
+        info_label.setStyleSheet("font-weight: bold; color: #3b82f6;")
+        layout.addWidget(info_label)
+        
+        # Prompts editor
+        prompts_editor = QTextEdit()
+        prompts_editor.setStyleSheet(
+            "QTextEdit { background-color: #1e293b; color: #e2e8f0; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 10pt; "
+            "border-radius: 5px; padding: 10px; }"
+        )
+        
+        # Build prompts text
+        try:
+            prompts_text = f"Shot Breakdown Prompts\n"
+            prompts_text += f"Video: {Path(self.shot_breakdown_current_video).name}\n"
+            prompts_text += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            prompts_text += "=" * 80 + "\n\n"
+            
+            for shot in self.shot_breakdown_results['shots']:
+                prompts_text += f"SHOT {shot['shot_number']:03d}\n"
+                prompts_text += "-" * 80 + "\n"
+                prompts_text += f"Timecode: {shot['start_time']:.2f}s - {shot['end_time']:.2f}s\n"
+                prompts_text += f"Duration: {shot['duration']:.2f}s\n\n"
+                prompts_text += shot.get('prompt', 'No prompt generated')
+                prompts_text += "\n\n" + "=" * 80 + "\n\n"
+            
+            prompts_editor.setPlainText(prompts_text)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to format prompts:\n{e}")
+            logger.error(f"Prompts formatting error: {e}")
+            return
+        
+        layout.addWidget(prompts_editor)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        word_count_btn = QPushButton("📊 Word Count")
+        word_count_btn.clicked.connect(lambda: self.shot_breakdown_show_word_count(prompts_editor))
+        word_count_btn.setStyleSheet("background-color: #6366f1; color: white; padding: 8px;")
+        button_layout.addWidget(word_count_btn)
+        
+        button_layout.addStretch()
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        export_btn = QPushButton("💾 Export Prompts")
+        export_btn.setStyleSheet("background-color: #10b981; color: white; padding: 8px; font-weight: bold;")
+        export_btn.clicked.connect(lambda: self.shot_breakdown_save_edited_prompts(prompts_editor, dialog))
+        button_layout.addWidget(export_btn)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.exec_()
+    
+    def shot_breakdown_show_word_count(self, editor):
+        """Show word and character count"""
+        text = editor.toPlainText()
+        words = len(text.split())
+        chars = len(text)
+        lines = text.count('\n') + 1
+        
+        QMessageBox.information(
+            self, 
+            "Text Statistics", 
+            f"Words: {words:,}\nCharacters: {chars:,}\nLines: {lines:,}"
+        )
+    
+    def shot_breakdown_save_edited_prompts(self, editor, dialog):
+        """Save edited prompts to file"""
+        # Get save path
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Prompts",
+            f"prompts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            "Text Files (*.txt)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(editor.toPlainText())
+                
+                QMessageBox.information(self, "Export Complete", f"Prompts exported to:\n{file_path}")
+                logger.info(f"Exported edited prompts to: {file_path}")
+                dialog.accept()
+            
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to export prompts:\n{e}")
+                logger.error(f"Prompts export error: {e}")
+    
+    def shot_breakdown_export_json(self):
+        """Export analysis results as JSON (direct export without preview)"""
+        # Redirect to preview function
+        self.shot_breakdown_preview_and_export_json()
+    
+    def shot_breakdown_export_prompts(self):
+        """Export AI prompts as text file (direct export without preview)"""
+        # Redirect to preview function
+        self.shot_breakdown_preview_and_export_prompts()
+    
+    def shot_breakdown_open_project_folder(self):
+        """Open the project folder in file explorer"""
+        if not self.shot_breakdown_results:
+            return
+        
+        project_dir = self.shot_breakdown_results.get('project_dir')
+        if project_dir and os.path.exists(project_dir):
+            if platform.system() == 'Windows':
+                os.startfile(project_dir)
+            elif platform.system() == 'Darwin':  # macOS
+                subprocess.Popen(['open', project_dir])
+            else:  # Linux
+                subprocess.Popen(['xdg-open', project_dir])
+            
+            logger.info(f"Opened project folder: {project_dir}")
+    
+    def shot_breakdown_save_keyframes(self):
+        """Save current shot's keyframes to a selected folder"""
+        if not self.shot_breakdown_current_shot:
+            QMessageBox.warning(self, "No Shot Selected", "Please select a shot first.")
+            return
+        
+        keyframes = self.shot_breakdown_current_shot.get('keyframes', [])
+        if not keyframes:
+            QMessageBox.warning(self, "No Keyframes", "The selected shot has no keyframes.")
+            return
+        
+        # Ask user to select destination folder
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder to Save Keyframes",
+            str(Path.home())
+        )
+        
+        if not folder:
+            return
+        
+        try:
+            import shutil
+            saved_count = 0
+            shot_num = self.shot_breakdown_current_shot['shot_number']
+            
+            for i, keyframe_path in enumerate(keyframes):
+                if not os.path.exists(keyframe_path):
+                    logger.warning(f"Keyframe not found: {keyframe_path}")
+                    continue
+                
+                # Create descriptive filename
+                keyframe_file = Path(keyframe_path)
+                new_filename = f"shot_{shot_num:03d}_keyframe_{i+1}{keyframe_file.suffix}"
+                dest_path = Path(folder) / new_filename
+                
+                # Copy keyframe to destination
+                shutil.copy2(keyframe_path, dest_path)
+                saved_count += 1
+                logger.info(f"Saved keyframe: {dest_path}")
+            
+            # Show success message
+            QMessageBox.information(
+                self,
+                "Keyframes Saved",
+                f"Successfully saved {saved_count} keyframe(s) to:\n{folder}"
+            )
+            
+            # Optionally open the folder
+            reply = QMessageBox.question(
+                self,
+                "Open Folder?",
+                "Would you like to open the destination folder?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                if platform.system() == 'Windows':
+                    os.startfile(folder)
+                elif platform.system() == 'Darwin':  # macOS
+                    subprocess.Popen(['open', folder])
+                else:  # Linux
+                    subprocess.Popen(['xdg-open', folder])
+        
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error Saving Keyframes",
+                f"Failed to save keyframes:\n{e}"
+            )
+            logger.error(f"Keyframe save error: {e}")
+    
+    def create_beat_composer_tab(self):
+        """Create the Beat-Composer tab for music video creation"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Initialize Beat Composer Manager
+        self.beat_composer_manager = BeatComposerManager()
+        self.beat_composer_audio_path = None
+        self.beat_composer_timeline = []
+        self.beat_composer_video_path = None
+        
+        # Audio preview player
+        self.beat_composer_audio_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
+        self.beat_composer_audio_player_dialog = None
+        
+        # Header
+        header = QLabel("🎵 Beat-Composer - Music Video Synchronization")
+        header.setStyleSheet("font-size: 18pt; font-weight: bold; color: #8b5cf6;")
+        layout.addWidget(header)
+        
+        description = QLabel(
+            "Detect beats in music and sync images/videos to create rhythm-based video content for social media"
+        )
+        description.setWordWrap(True)
+        description.setStyleSheet("color: #9ca3af; font-size: 10pt;")
+        layout.addWidget(description)
+        
+        # Main splitter
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Left panel: Controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setSpacing(10)
+        
+        # Audio Information Panel (hidden by default)
+        self.beat_composer_info_panel = QGroupBox("Audio Information")
+        self.beat_composer_info_panel.setStyleSheet(
+            "QGroupBox { font-weight: bold; background-color: #f8fafc; border: 2px solid #8b5cf6; "
+            "border-radius: 8px; margin-top: 10px; padding: 15px; }"
+        )
+        info_panel_layout = QVBoxLayout()
+        
+        # Create labels for metadata
+        self.beat_composer_info_filename = QLabel("<b>File:</b> --")
+        self.beat_composer_info_filename.setWordWrap(True)
+        self.beat_composer_info_filename.setStyleSheet("padding: 3px; color: #1e293b;")
+        info_panel_layout.addWidget(self.beat_composer_info_filename)
+        
+        self.beat_composer_info_duration = QLabel("<b>Duration:</b> --")
+        self.beat_composer_info_duration.setStyleSheet("padding: 3px; color: #1e293b;")
+        info_panel_layout.addWidget(self.beat_composer_info_duration)
+        
+        self.beat_composer_info_title = QLabel("<b>Title:</b> --")
+        self.beat_composer_info_title.setWordWrap(True)
+        self.beat_composer_info_title.setStyleSheet("padding: 3px; color: #1e293b;")
+        info_panel_layout.addWidget(self.beat_composer_info_title)
+        
+        self.beat_composer_info_artist = QLabel("<b>Artist:</b> --")
+        self.beat_composer_info_artist.setWordWrap(True)
+        self.beat_composer_info_artist.setStyleSheet("padding: 3px; color: #1e293b;")
+        info_panel_layout.addWidget(self.beat_composer_info_artist)
+        
+        self.beat_composer_info_panel.setLayout(info_panel_layout)
+        self.beat_composer_info_panel.setVisible(False)  # Hidden until audio is loaded
+        left_layout.addWidget(self.beat_composer_info_panel)
+        
+        # Step 1: Audio Selection
+        audio_group = QGroupBox("Step 1: Load Audio")
+        audio_layout = QVBoxLayout()
+        
+        self.beat_composer_audio_label = QLabel("No audio file selected")
+        self.beat_composer_audio_label.setStyleSheet(
+            "padding: 10px; background-color: #1e293b; border-radius: 5px; color: #cbd5e1;"
+        )
+        self.beat_composer_audio_label.setWordWrap(True)
+        audio_layout.addWidget(self.beat_composer_audio_label)
+        
+        audio_btn_layout = QHBoxLayout()
+        select_audio_btn = QPushButton("📂 Select Audio")
+        select_audio_btn.clicked.connect(self.beat_composer_select_audio)
+        select_audio_btn.setStyleSheet(
+            "QPushButton { background-color: #8b5cf6; color: white; padding: 10px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #7c3aed; }"
+        )
+        audio_btn_layout.addWidget(select_audio_btn)
+        
+        self.beat_composer_audio_info_btn = QPushButton("ℹ️ Audio Info")
+        self.beat_composer_audio_info_btn.clicked.connect(self.beat_composer_show_audio_info)
+        self.beat_composer_audio_info_btn.setEnabled(False)
+        audio_btn_layout.addWidget(self.beat_composer_audio_info_btn)
+        
+        self.beat_composer_audio_preview_btn = QPushButton("▶️ Preview Audio")
+        self.beat_composer_audio_preview_btn.clicked.connect(self.beat_composer_preview_audio)
+        self.beat_composer_audio_preview_btn.setEnabled(False)
+        audio_btn_layout.addWidget(self.beat_composer_audio_preview_btn)
+        
+        audio_layout.addLayout(audio_btn_layout)
+        audio_group.setLayout(audio_layout)
+        left_layout.addWidget(audio_group)
+        
+        # Step 2: Beat Detection
+        detection_group = QGroupBox("Step 2: Detect Beats")
+        detection_layout = QVBoxLayout()
+        
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("Detection Method:"))
+        self.beat_composer_method_combo = QComboBox()
+        self.beat_composer_method_combo.addItems(["Librosa (Fast)", "Madmom (Accurate)"])
+        self.beat_composer_method_combo.setToolTip(
+            "Librosa: Faster, good for preview\n"
+            "Madmom: More accurate, production quality (slower)"
+        )
+        method_layout.addWidget(self.beat_composer_method_combo)
+        method_layout.addStretch()
+        detection_layout.addLayout(method_layout)
+        
+        self.beat_composer_detect_btn = QPushButton("🎵 Detect Beats")
+        self.beat_composer_detect_btn.clicked.connect(self.beat_composer_detect_beats)
+        self.beat_composer_detect_btn.setEnabled(False)
+        self.beat_composer_detect_btn.setStyleSheet(
+            "QPushButton { background-color: #10b981; color: white; padding: 12px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #059669; } "
+            "QPushButton:disabled { background-color: #374151; color: #6b7280; }"
+        )
+        detection_layout.addWidget(self.beat_composer_detect_btn)
+        
+        self.beat_composer_detection_progress = QProgressBar()
+        self.beat_composer_detection_progress.setVisible(False)
+        detection_layout.addWidget(self.beat_composer_detection_progress)
+        
+        self.beat_composer_detection_status = QLabel("Ready")
+        self.beat_composer_detection_status.setStyleSheet(
+            "padding: 8px; background-color: #1e293b; border-radius: 5px; color: #94a3b8;"
+        )
+        self.beat_composer_detection_status.setWordWrap(True)
+        detection_layout.addWidget(self.beat_composer_detection_status)
+        
+        detection_group.setLayout(detection_layout)
+        left_layout.addWidget(detection_group)
+        
+        # Step 3: Timeline Configuration
+        timeline_group = QGroupBox("Step 3: Configure Timeline")
+        timeline_layout = QVBoxLayout()
+        
+        # Duration mode
+        duration_mode_layout = QHBoxLayout()
+        duration_mode_layout.addWidget(QLabel("Duration:"))
+        self.beat_composer_duration_mode = QComboBox()
+        self.beat_composer_duration_mode.addItems(["Full Audio", "N Seconds", "N Measures"])
+        self.beat_composer_duration_mode.currentTextChanged.connect(
+            self.beat_composer_duration_mode_changed
+        )
+        duration_mode_layout.addWidget(self.beat_composer_duration_mode)
+        timeline_layout.addLayout(duration_mode_layout)
+        
+        # Duration value (for seconds/measures)
+        duration_value_layout = QHBoxLayout()
+        duration_value_layout.addWidget(QLabel("Value:"))
+        self.beat_composer_duration_value = QSpinBox()
+        self.beat_composer_duration_value.setMinimum(1)
+        self.beat_composer_duration_value.setMaximum(9999)
+        self.beat_composer_duration_value.setValue(30)
+        self.beat_composer_duration_value.setEnabled(False)
+        duration_value_layout.addWidget(self.beat_composer_duration_value)
+        duration_value_layout.addStretch()
+        timeline_layout.addLayout(duration_value_layout)
+        
+        # Beat type checkboxes
+        self.beat_composer_use_beats = QCheckBox("Include All Beats")
+        self.beat_composer_use_beats.setChecked(True)
+        timeline_layout.addWidget(self.beat_composer_use_beats)
+        
+        self.beat_composer_use_downbeats = QCheckBox("Use Downbeats Only")
+        self.beat_composer_use_downbeats.setChecked(False)
+        self.beat_composer_use_downbeats.toggled.connect(
+            lambda checked: self.beat_composer_use_beats.setEnabled(not checked)
+        )
+        timeline_layout.addWidget(self.beat_composer_use_downbeats)
+        
+        self.beat_composer_build_timeline_btn = QPushButton("🔨 Build Timeline")
+        self.beat_composer_build_timeline_btn.clicked.connect(self.beat_composer_build_timeline)
+        self.beat_composer_build_timeline_btn.setEnabled(False)
+        self.beat_composer_build_timeline_btn.setStyleSheet(
+            "QPushButton { background-color: #3b82f6; color: white; padding: 10px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #2563eb; } "
+            "QPushButton:disabled { background-color: #374151; color: #6b7280; }"
+        )
+        timeline_layout.addWidget(self.beat_composer_build_timeline_btn)
+        
+        timeline_group.setLayout(timeline_layout)
+        left_layout.addWidget(timeline_group)
+        
+        # Step 4: Export & Preview
+        export_group = QGroupBox("Step 4: Export & Save")
+        export_layout = QVBoxLayout()
+        
+        export_btn_layout = QHBoxLayout()
+        
+        self.beat_composer_preview_btn = QPushButton("▶️ Preview Video")
+        self.beat_composer_preview_btn.clicked.connect(self.beat_composer_preview_video)
+        self.beat_composer_preview_btn.setEnabled(False)
+        self.beat_composer_preview_btn.setToolTip("Preview composed video with audio")
+        export_btn_layout.addWidget(self.beat_composer_preview_btn)
+        
+        self.beat_composer_export_btn = QPushButton("💾 Export Video")
+        self.beat_composer_export_btn.clicked.connect(self.beat_composer_export_video)
+        self.beat_composer_export_btn.setEnabled(False)
+        self.beat_composer_export_btn.setToolTip("Export final video file")
+        export_btn_layout.addWidget(self.beat_composer_export_btn)
+        
+        export_layout.addLayout(export_btn_layout)
+        
+        project_btn_layout = QHBoxLayout()
+        
+        self.beat_composer_save_project_btn = QPushButton("💾 Save Project")
+        self.beat_composer_save_project_btn.clicked.connect(self.beat_composer_save_project)
+        self.beat_composer_save_project_btn.setEnabled(False)
+        project_btn_layout.addWidget(self.beat_composer_save_project_btn)
+        
+        self.beat_composer_load_project_btn = QPushButton("📂 Load Project")
+        self.beat_composer_load_project_btn.clicked.connect(self.beat_composer_load_project)
+        project_btn_layout.addWidget(self.beat_composer_load_project_btn)
+        
+        export_layout.addLayout(project_btn_layout)
+        
+        export_group.setLayout(export_layout)
+        left_layout.addWidget(export_group)
+        
+        left_layout.addStretch()
+        
+        # Right panel: Timeline and Preview (horizontal split)
+        right_panel = QWidget()
+        right_main_layout = QVBoxLayout(right_panel)
+        right_main_layout.setSpacing(10)
+        
+        # Create horizontal splitter for timeline and preview
+        timeline_preview_splitter = QSplitter(Qt.Horizontal)
+        
+        # Left section: Beat Timeline List
+        timeline_container = QWidget()
+        timeline_layout = QVBoxLayout(timeline_container)
+        timeline_layout.setContentsMargins(0, 0, 0, 0)
+        
+        timeline_header = QLabel("Beat Timeline")
+        timeline_header.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        timeline_layout.addWidget(timeline_header)
+        
+        self.beat_composer_timeline_list = QListWidget()
+        self.beat_composer_timeline_list.itemClicked.connect(self.beat_composer_select_beat)
+        # Enable drag and drop for bulk file assignment
+        self.beat_composer_timeline_list.setAcceptDrops(True)
+        self.beat_composer_timeline_list.setDragEnabled(False)
+        self.beat_composer_timeline_list.dragEnterEvent = self.beat_composer_drag_enter_event
+        self.beat_composer_timeline_list.dragMoveEvent = self.beat_composer_drag_move_event
+        self.beat_composer_timeline_list.dropEvent = self.beat_composer_drop_event
+        timeline_layout.addWidget(self.beat_composer_timeline_list)
+        
+        # Right section: Media Preview
+        preview_container = QWidget()
+        preview_layout = QVBoxLayout(preview_container)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        
+        preview_header = QLabel("Media Preview")
+        preview_header.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        preview_layout.addWidget(preview_header)
+        
+        # Preview display area
+        self.beat_composer_preview_label = QLabel("No media to preview")
+        self.beat_composer_preview_label.setAlignment(Qt.AlignCenter)
+        self.beat_composer_preview_label.setStyleSheet(
+            "background-color: #1e293b; border: 2px solid #475569; "
+            "border-radius: 5px; padding: 20px; color: #cbd5e1; min-height: 300px;"
+        )
+        self.beat_composer_preview_label.setScaledContents(False)
+        preview_layout.addWidget(self.beat_composer_preview_label, 1)
+        
+        # Filename label
+        self.beat_composer_preview_filename = QLabel("")
+        self.beat_composer_preview_filename.setWordWrap(True)
+        self.beat_composer_preview_filename.setStyleSheet(
+            "background-color: #334155; padding: 8px; border-radius: 3px; "
+            "color: #e2e8f0; font-size: 10pt;"
+        )
+        self.beat_composer_preview_filename.setVisible(False)
+        preview_layout.addWidget(self.beat_composer_preview_filename)
+        
+        # Navigation controls
+        nav_layout = QHBoxLayout()
+        
+        self.beat_composer_first_btn = QPushButton("⏮️ First")
+        self.beat_composer_first_btn.clicked.connect(self.beat_composer_navigate_first)
+        self.beat_composer_first_btn.setEnabled(False)
+        nav_layout.addWidget(self.beat_composer_first_btn)
+        
+        self.beat_composer_prev_btn = QPushButton("⏪ Prev")
+        self.beat_composer_prev_btn.clicked.connect(self.beat_composer_navigate_prev)
+        self.beat_composer_prev_btn.setEnabled(False)
+        nav_layout.addWidget(self.beat_composer_prev_btn)
+        
+        self.beat_composer_next_btn = QPushButton("Next ⏩")
+        self.beat_composer_next_btn.clicked.connect(self.beat_composer_navigate_next)
+        self.beat_composer_next_btn.setEnabled(False)
+        nav_layout.addWidget(self.beat_composer_next_btn)
+        
+        self.beat_composer_last_btn = QPushButton("Last ⏭️")
+        self.beat_composer_last_btn.clicked.connect(self.beat_composer_navigate_last)
+        self.beat_composer_last_btn.setEnabled(False)
+        nav_layout.addWidget(self.beat_composer_last_btn)
+        
+        preview_layout.addLayout(nav_layout)
+        
+        # Play button for videos (initially hidden)
+        self.beat_composer_play_video_btn = QPushButton("▶️ Play Video")
+        self.beat_composer_play_video_btn.clicked.connect(self.beat_composer_play_preview_video)
+        self.beat_composer_play_video_btn.setVisible(False)
+        self.beat_composer_play_video_btn.setStyleSheet(
+            "QPushButton { background-color: #10b981; color: white; padding: 8px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #059669; }"
+        )
+        preview_layout.addWidget(self.beat_composer_play_video_btn)
+        
+        # Add both sections to splitter
+        timeline_preview_splitter.addWidget(timeline_container)
+        timeline_preview_splitter.addWidget(preview_container)
+        timeline_preview_splitter.setStretchFactor(0, 1)
+        timeline_preview_splitter.setStretchFactor(1, 1)
+        timeline_preview_splitter.setSizes([300, 300])
+        
+        right_main_layout.addWidget(timeline_preview_splitter, 1)
+        
+        # Beat Adjustment Controls
+        adjustment_group = QGroupBox("Beat Adjustment")
+        adjustment_layout = QVBoxLayout()
+        
+        # Movement mode
+        movement_layout = QHBoxLayout()
+        movement_layout.addWidget(QLabel("Movement Mode:"))
+        self.beat_composer_movement_mode = QComboBox()
+        self.beat_composer_movement_mode.addItems(["Independent", "Unified"])
+        self.beat_composer_movement_mode.setToolTip(
+            "Independent: Changes only this beat\n"
+            "Unified: Moves all subsequent beats together"
+        )
+        movement_layout.addWidget(self.beat_composer_movement_mode)
+        adjustment_layout.addLayout(movement_layout)
+        
+        # Time offset controls
+        offset_layout = QHBoxLayout()
+        offset_layout.addWidget(QLabel("Offset (seconds):"))
+        self.beat_composer_offset_spin = QDoubleSpinBox()
+        self.beat_composer_offset_spin.setMinimum(-10.0)
+        self.beat_composer_offset_spin.setMaximum(10.0)
+        self.beat_composer_offset_spin.setSingleStep(0.1)
+        self.beat_composer_offset_spin.setValue(0.0)
+        self.beat_composer_offset_spin.setDecimals(2)
+        offset_layout.addWidget(self.beat_composer_offset_spin)
+        
+        apply_offset_btn = QPushButton("Apply Offset")
+        apply_offset_btn.clicked.connect(self.beat_composer_apply_offset)
+        offset_layout.addWidget(apply_offset_btn)
+        
+        adjustment_layout.addLayout(offset_layout)
+        adjustment_group.setLayout(adjustment_layout)
+        right_main_layout.addWidget(adjustment_group)
+        
+        # Media Assignment
+        media_group = QGroupBox("Media Assignment")
+        media_layout = QVBoxLayout()
+        
+        self.beat_composer_media_label = QLabel("No media assigned")
+        self.beat_composer_media_label.setStyleSheet(
+            "padding: 8px; background-color: #1e293b; border-radius: 5px; color: #cbd5e1;"
+        )
+        self.beat_composer_media_label.setWordWrap(True)
+        media_layout.addWidget(self.beat_composer_media_label)
+        
+        media_btn_layout = QHBoxLayout()
+        
+        assign_image_btn = QPushButton("🖼️ Assign Image")
+        assign_image_btn.clicked.connect(lambda: self.beat_composer_assign_media('image'))
+        media_btn_layout.addWidget(assign_image_btn)
+        
+        assign_video_btn = QPushButton("🎬 Assign Video")
+        assign_video_btn.clicked.connect(lambda: self.beat_composer_assign_media('video'))
+        media_btn_layout.addWidget(assign_video_btn)
+        
+        remove_media_btn = QPushButton("❌ Remove Media")
+        remove_media_btn.clicked.connect(self.beat_composer_remove_media)
+        media_btn_layout.addWidget(remove_media_btn)
+        
+        media_layout.addLayout(media_btn_layout)
+        
+        # Bulk assignment button
+        bulk_btn_layout = QHBoxLayout()
+        bulk_add_btn = QPushButton("📁 Bulk Add Files...")
+        bulk_add_btn.clicked.connect(self.beat_composer_bulk_add_files)
+        bulk_add_btn.setToolTip(
+            "Select multiple files and assign them to beats in order.\n"
+            "You can also drag and drop files onto the timeline list."
+        )
+        bulk_add_btn.setStyleSheet(
+            "QPushButton { background-color: #3b82f6; color: white; padding: 8px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #2563eb; }"
+        )
+        bulk_btn_layout.addWidget(bulk_add_btn)
+        media_layout.addLayout(bulk_btn_layout)
+        
+        # Media duration
+        duration_layout = QHBoxLayout()
+        duration_layout.addWidget(QLabel("Display Duration (s):"))
+        self.beat_composer_media_duration = QDoubleSpinBox()
+        self.beat_composer_media_duration.setMinimum(0.1)
+        self.beat_composer_media_duration.setMaximum(30.0)
+        self.beat_composer_media_duration.setSingleStep(0.1)
+        self.beat_composer_media_duration.setValue(0.5)
+        self.beat_composer_media_duration.setDecimals(1)
+        duration_layout.addWidget(self.beat_composer_media_duration)
+        duration_layout.addStretch()
+        media_layout.addLayout(duration_layout)
+        
+        media_group.setLayout(media_layout)
+        right_main_layout.addWidget(media_group)
+        
+        # Add panels to splitter
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([400, 600])
+        
+        layout.addWidget(splitter, 1)
+        
+        # Add tab
+        self.tabs.addTab(tab, "🎵 Beat-Composer")
+        
+        logger.info("Beat-Composer tab initialized")
+    
+    def beat_composer_select_audio(self):
+        """Open file dialog to select audio file"""
+        # Load last used music directory from settings
+        last_music_dir = self.account_manager.get_setting('beat_composer_last_music_dir', str(Path.home()))
+        
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Audio File",
+            last_music_dir,
+            "Audio Files (*.mp3 *.wav *.m4a *.aac *.ogg *.flac);;All Files (*.*)"
+        )
+        
+        if file_path:
+            self.beat_composer_audio_path = file_path
+            self.beat_composer_audio_label.setText(file_path)
+            self.beat_composer_audio_info_btn.setEnabled(True)
+            self.beat_composer_audio_preview_btn.setEnabled(True)
+            self.beat_composer_detect_btn.setEnabled(True)
+            self.beat_composer_detection_status.setText(f"Audio loaded: {Path(file_path).name}")
+            
+            # Update information panel
+            self.beat_composer_update_info_panel(file_path)
+            
+            # Save the directory for next time
+            self.account_manager.set_setting('beat_composer_last_music_dir', str(Path(file_path).parent))
+            
+            # Create project
+            try:
+                self.beat_composer_manager.create_project(file_path)
+                logger.info(f"Selected audio: {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to create project:\n{e}")
+                logger.error(f"Project creation error: {e}")
+    
+    def beat_composer_show_audio_info(self):
+        """Display audio metadata"""
+        if not self.beat_composer_audio_path:
+            return
+        
+        try:
+            info = self.beat_composer_manager.get_audio_info(self.beat_composer_audio_path)
+            
+            info_text = (
+                f"Audio Information\n\n"
+                f"File: {Path(self.beat_composer_audio_path).name}\n\n"
+                f"Duration: {info['duration_seconds']:.2f} seconds\n"
+                f"Sample Rate: {info['sample_rate']:,} Hz\n"
+                f"Channels: {info['channels']}\n"
+                f"Format: {info['format']}\n"
+                f"File Size: {info['file_size_mb']:.2f} MB\n"
+            )
+            
+            QMessageBox.information(self, "Audio Info", info_text)
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read audio info:\n{e}")
+            logger.error(f"Audio info error: {e}")
+    
+    def beat_composer_preview_audio(self):
+        """Preview audio with playback controls"""
+        if not self.beat_composer_audio_path:
+            return
+        
+        # Create preview dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Audio Preview")
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(200)
+        
+        layout = QVBoxLayout()
+        
+        # Audio info
+        audio_name = Path(self.beat_composer_audio_path).name
+        info_label = QLabel(f"<b>🎵 {audio_name}</b>")
+        info_label.setAlignment(Qt.AlignCenter)
+        info_label.setStyleSheet("font-size: 14px; padding: 10px;")
+        layout.addWidget(info_label)
+        
+        # Get duration info
+        try:
+            info = self.beat_composer_manager.get_audio_info(self.beat_composer_audio_path)
+            duration_minutes = int(info['duration_seconds'] // 60)
+            duration_seconds = int(info['duration_seconds'] % 60)
+            duration_label = QLabel(f"Duration: {duration_minutes}:{duration_seconds:02d}")
+            duration_label.setAlignment(Qt.AlignCenter)
+            duration_label.setStyleSheet("color: #64748b; padding-bottom: 10px;")
+            layout.addWidget(duration_label)
+        except Exception as e:
+            logger.warning(f"Could not get audio duration: {e}")
+        
+        # Playback controls
+        controls_layout = QHBoxLayout()
+        
+        play_btn = QPushButton("▶️ Play")
+        play_btn.setStyleSheet(
+            "QPushButton { background-color: #10b981; color: white; padding: 10px 20px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #059669; }"
+        )
+        controls_layout.addWidget(play_btn)
+        
+        pause_btn = QPushButton("⏸️ Pause")
+        pause_btn.setStyleSheet(
+            "QPushButton { background-color: #f59e0b; color: white; padding: 10px 20px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #d97706; }"
+        )
+        pause_btn.setEnabled(False)
+        controls_layout.addWidget(pause_btn)
+        
+        stop_btn = QPushButton("⏹️ Stop")
+        stop_btn.setStyleSheet(
+            "QPushButton { background-color: #ef4444; color: white; padding: 10px 20px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #dc2626; }"
+        )
+        stop_btn.setEnabled(False)
+        controls_layout.addWidget(stop_btn)
+        
+        layout.addLayout(controls_layout)
+        
+        # Volume control
+        volume_layout = QHBoxLayout()
+        volume_layout.addWidget(QLabel("🔊 Volume:"))
+        volume_slider = QSlider(Qt.Horizontal)
+        volume_slider.setRange(0, 100)
+        volume_slider.setValue(70)
+        volume_slider.setToolTip("Adjust volume")
+        volume_layout.addWidget(volume_slider)
+        volume_label = QLabel("70%")
+        volume_layout.addWidget(volume_label)
+        layout.addLayout(volume_layout)
+        
+        # Status label
+        status_label = QLabel("Ready to play")
+        status_label.setAlignment(Qt.AlignCenter)
+        status_label.setStyleSheet("color: #64748b; padding: 10px; font-style: italic;")
+        layout.addWidget(status_label)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+        
+        dialog.setLayout(layout)
+        
+        # Set up media player
+        self.beat_composer_audio_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.beat_composer_audio_path)))
+        self.beat_composer_audio_player.setVolume(70)
+        
+        # Connect controls
+        def on_play():
+            self.beat_composer_audio_player.play()
+            play_btn.setEnabled(False)
+            pause_btn.setEnabled(True)
+            stop_btn.setEnabled(True)
+            status_label.setText("▶️ Playing...")
+            status_label.setStyleSheet("color: #10b981; padding: 10px; font-weight: bold;")
+        
+        def on_pause():
+            self.beat_composer_audio_player.pause()
+            play_btn.setEnabled(True)
+            pause_btn.setEnabled(False)
+            status_label.setText("⏸️ Paused")
+            status_label.setStyleSheet("color: #f59e0b; padding: 10px; font-weight: bold;")
+        
+        def on_stop():
+            self.beat_composer_audio_player.stop()
+            play_btn.setEnabled(True)
+            pause_btn.setEnabled(False)
+            stop_btn.setEnabled(False)
+            status_label.setText("⏹️ Stopped")
+            status_label.setStyleSheet("color: #ef4444; padding: 10px; font-weight: bold;")
+        
+        def on_volume_changed(value):
+            self.beat_composer_audio_player.setVolume(value)
+            volume_label.setText(f"{value}%")
+        
+        def on_dialog_closed():
+            # Stop playback when dialog is closed
+            self.beat_composer_audio_player.stop()
+            self.beat_composer_audio_player.setMedia(QMediaContent())
+        
+        play_btn.clicked.connect(on_play)
+        pause_btn.clicked.connect(on_pause)
+        stop_btn.clicked.connect(on_stop)
+        volume_slider.valueChanged.connect(on_volume_changed)
+        dialog.finished.connect(on_dialog_closed)
+        
+        # Show dialog
+        self.beat_composer_audio_player_dialog = dialog
+        dialog.exec_()
+    
+    def beat_composer_update_info_panel(self, audio_path):
+        """Update the audio information panel with file metadata"""
+        try:
+            # Get basic file info
+            file_path = Path(audio_path)
+            filename = file_path.name
+            
+            # Get duration from librosa
+            try:
+                info = self.beat_composer_manager.get_audio_info(audio_path)
+                duration_seconds = info['duration_seconds']
+                duration_minutes = int(duration_seconds // 60)
+                duration_secs = int(duration_seconds % 60)
+                duration_text = f"{duration_minutes}:{duration_secs:02d}"
+            except Exception as e:
+                logger.warning(f"Could not get audio duration: {e}")
+                duration_text = "Unknown"
+            
+            # Try to extract MP3/audio metadata
+            title = None
+            artist = None
+            
+            try:
+                from mutagen import File as MutagenFile
+                audio_file = MutagenFile(audio_path)
+                
+                if audio_file is not None and audio_file.tags is not None:
+                    # Try different tag formats
+                    # ID3 tags (MP3)
+                    if 'TIT2' in audio_file.tags:  # Title
+                        title = str(audio_file.tags['TIT2'])
+                    elif 'title' in audio_file.tags:
+                        title = str(audio_file.tags['title'][0]) if isinstance(audio_file.tags['title'], list) else str(audio_file.tags['title'])
+                    
+                    if 'TPE1' in audio_file.tags:  # Artist
+                        artist = str(audio_file.tags['TPE1'])
+                    elif 'artist' in audio_file.tags:
+                        artist = str(audio_file.tags['artist'][0]) if isinstance(audio_file.tags['artist'], list) else str(audio_file.tags['artist'])
+                    
+                    # Vorbis comments (OGG, FLAC)
+                    if title is None and hasattr(audio_file.tags, 'get'):
+                        title_tag = audio_file.tags.get('title')
+                        if title_tag:
+                            title = str(title_tag[0]) if isinstance(title_tag, list) else str(title_tag)
+                    
+                    if artist is None and hasattr(audio_file.tags, 'get'):
+                        artist_tag = audio_file.tags.get('artist')
+                        if artist_tag:
+                            artist = str(artist_tag[0]) if isinstance(artist_tag, list) else str(artist_tag)
+            
+            except ImportError:
+                logger.warning("mutagen not installed - MP3 metadata will not be available. Install with: pip install mutagen")
+            except Exception as e:
+                logger.debug(f"Could not extract audio metadata: {e}")
+            
+            # Update UI labels
+            self.beat_composer_info_filename.setText(f"<b>File:</b> {filename}")
+            self.beat_composer_info_duration.setText(f"<b>Duration:</b> {duration_text}")
+            
+            if title:
+                self.beat_composer_info_title.setText(f"<b>Title:</b> {title}")
+            else:
+                self.beat_composer_info_title.setText(f"<b>Title:</b> <i style='color: #64748b;'>Not available</i>")
+            
+            if artist:
+                self.beat_composer_info_artist.setText(f"<b>Artist:</b> {artist}")
+            else:
+                self.beat_composer_info_artist.setText(f"<b>Artist:</b> <i style='color: #64748b;'>Not available</i>")
+            
+            # Show the info panel
+            self.beat_composer_info_panel.setVisible(True)
+            
+            logger.info(f"Updated audio info panel: {filename}, {duration_text}")
+        
+        except Exception as e:
+            logger.error(f"Failed to update info panel: {e}")
+            # Hide panel on error
+            self.beat_composer_info_panel.setVisible(False)
+    
+    def beat_composer_detect_beats(self):
+        """Detect beats in the audio"""
+        if not self.beat_composer_audio_path:
+            return
+        
+        method = self.beat_composer_method_combo.currentText()
+        
+        # Disable controls
+        self.beat_composer_detect_btn.setEnabled(False)
+        self.beat_composer_detection_progress.setVisible(True)
+        self.beat_composer_detection_progress.setRange(0, 0)  # Indeterminate
+        self.beat_composer_detection_status.setText(f"Analyzing audio with {method}...")
+        
+        # Run in thread
+        from PyQt5.QtCore import QThread, pyqtSignal
+        
+        class DetectionThread(QThread):
+            finished = pyqtSignal(dict)
+            error = pyqtSignal(str)
+            
+            def __init__(self, manager, audio_path, method):
+                super().__init__()
+                self.manager = manager
+                self.audio_path = audio_path
+                self.method = method
+            
+            def run(self):
+                try:
+                    if "Madmom" in self.method:
+                        results = self.manager.detect_beats_madmom(self.audio_path)
+                    else:
+                        results = self.manager.detect_beats_librosa(self.audio_path)
+                    self.finished.emit(results)
+                except Exception as e:
+                    self.error.emit(str(e))
+        
+        self.beat_composer_detection_thread = DetectionThread(
+            self.beat_composer_manager,
+            self.beat_composer_audio_path,
+            method
+        )
+        self.beat_composer_detection_thread.finished.connect(self.beat_composer_detection_complete)
+        self.beat_composer_detection_thread.error.connect(self.beat_composer_detection_error)
+        self.beat_composer_detection_thread.start()
+    
+    def beat_composer_detection_complete(self, results):
+        """Handle beat detection completion"""
+        self.beat_composer_detect_btn.setEnabled(True)
+        self.beat_composer_detection_progress.setVisible(False)
+        self.beat_composer_build_timeline_btn.setEnabled(True)
+        
+        beat_count = results['beat_count']
+        downbeat_count = results['downbeat_count']
+        bpm = results['bpm']
+        time_sig = results.get('time_signature', (4, 4))
+        
+        status_text = (
+            f"✅ Detected {beat_count} beats ({downbeat_count} downbeats) | "
+            f"BPM: {bpm:.1f} | Time Signature: {time_sig[0]}/{time_sig[1]}"
+        )
+        self.beat_composer_detection_status.setText(status_text)
+        
+        logger.info(f"Beat detection complete: {beat_count} beats at {bpm:.1f} BPM")
+        
+        QMessageBox.information(
+            self,
+            "Beat Detection Complete",
+            f"Successfully detected beats!\n\n"
+            f"Beats: {beat_count}\n"
+            f"Downbeats: {downbeat_count}\n"
+            f"BPM: {bpm:.1f}\n"
+            f"Time Signature: {time_sig[0]}/{time_sig[1]}\n\n"
+            f"Now configure the timeline and build it."
+        )
+    
+    def beat_composer_detection_error(self, error_msg):
+        """Handle beat detection error"""
+        self.beat_composer_detect_btn.setEnabled(True)
+        self.beat_composer_detection_progress.setVisible(False)
+        self.beat_composer_detection_status.setText(f"❌ Error: {error_msg}")
+        
+        QMessageBox.critical(self, "Detection Error", f"Failed to detect beats:\n\n{error_msg}")
+        logger.error(f"Beat detection error: {error_msg}")
+    
+    def beat_composer_duration_mode_changed(self, mode):
+        """Handle duration mode change"""
+        enabled = mode in ["N Seconds", "N Measures"]
+        self.beat_composer_duration_value.setEnabled(enabled)
+    
+    def beat_composer_build_timeline(self):
+        """Build the beat timeline"""
+        try:
+            duration_mode_text = self.beat_composer_duration_mode.currentText()
+            
+            # Map UI text to internal mode
+            mode_map = {
+                "Full Audio": "full",
+                "N Seconds": "seconds",
+                "N Measures": "measures"
+            }
+            duration_mode = mode_map[duration_mode_text]
+            duration_value = self.beat_composer_duration_value.value()
+            
+            include_beats = self.beat_composer_use_beats.isChecked()
+            include_downbeats = self.beat_composer_use_downbeats.isChecked()
+            
+            # Build timeline
+            timeline = self.beat_composer_manager.build_timeline(
+                duration_mode=duration_mode,
+                duration_value=duration_value,
+                include_beats=include_beats,
+                include_downbeats=include_downbeats
+            )
+            
+            self.beat_composer_timeline = timeline
+            
+            # Populate list
+            self.beat_composer_timeline_list.clear()
+            for beat in timeline:
+                time = beat['adjusted_time']
+                beat_type = beat['type']
+                media_status = "📁" if beat['media'] else "⭕"
+                
+                item_text = f"{media_status} Beat {beat['index']:03d} | {time:.3f}s | Type: {beat_type}"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, beat)
+                self.beat_composer_timeline_list.addItem(item)
+            
+            # Enable export buttons
+            self.beat_composer_save_project_btn.setEnabled(True)
+            
+            logger.info(f"Built timeline with {len(timeline)} beats")
+            
+            QMessageBox.information(
+                self,
+                "Timeline Built",
+                f"Timeline created with {len(timeline)} beats!\n\n"
+                f"Now you can:\n"
+                f"• Adjust beat timestamps\n"
+                f"• Assign images/videos to beats\n"
+                f"• Preview and export your composition"
+            )
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to build timeline:\n{e}")
+            logger.error(f"Timeline build error: {e}")
+    
+    def beat_composer_select_beat(self, item):
+        """Handle beat selection"""
+        if not item:
+            return
+        
+        beat = item.data(Qt.UserRole)
+        if not beat:
+            return
+        
+        # Update media label
+        media = beat.get('media')
+        if media:
+            media_path = Path(media['path'])
+            self.beat_composer_media_label.setText(
+                f"{media['type'].title()}: {media_path.name}"
+            )
+        else:
+            self.beat_composer_media_label.setText("No media assigned")
+        
+        # Update duration from beat
+        self.beat_composer_media_duration.setValue(beat.get('duration', 0.5))
+        
+        # Update preview
+        self.beat_composer_update_preview(beat)
+        
+        # Update navigation buttons
+        self.beat_composer_update_nav_buttons()
+    
+    def beat_composer_update_preview(self, beat):
+        """Update the preview panel with the current beat's media"""
+        media = beat.get('media')
+        
+        if not media:
+            self.beat_composer_preview_label.clear()
+            self.beat_composer_preview_label.setText("No media to preview")
+            self.beat_composer_preview_filename.setVisible(False)
+            self.beat_composer_play_video_btn.setVisible(False)
+            return
+        
+        media_path = Path(media['path'])
+        media_type = media['type']
+        
+        # Show filename
+        self.beat_composer_preview_filename.setText(f"📄 {media_path.name}")
+        self.beat_composer_preview_filename.setVisible(True)
+        
+        # Load and display preview
+        if media_type == 'image':
+            try:
+                pixmap = QPixmap(str(media_path))
+                if not pixmap.isNull():
+                    # Scale to fit while maintaining aspect ratio
+                    scaled_pixmap = pixmap.scaled(
+                        self.beat_composer_preview_label.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                    self.beat_composer_preview_label.setPixmap(scaled_pixmap)
+                else:
+                    self.beat_composer_preview_label.setText(f"Failed to load image:\n{media_path.name}")
+                self.beat_composer_play_video_btn.setVisible(False)
+            except Exception as e:
+                self.beat_composer_preview_label.setText(f"Error loading image:\n{e}")
+                self.beat_composer_play_video_btn.setVisible(False)
+        
+        elif media_type == 'video':
+            # For videos, try to extract a frame as thumbnail
+            try:
+                import cv2
+                cap = cv2.VideoCapture(str(media_path))
+                ret, frame = cap.read()
+                cap.release()
+                
+                if ret:
+                    # Convert BGR to RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    height, width, channel = frame_rgb.shape
+                    bytes_per_line = 3 * width
+                    q_image = QImage(frame_rgb.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                    pixmap = QPixmap.fromImage(q_image)
+                    
+                    # Scale to fit
+                    scaled_pixmap = pixmap.scaled(
+                        self.beat_composer_preview_label.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                    self.beat_composer_preview_label.setPixmap(scaled_pixmap)
+                else:
+                    self.beat_composer_preview_label.setText(f"🎬 Video:\n{media_path.name}\n\n(Click Play to view)")
+                
+                self.beat_composer_play_video_btn.setVisible(True)
+            except ImportError:
+                self.beat_composer_preview_label.setText(f"🎬 Video:\n{media_path.name}\n\n(OpenCV not available for preview)")
+                self.beat_composer_play_video_btn.setVisible(True)
+            except Exception as e:
+                self.beat_composer_preview_label.setText(f"🎬 Video:\n{media_path.name}\n\n(Click Play to view)")
+                self.beat_composer_play_video_btn.setVisible(True)
+    
+    def beat_composer_update_nav_buttons(self):
+        """Update navigation button states based on current selection"""
+        current_row = self.beat_composer_timeline_list.currentRow()
+        total_rows = self.beat_composer_timeline_list.count()
+        
+        has_items = total_rows > 0
+        self.beat_composer_first_btn.setEnabled(has_items and current_row > 0)
+        self.beat_composer_prev_btn.setEnabled(has_items and current_row > 0)
+        self.beat_composer_next_btn.setEnabled(has_items and current_row < total_rows - 1)
+        self.beat_composer_last_btn.setEnabled(has_items and current_row < total_rows - 1)
+    
+    def beat_composer_navigate_first(self):
+        """Navigate to first beat in timeline"""
+        if self.beat_composer_timeline_list.count() > 0:
+            self.beat_composer_timeline_list.setCurrentRow(0)
+    
+    def beat_composer_navigate_prev(self):
+        """Navigate to previous beat in timeline"""
+        current_row = self.beat_composer_timeline_list.currentRow()
+        if current_row > 0:
+            self.beat_composer_timeline_list.setCurrentRow(current_row - 1)
+    
+    def beat_composer_navigate_next(self):
+        """Navigate to next beat in timeline"""
+        current_row = self.beat_composer_timeline_list.currentRow()
+        if current_row < self.beat_composer_timeline_list.count() - 1:
+            self.beat_composer_timeline_list.setCurrentRow(current_row + 1)
+    
+    def beat_composer_navigate_last(self):
+        """Navigate to last beat in timeline"""
+        count = self.beat_composer_timeline_list.count()
+        if count > 0:
+            self.beat_composer_timeline_list.setCurrentRow(count - 1)
+    
+    def beat_composer_play_preview_video(self):
+        """Play the currently selected video in an external player or dialog"""
+        current_item = self.beat_composer_timeline_list.currentItem()
+        if not current_item:
+            return
+        
+        beat = current_item.data(Qt.UserRole)
+        if not beat:
+            return
+        
+        media = beat.get('media')
+        if not media or media['type'] != 'video':
+            return
+        
+        video_path = media['path']
+        
+        # Try to open with system default player
+        try:
+            import os
+            import subprocess
+            import platform
+            
+            system = platform.system()
+            if system == 'Windows':
+                os.startfile(video_path)
+            elif system == 'Darwin':  # macOS
+                subprocess.run(['open', video_path])
+            else:  # Linux
+                subprocess.run(['xdg-open', video_path])
+            
+            logger.info(f"Opened video in system player: {video_path}")
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Cannot Play Video",
+                f"Failed to open video in system player:\n{e}\n\nPath: {video_path}"
+            )
+            logger.error(f"Failed to play video: {e}")
+    
+    def beat_composer_apply_offset(self):
+        """Apply time offset to selected beat"""
+        current_item = self.beat_composer_timeline_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "No Selection", "Please select a beat first.")
+            return
+        
+        beat = current_item.data(Qt.UserRole)
+        beat_index = beat['index']
+        offset = self.beat_composer_offset_spin.value()
+        
+        mode_text = self.beat_composer_movement_mode.currentText()
+        mode = 'independent' if mode_text == "Independent" else 'unified'
+        
+        try:
+            self.beat_composer_manager.adjust_beat_time(beat_index, offset, mode)
+            
+            # Refresh timeline display
+            self.beat_composer_refresh_timeline_display()
+            
+            logger.info(f"Applied {offset}s offset to beat {beat_index} ({mode} mode)")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to apply offset:\n{e}")
+            logger.error(f"Offset application error: {e}")
+    
+    def beat_composer_refresh_timeline_display(self):
+        """Refresh the timeline list display"""
+        self.beat_composer_timeline_list.clear()
+        
+        for beat in self.beat_composer_manager.timeline_beats:
+            time = beat['adjusted_time']
+            beat_type = beat['type']
+            media_status = "📁" if beat['media'] else "⭕"
+            
+            item_text = f"{media_status} Beat {beat['index']:03d} | {time:.3f}s | Type: {beat_type}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, beat)
+            self.beat_composer_timeline_list.addItem(item)
+        
+        # Update navigation buttons
+        self.beat_composer_update_nav_buttons()
+    
+    def beat_composer_assign_media(self, media_type):
+        """Assign image or video to selected beat"""
+        current_item = self.beat_composer_timeline_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "No Selection", "Please select a beat first.")
+            return
+        
+        beat = current_item.data(Qt.UserRole)
+        beat_index = beat['index']
+        
+        # Load last used media directory from settings
+        last_media_dir = self.account_manager.get_setting('beat_composer_last_media_dir', str(Path.home()))
+        
+        # Select file
+        if media_type == 'image':
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Image",
+                last_media_dir,
+                "Image Files (*.jpg *.jpeg *.png *.gif *.bmp *.webp);;All Files (*.*)"
+            )
+        else:  # video
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Video",
+                last_media_dir,
+                "Video Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v);;All Files (*.*)"
+            )
+        
+        if not file_path:
+            return
+        
+        # Save the directory for next time
+        self.account_manager.set_setting('beat_composer_last_media_dir', str(Path(file_path).parent))
+        
+        try:
+            # Get duration from UI
+            duration = self.beat_composer_media_duration.value()
+            
+            # Assign media
+            self.beat_composer_manager.assign_media_to_beat(beat_index, file_path, media_type)
+            
+            # Update duration in timeline
+            self.beat_composer_manager.timeline_beats[beat_index]['duration'] = duration
+            
+            # Refresh display
+            self.beat_composer_refresh_timeline_display()
+            
+            # Update media label
+            self.beat_composer_media_label.setText(
+                f"{media_type.title()}: {Path(file_path).name}"
+            )
+            
+            # Enable preview/export if we have at least one media assignment
+            has_media = any(b.get('media') for b in self.beat_composer_manager.timeline_beats)
+            self.beat_composer_preview_btn.setEnabled(has_media)
+            self.beat_composer_export_btn.setEnabled(has_media)
+            
+            logger.info(f"Assigned {media_type} to beat {beat_index}")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to assign media:\n{e}")
+            logger.error(f"Media assignment error: {e}")
+    
+    def beat_composer_remove_media(self):
+        """Remove media from selected beat"""
+        current_item = self.beat_composer_timeline_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "No Selection", "Please select a beat first.")
+            return
+        
+        beat = current_item.data(Qt.UserRole)
+        beat_index = beat['index']
+        
+        try:
+            self.beat_composer_manager.remove_media_from_beat(beat_index)
+            
+            # Refresh display
+            self.beat_composer_refresh_timeline_display()
+            self.beat_composer_media_label.setText("No media assigned")
+            
+            # Disable preview/export if no media left
+            has_media = any(b.get('media') for b in self.beat_composer_manager.timeline_beats)
+            self.beat_composer_preview_btn.setEnabled(has_media)
+            self.beat_composer_export_btn.setEnabled(has_media)
+            
+            logger.info(f"Removed media from beat {beat_index}")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to remove media:\n{e}")
+            logger.error(f"Media removal error: {e}")
+    
+    def beat_composer_bulk_add_files(self):
+        """Bulk add multiple files and assign them to beats in order"""
+        if not self.beat_composer_manager.timeline_beats:
+            QMessageBox.warning(self, "No Timeline", "Please build a timeline first.")
+            return
+        
+        # Load last used media directory from settings
+        last_media_dir = self.account_manager.get_setting('beat_composer_last_media_dir', str(Path.home()))
+        
+        # Select multiple files
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Media Files (Images/Videos)",
+            last_media_dir,
+            "Media Files (*.jpg *.jpeg *.png *.gif *.bmp *.webp *.mp4 *.mov *.avi *.mkv *.webm *.m4v);;All Files (*.*)"
+        )
+        
+        if not file_paths:
+            return
+        
+        # Save the directory for next time
+        self.account_manager.set_setting('beat_composer_last_media_dir', str(Path(file_paths[0]).parent))
+        
+        # Assign files to beats in order
+        self._beat_composer_assign_files_to_beats(file_paths)
+    
+    def _beat_composer_assign_files_to_beats(self, file_paths: list):
+        """Internal method to assign a list of files to beats in order"""
+        try:
+            # Get default duration from UI
+            default_duration = self.beat_composer_media_duration.value()
+            
+            # Find first unassigned beat or start from beginning
+            start_index = 0
+            for i, beat in enumerate(self.beat_composer_manager.timeline_beats):
+                if not beat.get('media'):
+                    start_index = i
+                    break
+            
+            assigned_count = 0
+            failed_files = []
+            
+            for idx, file_path in enumerate(file_paths):
+                beat_index = start_index + idx
+                
+                # Stop if we run out of beats
+                if beat_index >= len(self.beat_composer_manager.timeline_beats):
+                    remaining = len(file_paths) - idx
+                    QMessageBox.warning(
+                        self,
+                        "Not Enough Beats",
+                        f"Only {assigned_count} files assigned.\n"
+                        f"{remaining} files skipped (not enough beats in timeline)."
+                    )
+                    break
+                
+                try:
+                    # Determine media type from extension
+                    ext = Path(file_path).suffix.lower()
+                    if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
+                        media_type = 'image'
+                    elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v']:
+                        media_type = 'video'
+                    else:
+                        failed_files.append((file_path, "Unknown file type"))
+                        continue
+                    
+                    # Assign media
+                    self.beat_composer_manager.assign_media_to_beat(beat_index, file_path, media_type)
+                    
+                    # Update duration in timeline
+                    self.beat_composer_manager.timeline_beats[beat_index]['duration'] = default_duration
+                    
+                    assigned_count += 1
+                    
+                except Exception as e:
+                    failed_files.append((file_path, str(e)))
+                    logger.error(f"Failed to assign {file_path}: {e}")
+            
+            # Refresh display
+            self.beat_composer_refresh_timeline_display()
+            
+            # Enable preview/export if we have media
+            has_media = any(b.get('media') for b in self.beat_composer_manager.timeline_beats)
+            self.beat_composer_preview_btn.setEnabled(has_media)
+            self.beat_composer_export_btn.setEnabled(has_media)
+            
+            # Show summary
+            summary_msg = f"Successfully assigned {assigned_count} file(s) to beats."
+            if failed_files:
+                summary_msg += f"\n\nFailed to assign {len(failed_files)} file(s):"
+                for file_path, error in failed_files[:5]:  # Show first 5 failures
+                    summary_msg += f"\n• {Path(file_path).name}: {error}"
+                if len(failed_files) > 5:
+                    summary_msg += f"\n... and {len(failed_files) - 5} more"
+            
+            QMessageBox.information(self, "Bulk Assignment Complete", summary_msg)
+            logger.info(f"Bulk assigned {assigned_count} files to beats")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to assign files:\n{e}")
+            logger.error(f"Bulk assignment error: {e}")
+    
+    def beat_composer_drag_enter_event(self, event):
+        """Handle drag enter for timeline list"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def beat_composer_drag_move_event(self, event):
+        """Handle drag move for timeline list"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def beat_composer_drop_event(self, event):
+        """Handle file drop on timeline list"""
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        
+        if not self.beat_composer_manager.timeline_beats:
+            QMessageBox.warning(self, "No Timeline", "Please build a timeline first.")
+            event.ignore()
+            return
+        
+        # Extract file paths from dropped URLs
+        file_paths = []
+        for url in event.mimeData().urls():
+            file_path = url.toLocalFile()
+            if file_path and Path(file_path).is_file():
+                # Filter for supported media files
+                ext = Path(file_path).suffix.lower()
+                if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
+                          '.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v']:
+                    file_paths.append(file_path)
+        
+        if not file_paths:
+            QMessageBox.warning(
+                self,
+                "No Valid Files",
+                "No supported media files found.\n\n"
+                "Supported: jpg, png, gif, bmp, webp, mp4, mov, avi, mkv, webm, m4v"
+            )
+            event.ignore()
+            return
+        
+        # Assign files to beats
+        self._beat_composer_assign_files_to_beats(file_paths)
+        event.acceptProposedAction()
+    
+    def beat_composer_preview_video(self):
+        """Preview the composed video"""
+        try:
+            # Compose video to temp location
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / 'beat_composer_preview'
+            temp_dir.mkdir(exist_ok=True)
+            
+            preview_path = temp_dir / 'preview.mp4'
+            
+            # Show progress dialog
+            progress = QProgressDialog("Composing video for preview...", "Cancel", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # Compose video
+            video_path = self.beat_composer_manager.compose_video(
+                output_path=str(preview_path),
+                resolution=(1080, 1920),  # Vertical video for social media
+                fps=30
+            )
+            
+            progress.close()
+            
+            # Open video in default player
+            if platform.system() == 'Windows':
+                os.startfile(video_path)
+            elif platform.system() == 'Darwin':  # macOS
+                subprocess.Popen(['open', video_path])
+            else:  # Linux
+                subprocess.Popen(['xdg-open', video_path])
+            
+            logger.info(f"Preview video created: {video_path}")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to preview video:\n{e}")
+            logger.error(f"Video preview error: {e}")
+    
+    def beat_composer_export_video(self):
+        """Export the final composed video"""
+        # Load last used export directory from settings
+        last_export_dir = self.account_manager.get_setting(
+            'beat_composer_last_export_dir',
+            str(Path.home() / 'Documents' / 'BeatComposer')
+        )
+        
+        # Create suggested filename with path
+        suggested_filename = f"beat_composition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        suggested_path = str(Path(last_export_dir) / suggested_filename)
+        
+        # Ask for output location
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Video",
+            suggested_path,
+            "Video Files (*.mp4);;All Files (*.*)"
+        )
+        
+        if not file_path:
+            return
+        
+        # Save the directory for next time
+        self.account_manager.set_setting('beat_composer_last_export_dir', str(Path(file_path).parent))
+        
+        try:
+            # Show progress dialog
+            progress = QProgressDialog("Rendering final video...", "Cancel", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # Compose video
+            video_path = self.beat_composer_manager.compose_video(
+                output_path=file_path,
+                resolution=(1080, 1920),  # Vertical video for social media
+                fps=30
+            )
+            
+            progress.close()
+            
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Video exported successfully!\n\n{video_path}"
+            )
+            
+            # Ask to open folder
+            reply = QMessageBox.question(
+                self,
+                "Open Folder?",
+                "Would you like to open the output folder?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                folder = str(Path(video_path).parent)
+                if platform.system() == 'Windows':
+                    os.startfile(folder)
+                elif platform.system() == 'Darwin':
+                    subprocess.Popen(['open', folder])
+                else:
+                    subprocess.Popen(['xdg-open', folder])
+            
+            logger.info(f"Video exported: {video_path}")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export video:\n{e}")
+            logger.error(f"Video export error: {e}")
+    
+    def beat_composer_save_project(self):
+        """Save current project"""
+        try:
+            project_path = self.beat_composer_manager.save_project()
+            
+            QMessageBox.information(
+                self,
+                "Project Saved",
+                f"Project saved successfully!\n\n{project_path}"
+            )
+            
+            logger.info(f"Project saved: {project_path}")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save project:\n{e}")
+            logger.error(f"Project save error: {e}")
+    
+    def beat_composer_load_project(self):
+        """Load a saved project"""
+        # Load last used project directory from settings
+        last_project_dir = self.account_manager.get_setting(
+            'beat_composer_last_project_dir', 
+            str(Path.home() / 'Documents' / 'BeatComposer')
+        )
+        
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Project",
+            last_project_dir,
+            "Project Files (*.json);;All Files (*.*)"
+        )
+        
+        if not file_path:
+            return
+        
+        # Save the directory for next time
+        self.account_manager.set_setting('beat_composer_last_project_dir', str(Path(file_path).parent))
+        
+        try:
+            self.beat_composer_manager.load_project(file_path)
+            
+            # Update UI
+            if self.beat_composer_manager.audio_path:
+                self.beat_composer_audio_path = str(self.beat_composer_manager.audio_path)
+                self.beat_composer_audio_label.setText(self.beat_composer_audio_path)
+                self.beat_composer_audio_info_btn.setEnabled(True)
+                self.beat_composer_audio_preview_btn.setEnabled(True)
+                
+                # Update information panel
+                self.beat_composer_update_info_panel(self.beat_composer_audio_path)
+            
+            # Update status
+            bpm = self.beat_composer_manager.bpm
+            beat_count = len(self.beat_composer_manager.beats)
+            self.beat_composer_detection_status.setText(
+                f"✅ Loaded: {beat_count} beats at {bpm:.1f} BPM"
+            )
+            
+            # Refresh timeline
+            if self.beat_composer_manager.timeline_beats:
+                self.beat_composer_refresh_timeline_display()
+                self.beat_composer_build_timeline_btn.setEnabled(True)
+                self.beat_composer_save_project_btn.setEnabled(True)
+                
+                # Enable preview/export if media assigned
+                has_media = any(b.get('media') for b in self.beat_composer_manager.timeline_beats)
+                self.beat_composer_preview_btn.setEnabled(has_media)
+                self.beat_composer_export_btn.setEnabled(has_media)
+            
+            QMessageBox.information(
+                self,
+                "Project Loaded",
+                f"Project loaded successfully!\n\n"
+                f"Beats: {beat_count}\n"
+                f"BPM: {bpm:.1f}\n"
+                f"Timeline: {len(self.beat_composer_manager.timeline_beats)} beats"
+            )
+            
+            logger.info(f"Project loaded: {file_path}")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load project:\n{e}")
+            logger.error(f"Project load error: {e}")
     
     def create_topics_tab(self):
         """Create the Topics management tab"""

@@ -1013,8 +1013,16 @@ class InstagramManager:
         """
         if not self.logged_in:
             raise RuntimeError("Must be logged in to download")
-        self._set_runtime_status('resolving_post', 'download_started', f"Starting authenticated download for {shortcode}.")
-        return self._download_post_authenticated(shortcode, target_dir)
+        
+        # Try anonymous first for public content (reduces rate limiting on authenticated session)
+        try:
+            self._set_runtime_status('resolving_post', 'download_started', f"Attempting anonymous download for {shortcode}")
+            return self._download_post_anonymous(shortcode, target_dir)
+        except instaloader.exceptions.LoginRequiredException:
+            # Post is private - use authenticated session
+            logger.info(f"Post {shortcode} requires authentication, using logged-in session")
+            self._set_runtime_status('resolving_post', 'download_retry_auth', f"Retrying with authentication for {shortcode}")
+            return self._download_post_authenticated(shortcode, target_dir)
     
     def _download_post_anonymous(self, shortcode: str, target_dir: Path) -> tuple:
         """

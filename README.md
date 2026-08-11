@@ -12,7 +12,9 @@ Built on proven libraries. No web scraping. No complexity. Just works.
 ✅ **Session persistence** - Stay logged in for ~90 days  
 ✅ **Clean GUI** - PyQt5 interface with progress tracking  
 ✅ **CLI mode** - Optional command-line interface  
-✅ **Reliable** - Built on `instaloader` library (actively maintained)
+✅ **Reliable** - Built on `instaloader` library (actively maintained)  
+✅ **🎬 Shot Breakdown** - Cinematic video analysis tool with AI prompt generation ⭐  
+✅ **🎵 Beat-Composer** - Music video synchronization with automatic beat detection ⭐ NEW
 
 ## ⚠️ Important Limitation
 
@@ -103,26 +105,126 @@ python main.py list username password
 python main.py accounts
 ```
 
+**Analyze video for shot breakdown:**
+
+```bash
+python main.py shot-breakdown video.mp4
+python main.py shot-breakdown video.mp4 -m scenedetect -t 25.0
+```
+
 **Verbose logging:**
 
 ```bash
 python main.py -v
 ```
 
+### 🎬 Shot Breakdown Tool
+
+**NEW:** Automated cinematic video analysis system that breaks down videos shot-by-shot.
+
+**Features:**
+
+- 🎥 Automatic shot detection (PySceneDetect + OpenCV)
+- 🖼️ Keyframe extraction (first/middle/last frames)
+- 🎨 Scene labeling (shot type, camera angle, movement, lighting)
+- 🔗 Dependency mapping (visual, motion, narrative continuity)
+- 🤖 AI prompt generation (for Runway, Pika, Luma, Kling, etc.)
+- 📊 Complete JSON export with all metadata
+- 📝 Text prompt files ready for AI video tools
+
+**Access in GUI:**
+
+- Open the "🎬 Shot Breakdown" tab
+- Select a video file
+- Configure detection settings (method, sensitivity)
+- Click "Process Video"
+- Review shots with keyframes and prompts
+- Export JSON or prompts for AI tools
+
+**Command-line usage:**
+
+```bash
+# Basic usage (auto-detect method)
+python main.py shot-breakdown video.mp4
+
+# Specify detection method and sensitivity
+python main.py shot-breakdown video.mp4 -m scenedetect -t 25.0
+
+# Use OpenCV method (no extra dependencies)
+python main.py shot-breakdown video.mp4 -m opencv -t 30.0
+```
+
+**Output:**
+
+- Project folder with all analysis data
+- `shot_breakdown.json` - Complete structured data
+- `prompts.txt` - AI-ready prompts for each shot
+- Keyframe images for every shot
+
+**Documentation:** See [Documentation/SHOT_BREAKDOWN.md](Documentation/SHOT_BREAKDOWN.md) for complete guide.
+
+### 🎵 Beat-Composer Tool
+
+**NEW:** Professional music video creation tool that automatically synchronizes images and videos to beats in audio tracks.
+
+**Features:**
+
+- 🎵 Automatic beat detection (librosa + madmom)
+- 📊 BPM, tempo, downbeats, and time signature detection
+- ⏱️ Flexible timeline: full audio, N seconds, or N measures
+- 🎯 Precise beat adjustment (independent or unified mode)
+- 🖼️ Assign images/videos to beats
+- ▶️ Preview compositions before export
+- 💾 Export high-quality videos (1080x1920 vertical)
+- 💾 Save/load projects for later editing
+
+**Access in GUI:**
+
+- Open the "🎵 Beat-Composer" tab
+- Load an audio file (MP3, WAV, M4A, etc.)
+- Detect beats (Librosa=fast, Madmom=accurate)
+- Configure timeline duration and beat types
+- Assign images/videos to beats
+- Preview and export your video
+
+**Perfect for:**
+
+- Instagram Reels with music sync
+- TikTok rhythm-based videos
+- YouTube Shorts
+- Social media content creation
+
+**Quick Install:**
+
+```powershell
+# Install Beat-Composer dependencies
+.\setup-beat-composer.ps1
+
+# Or manually:
+pip install librosa madmom moviepy ffmpeg-python soundfile audioread mutagen
+```
+
+**Documentation:** See [Documentation/BEAT_COMPOSER.md](Documentation/BEAT_COMPOSER.md) for complete guide.
+
 ## File Structure
 
 ```
 instagram-downloader/
-├── main.py                 # Entry point
-├── gui.py                  # PyQt5 GUI (450 lines)
-├── instagram_manager.py    # Instagram operations (180 lines)
-├── account_manager.py      # Account persistence (150 lines)
-├── config.py              # Configuration (50 lines)
-├── requirements.txt       # Dependencies
-├── README.md             # This file
-└── ARCHITECTURE.md       # Design documentation
-
-Total: ~900 lines of clean code
+├── main.py                      # Entry point
+├── gui.py                       # PyQt5 GUI
+├── instagram_manager.py         # Instagram operations
+├── account_manager.py           # Account persistence
+├── shot_breakdown_manager.py    # Video shot analysis 🆕
+├── beat_composer_manager.py     # Music video synchronization 🆕
+├── content_database_manager.py  # Content storage
+├── config.py                    # Configuration
+├── requirements.txt             # Dependencies
+├── README.md                    # This file
+└── Documentation/
+    ├── ARCHITECTURE.md          # Design documentation
+    ├── SHOT_BREAKDOWN.md        # Shot breakdown guide 🆕
+    ├── BEAT_COMPOSER.md         # Beat-Composer guide 🆕
+    └── ...
 ```
 
 ## Configuration

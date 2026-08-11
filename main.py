@@ -13,6 +13,7 @@ import config
 from gui import main as gui_main
 from instagram_manager import InstagramManager, quick_download
 from account_manager import AccountManager
+from shot_breakdown_manager import ShotBreakdownManager
 
 
 def setup_logging(verbose=False):
@@ -72,6 +73,33 @@ def cli_mode(args):
             print("No saved accounts")
         return 0
     
+    elif args.command == 'shot-breakdown':
+        # Analyze video for shot breakdown
+        print(f"\n🎬 Shot Breakdown Analysis\n")
+        print(f"Video: {args.video}")
+        print(f"Method: {args.method}")
+        print(f"Threshold: {args.threshold}")
+        print()
+        
+        try:
+            manager = ShotBreakdownManager()
+            results = manager.process_video(
+                args.video,
+                threshold=args.threshold,
+                method=args.method
+            )
+            
+            print(f"\n✅ Analysis complete!")
+            print(f"📊 Detected {results['shot_count']} shots")
+            print(f"📁 Results: {results['project_dir']}")
+            print()
+            
+            return 0
+        
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+            return 1
+    
     return 0
 
 
@@ -99,6 +127,15 @@ def main():
     
     # Accounts command
     subparsers.add_parser('accounts', help='List saved accounts')
+    
+    # Shot breakdown command
+    shot_parser = subparsers.add_parser('shot-breakdown', help='Analyze video for cinematic shot breakdown')
+    shot_parser.add_argument('video', help='Path to video file')
+    shot_parser.add_argument('-m', '--method', default='auto', 
+                           choices=['auto', 'scenedetect', 'opencv'],
+                           help='Detection method (default: auto)')
+    shot_parser.add_argument('-t', '--threshold', type=float, default=27.0,
+                           help='Detection sensitivity threshold (default: 27.0)')
     
     args = parser.parse_args()
     
