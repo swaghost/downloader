@@ -33,7 +33,7 @@ try:
     import librosa
     LIBROSA_AVAILABLE = True
 except ImportError:
-    logger.warning("librosa not available. Install with: pip install librosa")
+    logger.info("librosa not available - run .\\install-beat-composer.ps1 or: pip install librosa")
     LIBROSA_AVAILABLE = False
 
 try:
@@ -42,28 +42,82 @@ try:
     from madmom.features.downbeats import RNNDownBeatProcessor, DBNDownBeatTrackingProcessor
     MADMOM_AVAILABLE = True
 except ImportError:
-    logger.warning("madmom not available. Install with: pip install Cython numpy && pip install madmom")
+    logger.info("madmom not available - librosa will be used for beat detection (faster, slightly less accurate)")
     MADMOM_AVAILABLE = False
 except Exception as e:
-    logger.warning(f"madmom import failed: {e}. Using librosa only.")
+    logger.info(f"madmom import failed: {e}. Using librosa fallback for beat detection.")
     MADMOM_AVAILABLE = False
 
 try:
-    from moviepy.editor import (
+    # MoviePy 2.x imports directly from moviepy
+    from moviepy import (
         VideoFileClip, ImageClip, CompositeVideoClip, 
         AudioFileClip, concatenate_videoclips
     )
     MOVIEPY_AVAILABLE = True
 except ImportError:
-    logger.warning("moviepy not available. Install with: pip install moviepy")
-    MOVIEPY_AVAILABLE = False
+    # Try MoviePy 1.x import structure as fallback
+    try:
+        from moviepy.editor import (
+            VideoFileClip, ImageClip, CompositeVideoClip, 
+            AudioFileClip, concatenate_videoclips
+        )
+        MOVIEPY_AVAILABLE = True
+    except ImportError:
+        logger.info("moviepy not available - video composition disabled. Run .\\install-beat-composer.ps1 to enable.")
+        MOVIEPY_AVAILABLE = False
 
 try:
     import ffmpeg
     FFMPEG_AVAILABLE = True
 except ImportError:
-    logger.warning("ffmpeg-python not available. Install with: pip install ffmpeg-python")
+    logger.info("ffmpeg-python not available - video rendering may be limited. Run .\\install-beat-composer.ps1 to enable.")
     FFMPEG_AVAILABLE = False
+
+
+def check_dependencies_available():
+    """
+    Re-check if dependencies are available at runtime.
+    Useful after installing packages while app is running.
+    Returns tuple: (librosa_ok, moviepy_ok, ffmpeg_ok)
+    """
+    librosa_ok = LIBROSA_AVAILABLE
+    moviepy_ok = MOVIEPY_AVAILABLE
+    ffmpeg_ok = FFMPEG_AVAILABLE
+    
+    # Try to re-import if previously unavailable
+    if not LIBROSA_AVAILABLE:
+        try:
+            import importlib
+            importlib.import_module('librosa')
+            librosa_ok = True
+            logger.info("librosa is now available")
+        except ImportError:
+            pass
+    
+    if not MOVIEPY_AVAILABLE:
+        try:
+            # Try MoviePy 2.x first
+            import importlib
+            importlib.import_module('moviepy')
+            # Verify key classes are available
+            mod = importlib.import_module('moviepy')
+            if hasattr(mod, 'VideoFileClip') and hasattr(mod, 'AudioFileClip'):
+                moviepy_ok = True
+                logger.info("moviepy is now available")
+        except ImportError:
+            pass
+    
+    if not FFMPEG_AVAILABLE:
+        try:
+            import importlib
+            importlib.import_module('ffmpeg')
+            ffmpeg_ok = True
+            logger.info("ffmpeg-python is now available")
+        except ImportError:
+            pass
+    
+    return (librosa_ok, moviepy_ok, ffmpeg_ok)
 
 
 class BeatComposerManager:
@@ -112,6 +166,9 @@ class BeatComposerManager:
         # Timeline configuration
         self.timeline_beats = []  # Working timeline with adjustments
         self.beat_media_assignments = {}  # {beat_index: {'type': 'image'/'video', 'path': '...'}}
+        
+        # Composition settings
+        self.default_scaling_mode = 'crop'  # 'stretch' or 'crop'
         
         logger.info(f"Beat Composer Manager initialized. Output: {self.output_dir}")
     
@@ -426,7 +483,7 @@ class BeatComposerManager:
         
         logger.info(f"Adjusted beat {beat_index} by {offset_seconds}s ({movement_mode} mode)")
     
-    def assign_media_to_beat(self, beat_index: int, media_path: str, media_type: str = None):
+    def assign_media_to_beat(self, beat_index: int, media_path: str, media_type: str = None, scaling_mode: str = None):
         """
         Assign an image or video to a beat.
         
@@ -434,6 +491,7 @@ class BeatComposerManager:
             beat_index: Index of beat
             media_path: Path to image or video file
             media_type: 'image' or 'video' (auto-detected if None)
+            scaling_mode: 'stretch' or 'crop' (uses default if None)
         """
         if beat_index < 0 or beat_index >= len(self.timeline_beats):
             raise ValueError(f"Invalid beat index: {beat_index}")
@@ -454,10 +512,11 @@ class BeatComposerManager:
         
         self.timeline_beats[beat_index]['media'] = {
             'type': media_type,
-            'path': str(media_path)
+            'path': str(media_path),
+            'scaling_mode': scaling_mode or self.default_scaling_mode
         }
         
-        logger.info(f"Assigned {media_type} to beat {beat_index}: {media_path.name}")
+        logger.info(f"Assigned {media_type} to beat {beat_index}: {media_path.name} (scaling: {scaling_mode or self.default_scaling_mode})")
     
     def remove_media_from_beat(self, beat_index: int):
         """Remove media assignment from a beat."""
@@ -468,7 +527,8 @@ class BeatComposerManager:
         logger.info(f"Removed media from beat {beat_index}")
     
     def compose_video(self, output_path: str = None, resolution: Tuple[int, int] = (1080, 1920),
-                     fps: int = 30, background_color: Tuple[int, int, int] = (0, 0, 0)) -> str:
+                     fps: int = 30, background_color: Tuple[int, int, int] = (0, 0, 0),
+                     progress_callback=None) -> str:
         """
         Compose final video from timeline and media assignments.
         
@@ -477,12 +537,33 @@ class BeatComposerManager:
             resolution: (width, height) of output video
             fps: Frames per second
             background_color: RGB tuple for background
+            progress_callback: Optional callback function(current, total, status_text)
             
         Returns:
             Path to the composed video
         """
-        if not MOVIEPY_AVAILABLE:
+        # Re-check if moviepy is available (in case it was installed after initial load)
+        _, moviepy_ok, _ = check_dependencies_available()
+        
+        if not moviepy_ok and not MOVIEPY_AVAILABLE:
             raise ImportError("moviepy is required for video composition")
+        
+        # If moviepy wasn't initially available but is now, import it
+        if not MOVIEPY_AVAILABLE and moviepy_ok:
+            global AudioFileClip, VideoFileClip, ImageClip, CompositeVideoClip, concatenate_videoclips
+            try:
+                # MoviePy 2.x
+                from moviepy import (
+                    VideoFileClip, ImageClip, CompositeVideoClip, 
+                    AudioFileClip, concatenate_videoclips
+                )
+            except ImportError:
+                # MoviePy 1.x fallback
+                from moviepy.editor import (
+                    VideoFileClip, ImageClip, CompositeVideoClip, 
+                    AudioFileClip, concatenate_videoclips
+                )
+            logger.info("moviepy loaded successfully at runtime")
         
         if not self.timeline_beats:
             raise ValueError("No timeline built. Run build_timeline first.")
@@ -496,33 +577,81 @@ class BeatComposerManager:
         
         logger.info(f"Composing video: {resolution[0]}x{resolution[1]} @ {fps}fps")
         
+        if progress_callback:
+            progress_callback(0, 100, "Loading audio...")
+        
         # Load audio
         audio_clip = AudioFileClip(str(self.audio_path))
         
-        # Create clips for each beat with media
+        # Create clips for each beat with media, extending to next beat to avoid gaps
         clips = []
+        media_beats = [b for b in self.timeline_beats if b.get('media')]
         
-        for beat in self.timeline_beats:
+        if not media_beats:
+            raise ValueError("No media clips to compose. Assign media to beats first.")
+        
+        total_beats = len(media_beats)
+        
+        for i, beat in enumerate(media_beats):
             media = beat.get('media')
             if not media:
                 continue
             
             start_time = beat['adjusted_time']
-            duration = beat['duration']
+            
+            # Calculate duration: extend to next beat or end of audio
+            if i < len(media_beats) - 1:
+                next_beat_time = media_beats[i + 1]['adjusted_time']
+                duration = next_beat_time - start_time
+            else:
+                # Last beat: extend to end of audio
+                duration = audio_clip.duration - start_time
+            
+            # Ensure minimum duration
+            duration = max(0.1, duration)
+            
+            if progress_callback:
+                progress_callback(i, total_beats, f"Processing clip {i+1}/{total_beats}: {Path(media['path']).name}")
             
             try:
+                # Get scaling mode for this media item
+                scaling_mode = media.get('scaling_mode', self.default_scaling_mode)
+                
                 if media['type'] == 'image':
-                    clip = (ImageClip(media['path'])
-                           .set_start(start_time)
-                           .set_duration(duration)
-                           .resize(resolution))
+                    base_clip = ImageClip(media['path'])
+                    
+                    # Apply scaling based on mode
+                    if scaling_mode == 'crop':
+                        # Crop to fill: scale to cover entire frame, then crop
+                        clip = self._apply_crop_scaling(base_clip, resolution)
+                    else:  # stretch
+                        # Stretch to fill: distort aspect ratio to fit exactly
+                        clip = base_clip.resized(resolution)
+                    
+                    clip = (clip
+                           .with_start(start_time)
+                           .with_duration(duration))
                 
                 elif media['type'] == 'video':
                     video_clip = VideoFileClip(media['path'])
-                    clip = (video_clip
-                           .subclip(0, min(duration, video_clip.duration))
-                           .set_start(start_time)
-                           .resize(resolution))
+                    # If video is shorter than needed duration, loop it
+                    if video_clip.duration < duration:
+                        # Loop video to fill duration
+                        num_loops = int(duration / video_clip.duration) + 1
+                        looped_clip = concatenate_videoclips([video_clip] * num_loops)
+                        base_clip = looped_clip.subclipped(0, duration)
+                    else:
+                        base_clip = video_clip.subclipped(0, min(duration, video_clip.duration))
+                    
+                    # Apply scaling based on mode
+                    if scaling_mode == 'crop':
+                        # Crop to fill: scale to cover entire frame, then crop
+                        clip = self._apply_crop_scaling(base_clip, resolution)
+                    else:  # stretch
+                        # Stretch to fill: distort aspect ratio to fit exactly
+                        clip = base_clip.resized(resolution)
+                    
+                    clip = clip.with_start(start_time)
                 
                 clips.append(clip)
             
@@ -533,25 +662,59 @@ class BeatComposerManager:
         if not clips:
             raise ValueError("No media clips to compose. Assign media to beats first.")
         
-        # Create background
-        from moviepy.editor import ColorClip
+        if progress_callback:
+            progress_callback(total_beats, total_beats, "Creating composite video...")
+        
+        # Create background only for areas not covered by clips
+        try:
+            # MoviePy 2.x
+            from moviepy import ColorClip
+        except ImportError:
+            # MoviePy 1.x
+            from moviepy.editor import ColorClip
         background = ColorClip(size=resolution, color=background_color, 
                              duration=audio_clip.duration)
         
         # Composite all clips on background
         final_video = CompositeVideoClip([background] + clips, size=resolution)
-        final_video = final_video.set_audio(audio_clip)
-        final_video = final_video.set_fps(fps)
+        final_video = final_video.with_audio(audio_clip)
+        final_video = final_video.with_fps(fps)
         
         # Write video
+        if progress_callback:
+            progress_callback(100, 100, "Rendering video...")
+        
         logger.info(f"Rendering video to: {output_path}")
+        
+        # Custom progress logger for write_videofile
+        if progress_callback:
+            # Create a custom logger that calls our progress callback
+            class ProgressLogger:
+                def __init__(self, callback):
+                    self.callback = callback
+                
+                def __call__(self, **kwargs):
+                    # MoviePy passes progress info as kwargs
+                    if 't' in kwargs and 'total_duration' in kwargs:
+                        current_time = kwargs['t']
+                        total_time = kwargs['total_duration']
+                        percent = int((current_time / total_time) * 100) if total_time > 0 else 0
+                        self.callback(int(current_time * fps), int(total_time * fps), 
+                                    f"Rendering: {percent}% ({current_time:.1f}/{total_time:.1f}s)")
+            
+            progress_logger = ProgressLogger(progress_callback)
+            logger_param = progress_logger
+        else:
+            logger_param = 'bar'
+        
         final_video.write_videofile(
             str(output_path),
             codec='libx264',
             audio_codec='aac',
             fps=fps,
             preset='medium',
-            threads=4
+            threads=4,
+            logger=logger_param
         )
         
         # Cleanup
@@ -562,6 +725,46 @@ class BeatComposerManager:
         
         logger.info(f"Video composition complete: {output_path}")
         return str(output_path)
+    
+    def _apply_crop_scaling(self, clip, target_resolution):
+        """
+        Scale clip to fill target resolution while maintaining aspect ratio (crop to fit).
+        
+        Args:
+            clip: VideoClip or ImageClip
+            target_resolution: (width, height) tuple
+            
+        Returns:
+            Scaled and cropped clip
+        """
+        target_width, target_height = target_resolution
+        target_aspect = target_width / target_height
+        
+        # Get clip dimensions
+        clip_width, clip_height = clip.size
+        clip_aspect = clip_width / clip_height
+        
+        # Scale to cover the target area (one dimension will be larger)
+        if clip_aspect > target_aspect:
+            # Clip is wider - scale by height, crop width
+            scaled_clip = clip.resized(height=target_height)
+        else:
+            # Clip is taller - scale by width, crop height
+            scaled_clip = clip.resized(width=target_width)
+        
+        # Crop to exact target size (centered)
+        try:
+            # MoviePy 2.x
+            cropped_clip = scaled_clip.cropped(x_center=scaled_clip.w/2, y_center=scaled_clip.h/2,
+                                               width=target_width, height=target_height)
+        except AttributeError:
+            # MoviePy 1.x fallback
+            from moviepy.video.fx.crop import crop
+            x1 = (scaled_clip.w - target_width) / 2
+            y1 = (scaled_clip.h - target_height) / 2
+            cropped_clip = crop(scaled_clip, x1=x1, y1=y1, width=target_width, height=target_height)
+        
+        return cropped_clip
     
     def save_project(self, project_path: str = None) -> str:
         """

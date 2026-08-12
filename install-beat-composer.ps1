@@ -46,12 +46,12 @@ foreach ($pkg in $audio) {
 
 Write-Host ""
 
-# Step 3: Video processing (moviepy)
+# Step 3: Video processing (moviepy 2.x)
 Write-Host "[3/4] Installing video processing libraries..." -ForegroundColor Yellow
 Write-Host ""
 
-Write-Host "  Installing moviepy..." -NoNewline
-pip install --quiet "moviepy>=1.0.3" 2>&1 | Out-Null
+Write-Host "  Installing moviepy 2.x..." -NoNewline
+pip install --quiet "moviepy>=2.0.0" 2>&1 | Out-Null
 if ($LASTEXITCODE -eq 0) {
     Write-Host " OK" -ForegroundColor Green
 } else {

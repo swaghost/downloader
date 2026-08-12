@@ -22,7 +22,7 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QProgressBar, QTextEdit, QFileDialog, QListWidgetItem,
+    QMessageBox, QProgressBar, QProgressDialog, QTextEdit, QFileDialog, QListWidgetItem,
     QGroupBox, QGridLayout, QInputDialog, QTableWidget, QTableWidgetItem,
     QSplitter, QHeaderView, QCheckBox, QDialog, QScrollArea, QFrame,
     QStackedWidget, QComboBox, QSpinBox, QToolTip, QSlider, QTreeWidget, QTreeWidgetItem,
@@ -69,6 +69,239 @@ class HoverImageLabel(QLabel):
         """Hide tooltip when mouse leaves"""
         QToolTip.hideText()
         super().leaveEvent(event)
+
+
+class AudioDropLabel(QLabel):
+    """Label widget that accepts drag/drop of audio files."""
+    file_dropped = pyqtSignal(str)
+    
+    SUPPORTED_AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac')
+    
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setAcceptDrops(True)
+        self._drag_active = False
+        self._original_style = self.styleSheet()  # Save initial style
+    
+    def _is_supported_audio(self, file_path):
+        """Check if file is a supported audio format."""
+        return str(file_path).lower().endswith(self.SUPPORTED_AUDIO_EXTENSIONS)
+    
+    def _extract_audio_path(self, mime_data):
+        """Extract first supported audio file from mime data."""
+        if not mime_data or not mime_data.hasUrls():
+            return None
+        
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            local_path = url.toLocalFile()
+            if self._is_supported_audio(local_path) and os.path.exists(local_path):
+                return local_path
+        
+        return None
+    
+    def dragEnterEvent(self, event):
+        """Handle drag enter event."""
+        audio_path = self._extract_audio_path(event.mimeData())
+        if audio_path:
+            event.acceptProposedAction()
+            self._drag_active = True
+            self._update_drag_style(True)
+        else:
+            event.ignore()
+    
+    def dragMoveEvent(self, event):
+        """Handle drag move event."""
+        audio_path = self._extract_audio_path(event.mimeData())
+        if audio_path:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dragLeaveEvent(self, event):
+        """Handle drag leave event."""
+        self._drag_active = False
+        self._update_drag_style(False)
+        super().dragLeaveEvent(event)
+    
+    def dropEvent(self, event):
+        """Handle drop event."""
+        audio_path = self._extract_audio_path(event.mimeData())
+        if audio_path:
+            self._drag_active = False
+            self._update_drag_style(False)
+            self.file_dropped.emit(audio_path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def _update_drag_style(self, active):
+        """Update visual style during drag operation."""
+        if active:
+            # Apply hover style
+            self.setStyleSheet(
+                "padding: 10px; background-color: #7c3aed; border: 2px dashed #fff; "
+                "border-radius: 5px; color: #ffffff; font-weight: bold;"
+            )
+        else:
+            # Restore original style
+            self.setStyleSheet(self._original_style)
+
+
+class VideoDropLabel(QLabel):
+    """Label widget that accepts drag/drop of video files."""
+    file_dropped = pyqtSignal(str)
+    
+    SUPPORTED_VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
+    
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setAcceptDrops(True)
+        self._drag_active = False
+        self._original_style = self.styleSheet()
+    
+    def _is_supported_video(self, file_path):
+        """Check if file is a supported video format."""
+        return str(file_path).lower().endswith(self.SUPPORTED_VIDEO_EXTENSIONS)
+    
+    def _extract_video_path(self, mime_data):
+        """Extract first supported video file from mime data."""
+        if not mime_data or not mime_data.hasUrls():
+            return None
+        
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            local_path = url.toLocalFile()
+            if self._is_supported_video(local_path) and os.path.exists(local_path):
+                return local_path
+        
+        return None
+    
+    def dragEnterEvent(self, event):
+        """Handle drag enter event."""
+        video_path = self._extract_video_path(event.mimeData())
+        if video_path:
+            event.acceptProposedAction()
+            self._drag_active = True
+            self._update_drag_style(True)
+        else:
+            event.ignore()
+    
+    def dragMoveEvent(self, event):
+        """Handle drag move event."""
+        video_path = self._extract_video_path(event.mimeData())
+        if video_path:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dragLeaveEvent(self, event):
+        """Handle drag leave event."""
+        self._drag_active = False
+        self._update_drag_style(False)
+        super().dragLeaveEvent(event)
+    
+    def dropEvent(self, event):
+        """Handle drop event."""
+        video_path = self._extract_video_path(event.mimeData())
+        if video_path:
+            self._drag_active = False
+            self._update_drag_style(False)
+            self.file_dropped.emit(video_path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def _update_drag_style(self, active):
+        """Update visual style during drag operation."""
+        if active:
+            self.setStyleSheet(
+                "padding: 10px; background-color: #3a7ca5; border: 2px dashed #fff; "
+                "border-radius: 5px; color: #ffffff; font-weight: bold;"
+            )
+        else:
+            self.setStyleSheet(self._original_style)
+
+
+class MediaDropLabel(QLabel):
+    """Label widget that accepts drag/drop of audio or video files."""
+    file_dropped = pyqtSignal(str)
+    
+    SUPPORTED_EXTENSIONS = (
+        '.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac',  # Audio
+        '.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v'  # Video
+    )
+    
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setAcceptDrops(True)
+        self._drag_active = False
+        self._original_style = self.styleSheet()
+    
+    def _is_supported_media(self, file_path):
+        """Check if file is a supported audio/video format."""
+        return str(file_path).lower().endswith(self.SUPPORTED_EXTENSIONS)
+    
+    def _extract_media_path(self, mime_data):
+        """Extract first supported media file from mime data."""
+        if not mime_data or not mime_data.hasUrls():
+            return None
+        
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            local_path = url.toLocalFile()
+            if self._is_supported_media(local_path) and os.path.exists(local_path):
+                return local_path
+        
+        return None
+    
+    def dragEnterEvent(self, event):
+        """Handle drag enter event."""
+        media_path = self._extract_media_path(event.mimeData())
+        if media_path:
+            event.acceptProposedAction()
+            self._drag_active = True
+            self._update_drag_style(True)
+        else:
+            event.ignore()
+    
+    def dragMoveEvent(self, event):
+        """Handle drag move event."""
+        media_path = self._extract_media_path(event.mimeData())
+        if media_path:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dragLeaveEvent(self, event):
+        """Handle drag leave event."""
+        self._drag_active = False
+        self._update_drag_style(False)
+        super().dragLeaveEvent(event)
+    
+    def dropEvent(self, event):
+        """Handle drop event."""
+        media_path = self._extract_media_path(event.mimeData())
+        if media_path:
+            self._drag_active = False
+            self._update_drag_style(False)
+            self.file_dropped.emit(media_path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def _update_drag_style(self, active):
+        """Update visual style during drag operation."""
+        if active:
+            self.setStyleSheet(
+                "padding: 10px; background-color: #16a34a; border: 2px dashed #fff; "
+                "border-radius: 5px; color: #ffffff; font-weight: bold;"
+            )
+        else:
+            self.setStyleSheet(self._original_style)
 
 
 class Mp3DropListWidget(QListWidget):
@@ -5280,10 +5513,21 @@ class InstagramDownloaderGUI(QMainWindow):
         layout.setSpacing(6)
 
         instructions = QLabel(
-            "Load a source video, set audio trim start/end in frames, preview audio, then save the extracted audio file."
+            "Load a source video or drag-drop a video file, set audio trim start/end in frames, preview audio, then save the extracted audio file."
         )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
+
+        # Video drop zone
+        self.audio_extract_drop_label = VideoDropLabel("Drop video file here")
+        self.audio_extract_drop_label.setFixedHeight(60)
+        self.audio_extract_drop_label.setAlignment(Qt.AlignCenter)
+        self.audio_extract_drop_label.setStyleSheet(
+            "padding: 10px; background-color: #2a2a2a; border: 2px dashed #666; "
+            "border-radius: 5px; color: #999;"
+        )
+        self.audio_extract_drop_label.file_dropped.connect(self.on_audio_extract_video_dropped)
+        layout.addWidget(self.audio_extract_drop_label)
 
         source_row = QHBoxLayout()
         source_row.addWidget(QLabel("Source Video:"))
@@ -5393,6 +5637,85 @@ class InstagramDownloaderGUI(QMainWindow):
         self.audio_extract_status_label = QLabel("Load a video to start audio extraction.")
         layout.addWidget(self.audio_extract_status_label)
 
+        # Separator between audio extraction and transcription
+        separator_line = QFrame()
+        separator_line.setFrameShape(QFrame.HLine)
+        separator_line.setFrameShadow(QFrame.Sunken)
+        separator_line.setStyleSheet("background-color: #555;")
+        layout.addWidget(separator_line)
+
+        # Transcription section
+        transcription_title = QLabel("<b>Audio/Video Transcription</b>")
+        layout.addWidget(transcription_title)
+
+        transcription_instructions = QLabel(
+            "Drop an audio or video file below to extract text using Faster-Whisper."
+        )
+        transcription_instructions.setWordWrap(True)
+        layout.addWidget(transcription_instructions)
+
+        # Media drop zone for transcription
+        self.transcription_drop_label = MediaDropLabel("Drop audio/video file here for transcription")
+        self.transcription_drop_label.setFixedHeight(60)
+        self.transcription_drop_label.setAlignment(Qt.AlignCenter)
+        self.transcription_drop_label.setStyleSheet(
+            "padding: 10px; background-color: #2a2a2a; border: 2px dashed #666; "
+            "border-radius: 5px; color: #999;"
+        )
+        self.transcription_drop_label.file_dropped.connect(self.on_transcription_media_dropped)
+        layout.addWidget(self.transcription_drop_label)
+
+        transcription_source_row = QHBoxLayout()
+        transcription_source_row.addWidget(QLabel("Source File:"))
+        self.transcription_source_input = QLineEdit()
+        self.transcription_source_input.setReadOnly(True)
+        self.transcription_source_input.setPlaceholderText("No file selected")
+        transcription_source_row.addWidget(self.transcription_source_input, 1)
+        browse_transcription_btn = QPushButton("Browse...")
+        browse_transcription_btn.clicked.connect(self.on_transcription_browse_media)
+        transcription_source_row.addWidget(browse_transcription_btn)
+        layout.addLayout(transcription_source_row)
+
+        # Transcription controls
+        transcription_controls = QHBoxLayout()
+        transcription_controls.setContentsMargins(0, 0, 0, 0)
+        transcription_controls.setSpacing(4)
+        self.transcription_start_btn = QPushButton("Start Transcription")
+        self.transcription_start_btn.setFixedHeight(32)
+        self.transcription_start_btn.clicked.connect(self.start_transcription)
+        transcription_controls.addWidget(self.transcription_start_btn)
+        transcription_controls.addStretch(1)
+        layout.addLayout(transcription_controls)
+
+        self.transcription_status_label = QLabel("Ready")
+        layout.addWidget(self.transcription_status_label)
+
+        # Transcription results table
+        self.transcription_table = QTableWidget(0, 2)
+        self.transcription_table.setHorizontalHeaderLabels(["Time", "Text"])
+        self.transcription_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.transcription_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.transcription_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.transcription_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.transcription_table.setMinimumHeight(200)
+        layout.addWidget(self.transcription_table)
+
+        # Transcription actions
+        transcription_actions = QHBoxLayout()
+        transcription_actions.setContentsMargins(0, 0, 0, 0)
+        transcription_actions.setSpacing(4)
+        self.transcription_copy_with_time_btn = QPushButton("Copy with Timestamps")
+        self.transcription_copy_with_time_btn.clicked.connect(lambda: self.copy_transcription(include_timestamps=True))
+        transcription_actions.addWidget(self.transcription_copy_with_time_btn)
+        self.transcription_copy_no_time_btn = QPushButton("Copy Text Only")
+        self.transcription_copy_no_time_btn.clicked.connect(lambda: self.copy_transcription(include_timestamps=False))
+        transcription_actions.addWidget(self.transcription_copy_no_time_btn)
+        self.transcription_save_btn = QPushButton("Save as Text File...")
+        self.transcription_save_btn.clicked.connect(self.save_transcription)
+        transcription_actions.addWidget(self.transcription_save_btn)
+        transcription_actions.addStretch(1)
+        layout.addLayout(transcription_actions)
+
         layout.addStretch(0)
 
         self.audio_extract_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
@@ -5404,7 +5727,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.audio_extract_preview_timer.setInterval(50)
         self.audio_extract_preview_timer.timeout.connect(self._enforce_audio_extract_trim_boundaries)
 
-        self.tabs.addTab(tab, "Extract Audio")
+        self.tabs.addTab(tab, "Audio Tools")
 
     def create_framevid_tab(self):
         """Create tab for assembling image/video frames into a preview/export video."""
@@ -7669,10 +7992,15 @@ class InstagramDownloaderGUI(QMainWindow):
             return
         self.load_audio_extract_source(file_path)
 
+    def on_audio_extract_video_dropped(self, file_path):
+        """Handle drag-dropped video file for audio extraction."""
+        if file_path and os.path.exists(file_path):
+            self.load_audio_extract_source(file_path)
+
     def load_audio_extract_source(self, file_path):
         """Load source video metadata and configure preview/trim controls."""
         if not file_path or not os.path.exists(file_path):
-            QMessageBox.warning(self, "Extract Audio", "Invalid source video path.")
+            QMessageBox.warning(self, "Audio Tools", "Invalid source video path.")
             return False
 
         cv2 = self._get_cv2_for_vid_prep()
@@ -7686,7 +8014,7 @@ class InstagramDownloaderGUI(QMainWindow):
 
         cap = cv2.VideoCapture(file_path)
         if not cap or not cap.isOpened():
-            QMessageBox.warning(self, "Extract Audio", "Could not open source video.")
+            QMessageBox.warning(self, "Audio Tools", "Could not open source video.")
             self.audio_extract_status_label.setText("Failed to open source video.")
             return False
 
@@ -7769,13 +8097,13 @@ class InstagramDownloaderGUI(QMainWindow):
     def play_audio_extract_preview(self):
         """Play video preview constrained to trim range."""
         if not self.audio_extract_source_path:
-            QMessageBox.information(self, "Extract Audio", "No source video loaded.")
+            QMessageBox.information(self, "Audio Tools", "No source video loaded.")
             return
 
         start_ms = int(self._audio_extract_frame_to_seconds(self.audio_extract_trim_start_frame) * 1000)
         end_ms = int(self._audio_extract_end_boundary_seconds() * 1000)
         if end_ms <= start_ms:
-            QMessageBox.warning(self, "Extract Audio", "Trim range must be greater than zero.")
+            QMessageBox.warning(self, "Audio Tools", "Trim range must be greater than zero.")
             return
 
         current_ms = int(self.audio_extract_player.position())
@@ -7845,7 +8173,7 @@ class InstagramDownloaderGUI(QMainWindow):
         output_path = self._save_extracted_audio_to_path()
         if output_path:
             self.audio_extract_status_label.setText(f"Saved audio: {output_path}")
-            QMessageBox.information(self, "Extract Audio", f"Saved audio:\n{output_path}")
+            QMessageBox.information(self, "Audio Tools", f"Saved audio:\n{output_path}")
 
     def save_and_add_extracted_audio_to_music(self):
         """Save extracted audio and add it to the saved music library."""
@@ -7878,7 +8206,7 @@ class InstagramDownloaderGUI(QMainWindow):
         )
         QMessageBox.information(
             self,
-            "Extract Audio",
+            "Audio Tools",
             f"Saved audio:\n{output_path}\n\n"
             f"{ 'Added to sound effects.' if added else 'Audio was already in sound effects.' }"
         )
@@ -7886,12 +8214,12 @@ class InstagramDownloaderGUI(QMainWindow):
     def _save_extracted_audio_to_path(self):
         """Run the audio export and return the saved file path on success."""
         if not self.audio_extract_source_path or not os.path.exists(self.audio_extract_source_path):
-            QMessageBox.warning(self, "Extract Audio", "Load a source video first.")
+            QMessageBox.warning(self, "Audio Tools", "Load a source video first.")
             return None
 
         ffmpeg_bin = shutil.which("ffmpeg")
         if not ffmpeg_bin:
-            QMessageBox.warning(self, "Extract Audio", "ffmpeg is not available on PATH.")
+            QMessageBox.warning(self, "Audio Tools", "ffmpeg is not available on PATH.")
             return None
 
         start_frame = max(0, int(self.audio_extract_trim_start_frame))
@@ -7900,7 +8228,7 @@ class InstagramDownloaderGUI(QMainWindow):
         end_s = self._audio_extract_frame_to_seconds(end_frame + 1)
         duration_s = max(0.0, end_s - start_s)
         if duration_s <= 0:
-            QMessageBox.warning(self, "Extract Audio", "Trim markers must define a positive range.")
+            QMessageBox.warning(self, "Audio Tools", "Trim markers must define a positive range.")
             return None
 
         audio_format = (self.audio_extract_format_combo.currentText() or 'mp3').strip().lower()
@@ -7942,10 +8270,232 @@ class InstagramDownloaderGUI(QMainWindow):
             self.audio_extract_status_label.setText("Audio extraction failed.")
             QMessageBox.warning(
                 self,
-                "Extract Audio",
+                "Audio Tools",
                 f"Failed to extract audio.\n\n{stderr_text or str(e)}"
             )
             return None
+
+    # Transcription methods
+    def on_transcription_browse_media(self):
+        """Browse and load an audio or video file for transcription."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Audio or Video File",
+            "",
+            "Media Files (*.mp3 *.wav *.m4a *.aac *.ogg *.flac *.mp4 *.mov *.mkv *.m4v *.webm *.avi);;All Files (*)"
+        )
+        if not file_path:
+            return
+        self.load_transcription_source(file_path)
+
+    def on_transcription_media_dropped(self, file_path):
+        """Handle drag-dropped media file for transcription."""
+        if file_path and os.path.exists(file_path):
+            self.load_transcription_source(file_path)
+
+    def load_transcription_source(self, file_path):
+        """Load media file for transcription."""
+        if not file_path or not os.path.exists(file_path):
+            QMessageBox.warning(self, "Audio Tools", "Invalid file path.")
+            return False
+
+        self.transcription_source_input.setText(file_path)
+        self.transcription_status_label.setText(f"Loaded: {os.path.basename(file_path)}")
+        return True
+
+    def start_transcription(self):
+        """Start transcribing the loaded media file using Faster-Whisper."""
+        source_path = self.transcription_source_input.text()
+        if not source_path or not os.path.exists(source_path):
+            QMessageBox.warning(self, "Audio Tools", "Please load an audio or video file first.")
+            return
+
+        # Check if faster-whisper is available
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                "Audio Tools",
+                "Faster-Whisper is not installed.\n\n"
+                "Install it with:\n"
+                "pip install faster-whisper"
+            )
+            return
+
+        # Check if it's a video file that needs audio extraction
+        video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
+        is_video = source_path.lower().endswith(video_extensions)
+        
+        audio_path = source_path
+        temp_audio_file = None
+
+        if is_video:
+            # Extract audio from video using ffmpeg
+            ffmpeg_bin = shutil.which("ffmpeg")
+            if not ffmpeg_bin:
+                QMessageBox.warning(self, "Audio Tools", "ffmpeg is required to extract audio from video files.")
+                return
+
+            self.transcription_status_label.setText("Extracting audio from video...")
+            QApplication.processEvents()
+
+            try:
+                import tempfile
+                temp_audio_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                audio_path = temp_audio_file.name
+                temp_audio_file.close()
+
+                cmd = [
+                    ffmpeg_bin,
+                    "-i", source_path,
+                    "-vn",
+                    "-acodec", "pcm_s16le",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    audio_path
+                ]
+                subprocess.run(cmd, check=True, capture_output=True)
+            except subprocess.CalledProcessError as e:
+                self.transcription_status_label.setText("Failed to extract audio")
+                QMessageBox.warning(
+                    self,
+                    "Audio Tools",
+                    f"Failed to extract audio from video.\n\n{e.stderr.decode() if e.stderr else str(e)}"
+                )
+                if temp_audio_file and os.path.exists(audio_path):
+                    os.remove(audio_path)
+                return
+
+        # Run transcription in a separate thread (for now, run in main thread with progress dialog)
+        self.transcription_status_label.setText("Transcribing...")
+        QApplication.processEvents()
+
+        try:
+            # Initialize Whisper model (using base model for speed/quality balance)
+            model = WhisperModel("base", device="cpu", compute_type="int8")
+            
+            # Transcribe
+            segments, info = model.transcribe(audio_path, word_timestamps=False)
+            
+            # Clear existing results
+            self.transcription_table.setRowCount(0)
+            
+            # Add results to table
+            for segment in segments:
+                row = self.transcription_table.rowCount()
+                self.transcription_table.insertRow(row)
+                
+                # Format time as MM:SS.mmm
+                start_time = segment.start
+                minutes = int(start_time // 60)
+                seconds = start_time % 60
+                time_str = f"{minutes:02d}:{seconds:06.3f}"
+                
+                self.transcription_table.setItem(row, 0, QTableWidgetItem(time_str))
+                self.transcription_table.setItem(row, 1, QTableWidgetItem(segment.text.strip()))
+            
+            self.transcription_status_label.setText(
+                f"Transcription complete: {self.transcription_table.rowCount()} segments"
+            )
+            
+        except Exception as e:
+            self.transcription_status_label.setText("Transcription failed")
+            QMessageBox.warning(
+                self,
+                "Audio Tools",
+                f"Transcription failed:\n\n{str(e)}"
+            )
+        finally:
+            # Clean up temp audio file if created
+            if temp_audio_file and os.path.exists(audio_path) and audio_path != source_path:
+                try:
+                    os.remove(audio_path)
+                except:
+                    pass
+
+    def copy_transcription(self, include_timestamps=True):
+        """Copy transcription text to clipboard with or without timestamps."""
+        if self.transcription_table.rowCount() == 0:
+            QMessageBox.information(self, "Audio Tools", "No transcription available to copy.")
+            return
+
+        lines = []
+        for row in range(self.transcription_table.rowCount()):
+            time_item = self.transcription_table.item(row, 0)
+            text_item = self.transcription_table.item(row, 1)
+            
+            if include_timestamps:
+                lines.append(f"[{time_item.text()}] {text_item.text()}")
+            else:
+                lines.append(text_item.text())
+
+        text = "\n".join(lines)
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        
+        self.transcription_status_label.setText(
+            f"Copied {len(lines)} segments to clipboard"
+        )
+
+    def save_transcription(self):
+        """Save transcription to a text file."""
+        if self.transcription_table.rowCount() == 0:
+            QMessageBox.information(self, "Audio Tools", "No transcription available to save.")
+            return
+
+        # Get last used folder from settings
+        last_folder = self.account_manager.get_setting('transcription_last_save_folder', '')
+        if not last_folder or not os.path.exists(last_folder):
+            source_path = self.transcription_source_input.text()
+            if source_path and os.path.exists(source_path):
+                last_folder = str(Path(source_path).parent)
+            else:
+                last_folder = str(Path.home())
+
+        # Generate default filename based on source
+        source_path = self.transcription_source_input.text()
+        if source_path:
+            source_stem = Path(source_path).stem
+            default_name = f"{source_stem}.transcription.txt"
+        else:
+            default_name = "transcription.txt"
+
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Transcription",
+            str(Path(last_folder) / default_name),
+            "Text Files (*.txt);;All Files (*)"
+        )
+        
+        if not output_path:
+            return
+
+        try:
+            lines = []
+            for row in range(self.transcription_table.rowCount()):
+                time_item = self.transcription_table.item(row, 0)
+                text_item = self.transcription_table.item(row, 1)
+                lines.append(f"[{time_item.text()}] {text_item.text()}")
+
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(lines))
+
+            # Save the folder for next time
+            self.account_manager.set_setting('transcription_last_save_folder', str(Path(output_path).parent))
+
+            self.transcription_status_label.setText(f"Saved: {output_path}")
+            QMessageBox.information(
+                self,
+                "Audio Tools",
+                f"Transcription saved to:\n{output_path}"
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Audio Tools",
+                f"Failed to save transcription:\n\n{str(e)}"
+            )
 
     def on_vid_prep_audio_setting_changed(self, *args):
         """Persist audio replacement inputs and mark the preview stale."""
@@ -12646,11 +13196,14 @@ DEPENDENCIES:
         audio_group = QGroupBox("Step 1: Load Audio")
         audio_layout = QVBoxLayout()
         
-        self.beat_composer_audio_label = QLabel("No audio file selected")
+        self.beat_composer_audio_label = AudioDropLabel("No audio file selected - Drag & drop an MP3 or other audio file here")
         self.beat_composer_audio_label.setStyleSheet(
             "padding: 10px; background-color: #1e293b; border-radius: 5px; color: #cbd5e1;"
         )
         self.beat_composer_audio_label.setWordWrap(True)
+        self.beat_composer_audio_label.setAlignment(Qt.AlignCenter)
+        self.beat_composer_audio_label.setMinimumHeight(60)
+        self.beat_composer_audio_label.file_dropped.connect(self.beat_composer_audio_dropped)
         audio_layout.addWidget(self.beat_composer_audio_label)
         
         audio_btn_layout = QHBoxLayout()
@@ -12775,6 +13328,44 @@ DEPENDENCIES:
         export_group = QGroupBox("Step 4: Export & Save")
         export_layout = QVBoxLayout()
         
+        # Video size/aspect ratio selector
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(QLabel("Video Size:"))
+        self.beat_composer_video_size = QComboBox()
+        self.beat_composer_video_size.addItems([
+            "📺 Wide 16:9 (1920×1080)",
+            "📱 Vertical 9:16 (1080×1920)",
+            "⬜ Square 1:1 (1080×1080)",
+            "📺 Classic 4:3 (1440×1080)",
+            "📱 Social 4:5 (1080×1350)",
+            "🎬 Cinema 21:9 (2560×1080)",
+            "🖼️ Portrait 2:3 (1080×1620)",
+            "🎥 HD 16:9 (1280×720)",
+            "🎞️ 4K 16:9 (3840×2160)"
+        ])
+        self.beat_composer_video_size.setCurrentIndex(1)  # Default to Vertical 9:16
+        self.beat_composer_video_size.setToolTip("Select output video dimensions and aspect ratio")
+        self.beat_composer_video_size.currentIndexChanged.connect(lambda: self._beat_composer_save_state())
+        size_layout.addWidget(self.beat_composer_video_size, 1)
+        export_layout.addLayout(size_layout)
+        
+        # Scaling mode selector
+        scaling_layout = QHBoxLayout()
+        scaling_layout.addWidget(QLabel("Scaling Mode:"))
+        self.beat_composer_scaling_mode = QComboBox()
+        self.beat_composer_scaling_mode.addItems([
+            "🖼️ Crop to Fit (maintains aspect)",
+            "↔️ Stretch to Fill (distorts)"
+        ])
+        self.beat_composer_scaling_mode.setCurrentIndex(0)  # Default to Crop
+        self.beat_composer_scaling_mode.setToolTip(
+            "Crop to Fit: Scales to cover frame, crops excess (maintains aspect ratio)\n"
+            "Stretch to Fill: Distorts image/video to fit exactly (may look stretched)"
+        )
+        self.beat_composer_scaling_mode.currentIndexChanged.connect(self._beat_composer_scaling_mode_changed)
+        scaling_layout.addWidget(self.beat_composer_scaling_mode, 1)
+        export_layout.addLayout(scaling_layout)
+        
         export_btn_layout = QHBoxLayout()
         
         self.beat_composer_preview_btn = QPushButton("▶️ Preview Video")
@@ -12803,6 +13394,19 @@ DEPENDENCIES:
         project_btn_layout.addWidget(self.beat_composer_load_project_btn)
         
         export_layout.addLayout(project_btn_layout)
+        
+        # Composition progress
+        self.beat_composer_composition_progress = QProgressBar()
+        self.beat_composer_composition_progress.setVisible(False)
+        export_layout.addWidget(self.beat_composer_composition_progress)
+        
+        self.beat_composer_composition_status = QLabel("")
+        self.beat_composer_composition_status.setStyleSheet(
+            "padding: 8px; background-color: #1e293b; border-radius: 5px; color: #94a3b8;"
+        )
+        self.beat_composer_composition_status.setWordWrap(True)
+        self.beat_composer_composition_status.setVisible(False)
+        export_layout.addWidget(self.beat_composer_composition_status)
         
         export_group.setLayout(export_layout)
         left_layout.addWidget(export_group)
@@ -12834,6 +13438,9 @@ DEPENDENCIES:
         self.beat_composer_timeline_list.dragEnterEvent = self.beat_composer_drag_enter_event
         self.beat_composer_timeline_list.dragMoveEvent = self.beat_composer_drag_move_event
         self.beat_composer_timeline_list.dropEvent = self.beat_composer_drop_event
+        # Enable context menu for per-item options
+        self.beat_composer_timeline_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.beat_composer_timeline_list.customContextMenuRequested.connect(self.beat_composer_timeline_context_menu)
         timeline_layout.addWidget(self.beat_composer_timeline_list)
         
         # Right section: Media Preview
@@ -13015,6 +13622,9 @@ DEPENDENCIES:
         self.tabs.addTab(tab, "🎵 Beat-Composer")
         
         logger.info("Beat-Composer tab initialized")
+        
+        # Restore previous state
+        self._beat_composer_restore_state()
     
     def beat_composer_select_audio(self):
         """Open file dialog to select audio file"""
@@ -13029,26 +13639,55 @@ DEPENDENCIES:
         )
         
         if file_path:
-            self.beat_composer_audio_path = file_path
-            self.beat_composer_audio_label.setText(file_path)
-            self.beat_composer_audio_info_btn.setEnabled(True)
-            self.beat_composer_audio_preview_btn.setEnabled(True)
-            self.beat_composer_detect_btn.setEnabled(True)
-            self.beat_composer_detection_status.setText(f"Audio loaded: {Path(file_path).name}")
+            self._beat_composer_load_audio_file(file_path)
+    
+    def beat_composer_audio_dropped(self, file_path):
+        """Handle audio file dropped onto the label"""
+        self._beat_composer_load_audio_file(file_path)
+    
+    def _beat_composer_load_audio_file(self, file_path, auto_detect=True, clear_timeline=True):
+        """Common method to load an audio file (from dialog or drag-drop)
+        
+        Args:
+            file_path: Path to audio file
+            auto_detect: If True, automatically start beat detection after loading
+            clear_timeline: If True, clear the existing timeline
+        """
+        if not file_path:
+            return
+        
+        self.beat_composer_audio_path = file_path
+        self.beat_composer_audio_label.setText(file_path)
+        self.beat_composer_audio_info_btn.setEnabled(True)
+        self.beat_composer_audio_preview_btn.setEnabled(True)
+        self.beat_composer_detect_btn.setEnabled(True)
+        self.beat_composer_detection_status.setText(f"Audio loaded: {Path(file_path).name}")
+        
+        # Clear previous timeline only if requested
+        if clear_timeline:
+            self.beat_composer_timeline_list.clear()
+            self.beat_composer_timeline = []
+        
+        # Update information panel
+        self.beat_composer_update_info_panel(file_path)
+        
+        # Save the directory for next time
+        self.account_manager.set_setting('beat_composer_last_music_dir', str(Path(file_path).parent))
+        
+        # Create project
+        try:
+            self.beat_composer_manager.create_project(file_path)
+            logger.info(f"Selected audio: {file_path}")
             
-            # Update information panel
-            self.beat_composer_update_info_panel(file_path)
+            # Save state
+            self._beat_composer_save_state()
             
-            # Save the directory for next time
-            self.account_manager.set_setting('beat_composer_last_music_dir', str(Path(file_path).parent))
-            
-            # Create project
-            try:
-                self.beat_composer_manager.create_project(file_path)
-                logger.info(f"Selected audio: {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to create project:\n{e}")
-                logger.error(f"Project creation error: {e}")
+            # Automatically start beat detection only if requested
+            if auto_detect:
+                QTimer.singleShot(100, self.beat_composer_detect_beats)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create project:\n{e}")
+            logger.error(f"Project creation error: {e}")
     
     def beat_composer_show_audio_info(self):
         """Display audio metadata"""
@@ -13352,16 +13991,11 @@ DEPENDENCIES:
         
         logger.info(f"Beat detection complete: {beat_count} beats at {bpm:.1f} BPM")
         
-        QMessageBox.information(
-            self,
-            "Beat Detection Complete",
-            f"Successfully detected beats!\n\n"
-            f"Beats: {beat_count}\n"
-            f"Downbeats: {downbeat_count}\n"
-            f"BPM: {bpm:.1f}\n"
-            f"Time Signature: {time_sig[0]}/{time_sig[1]}\n\n"
-            f"Now configure the timeline and build it."
-        )
+        # Save state
+        self._beat_composer_save_state()
+        
+        # Automatically build timeline
+        QTimer.singleShot(100, self.beat_composer_build_timeline)
     
     def beat_composer_detection_error(self, error_msg):
         """Handle beat detection error"""
@@ -13369,13 +14003,30 @@ DEPENDENCIES:
         self.beat_composer_detection_progress.setVisible(False)
         self.beat_composer_detection_status.setText(f"❌ Error: {error_msg}")
         
-        QMessageBox.critical(self, "Detection Error", f"Failed to detect beats:\n\n{error_msg}")
+        # Check if this is a missing dependency error
+        if "librosa" in error_msg.lower() or "import" in error_msg.lower() or "module" in error_msg.lower():
+            QMessageBox.critical(
+                self,
+                "Missing Dependencies",
+                f"Beat-Composer dependencies are not installed.\n\n"
+                f"Error: {error_msg}\n\n"
+                f"To install the required packages, run:\n"
+                f"  .\\install-beat-composer.ps1\n\n"
+                f"Or manually install:\n"
+                f"  pip install librosa soundfile audioread"
+            )
+        else:
+            QMessageBox.critical(self, "Detection Error", f"Failed to detect beats:\n\n{error_msg}")
+        
         logger.error(f"Beat detection error: {error_msg}")
     
     def beat_composer_duration_mode_changed(self, mode):
         """Handle duration mode change"""
         enabled = mode in ["N Seconds", "N Measures"]
         self.beat_composer_duration_value.setEnabled(enabled)
+        
+        # Save state when UI changes
+        self._beat_composer_save_state()
     
     def beat_composer_build_timeline(self):
         """Build the beat timeline"""
@@ -13394,6 +14045,10 @@ DEPENDENCIES:
             include_beats = self.beat_composer_use_beats.isChecked()
             include_downbeats = self.beat_composer_use_downbeats.isChecked()
             
+            # Update status
+            self.beat_composer_detection_status.setText("Building timeline...")
+            QApplication.processEvents()
+            
             # Build timeline
             timeline = self.beat_composer_manager.build_timeline(
                 duration_mode=duration_mode,
@@ -13403,6 +14058,10 @@ DEPENDENCIES:
             )
             
             self.beat_composer_timeline = timeline
+            
+            # Update status
+            self.beat_composer_detection_status.setText(f"Populating timeline ({len(timeline)} beats)...")
+            QApplication.processEvents()
             
             # Populate list
             self.beat_composer_timeline_list.clear()
@@ -13421,14 +14080,21 @@ DEPENDENCIES:
             
             logger.info(f"Built timeline with {len(timeline)} beats")
             
+            # Update status to show completion
+            self.beat_composer_detection_status.setText(f"✅ Timeline ready: {len(timeline)} beats")
+            
+            # Save state
+            self._beat_composer_save_state()
+            
             QMessageBox.information(
                 self,
                 "Timeline Built",
                 f"Timeline created with {len(timeline)} beats!\n\n"
-                f"Now you can:\n"
-                f"• Adjust beat timestamps\n"
-                f"• Assign images/videos to beats\n"
-                f"• Preview and export your composition"
+                f"Drag images/videos onto the timeline to assign them to beats.\n\n"
+                f"Tips:\n"
+                f"• Media will extend to the next beat (no black gaps)\n"
+                f"• Click Preview to test your composition\n"
+                f"• Click Export to save the final video"
             )
         
         except Exception as e:
@@ -13635,17 +14301,7 @@ DEPENDENCIES:
     
     def beat_composer_refresh_timeline_display(self):
         """Refresh the timeline list display"""
-        self.beat_composer_timeline_list.clear()
-        
-        for beat in self.beat_composer_manager.timeline_beats:
-            time = beat['adjusted_time']
-            beat_type = beat['type']
-            media_status = "📁" if beat['media'] else "⭕"
-            
-            item_text = f"{media_status} Beat {beat['index']:03d} | {time:.3f}s | Type: {beat_type}"
-            item = QListWidgetItem(item_text)
-            item.setData(Qt.UserRole, beat)
-            self.beat_composer_timeline_list.addItem(item)
+        self._beat_composer_update_timeline_display()
         
         # Update navigation buttons
         self.beat_composer_update_nav_buttons()
@@ -13709,6 +14365,9 @@ DEPENDENCIES:
             self.beat_composer_export_btn.setEnabled(has_media)
             
             logger.info(f"Assigned {media_type} to beat {beat_index}")
+            
+            # Save state
+            self._beat_composer_save_state()
         
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to assign media:\n{e}")
@@ -13730,6 +14389,9 @@ DEPENDENCIES:
             # Refresh display
             self.beat_composer_refresh_timeline_display()
             self.beat_composer_media_label.setText("No media assigned")
+            
+            # Save state
+            self._beat_composer_save_state()
             
             # Disable preview/export if no media left
             has_media = any(b.get('media') for b in self.beat_composer_manager.timeline_beats)
@@ -13840,6 +14502,9 @@ DEPENDENCIES:
             
             QMessageBox.information(self, "Bulk Assignment Complete", summary_msg)
             logger.info(f"Bulk assigned {assigned_count} files to beats")
+            
+            # Save state
+            self._beat_composer_save_state()
         
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to assign files:\n{e}")
@@ -13895,9 +14560,41 @@ DEPENDENCIES:
         self._beat_composer_assign_files_to_beats(file_paths)
         event.acceptProposedAction()
     
+    def _beat_composer_get_selected_resolution(self):
+        """Parse the selected video size and return (width, height) tuple"""
+        size_text = self.beat_composer_video_size.currentText()
+        
+        # Extract resolution from text like "Vertical 9:16 (1080×1920)"
+        import re
+        match = re.search(r'\((\d+)×(\d+)\)', size_text)
+        if match:
+            width = int(match.group(1))
+            height = int(match.group(2))
+            return (width, height)
+        
+        # Default to vertical if parsing fails
+        return (1080, 1920)
+    
     def beat_composer_preview_video(self):
         """Preview the composed video"""
         try:
+            # Re-check dependencies availability
+            from beat_composer_manager import check_dependencies_available
+            _, moviepy_ok, _ = check_dependencies_available()
+            
+            if not moviepy_ok:
+                QMessageBox.critical(
+                    self, 
+                    "Missing Dependencies", 
+                    f"Beat-Composer dependencies are not installed.\n\n"
+                    f"To install the required packages, run:\n"
+                    f"  .\\install-beat-composer.ps1\n\n"
+                    f"Or manually install:\n"
+                    f"  pip install moviepy librosa ffmpeg-python\n\n"
+                    f"After installation, restart the application."
+                )
+                return
+            
             # Compose video to temp location
             import tempfile
             temp_dir = Path(tempfile.gettempdir()) / 'beat_composer_preview'
@@ -13905,16 +14602,40 @@ DEPENDENCIES:
             
             preview_path = temp_dir / 'preview.mp4'
             
-            # Show progress dialog
-            progress = QProgressDialog("Composing video for preview...", "Cancel", 0, 0, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
+            # Show inline progress UI
+            self.beat_composer_composition_progress.setVisible(True)
+            self.beat_composer_composition_progress.setValue(0)
+            self.beat_composer_composition_status.setVisible(True)
+            self.beat_composer_composition_status.setText("Initializing preview...")
+            
+            # Disable buttons during composition
+            self.beat_composer_preview_btn.setEnabled(False)
+            self.beat_composer_export_btn.setEnabled(False)
+            
+            QApplication.processEvents()
+            
+            # Get selected resolution
+            resolution = self._beat_composer_get_selected_resolution()
+            
+            # Progress callback
+            cancelled = [False]  # Use list to allow modification in nested function
+            
+            def update_progress(current, total, status):
+                if cancelled[0]:
+                    return False
+                self.beat_composer_composition_status.setText(f"🎬 Preview: {status}")
+                if total > 0:
+                    percent = int((current / total) * 100)
+                    self.beat_composer_composition_progress.setValue(percent)
+                QApplication.processEvents()
+                return True
             
             # Compose video
             video_path = self.beat_composer_manager.compose_video(
                 output_path=str(preview_path),
-                resolution=(1080, 1920),  # Vertical video for social media
-                fps=30
+                resolution=resolution,
+                fps=30,
+                progress_callback=update_progress
             )
             
             progress.close()
@@ -13929,7 +14650,25 @@ DEPENDENCIES:
             
             logger.info(f"Preview video created: {video_path}")
         
+        except ImportError as e:
+            QMessageBox.critical(
+                self, 
+                "Missing Dependencies", 
+                f"Beat-Composer dependencies are not installed.\n\n"
+                f"Error: {e}\n\n"
+                f"To install the required packages, run:\n"
+                f"  .\\install-beat-composer.ps1\n\n"
+                f"Or manually install:\n"
+                f"  pip install moviepy librosa ffmpeg-python"
+            )
+            logger.error(f"Video preview error (missing dependencies): {e}")
         except Exception as e:
+            # Hide progress UI and re-enable buttons on error
+            self.beat_composer_composition_progress.setVisible(False)
+            self.beat_composer_composition_status.setVisible(False)
+            self.beat_composer_preview_btn.setEnabled(True)
+            self.beat_composer_export_btn.setEnabled(True)
+            
             QMessageBox.critical(self, "Error", f"Failed to preview video:\n{e}")
             logger.error(f"Video preview error: {e}")
     
@@ -13960,19 +14699,47 @@ DEPENDENCIES:
         self.account_manager.set_setting('beat_composer_last_export_dir', str(Path(file_path).parent))
         
         try:
-            # Show progress dialog
-            progress = QProgressDialog("Rendering final video...", "Cancel", 0, 0, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
+            # Show inline progress UI
+            self.beat_composer_composition_progress.setVisible(True)
+            self.beat_composer_composition_progress.setValue(0)
+            self.beat_composer_composition_status.setVisible(True)
+            self.beat_composer_composition_status.setText("Initializing export...")
+            
+            # Disable buttons during composition
+            self.beat_composer_preview_btn.setEnabled(False)
+            self.beat_composer_export_btn.setEnabled(False)
+            
+            QApplication.processEvents()
+            
+            # Get selected resolution
+            resolution = self._beat_composer_get_selected_resolution()
+            
+            # Progress callback
+            cancelled = [False]  # Use list to allow modification in nested function
+            
+            def update_progress(current, total, status):
+                if cancelled[0]:
+                    return False
+                self.beat_composer_composition_status.setText(f"💾 Export: {status}")
+                if total > 0:
+                    percent = int((current / total) * 100)
+                    self.beat_composer_composition_progress.setValue(percent)
+                QApplication.processEvents()
+                return True
             
             # Compose video
             video_path = self.beat_composer_manager.compose_video(
                 output_path=file_path,
-                resolution=(1080, 1920),  # Vertical video for social media
-                fps=30
+                resolution=resolution,
+                fps=30,
+                progress_callback=update_progress
             )
             
-            progress.close()
+            # Hide progress UI and re-enable buttons
+            self.beat_composer_composition_progress.setVisible(False)
+            self.beat_composer_composition_status.setVisible(False)
+            self.beat_composer_preview_btn.setEnabled(True)
+            self.beat_composer_export_btn.setEnabled(True)
             
             QMessageBox.information(
                 self,
@@ -13999,7 +14766,31 @@ DEPENDENCIES:
             
             logger.info(f"Video exported: {video_path}")
         
+        except ImportError as e:
+            # Hide progress UI and re-enable buttons on error
+            self.beat_composer_composition_progress.setVisible(False)
+            self.beat_composer_composition_status.setVisible(False)
+            self.beat_composer_preview_btn.setEnabled(True)
+            self.beat_composer_export_btn.setEnabled(True)
+            
+            QMessageBox.critical(
+                self, 
+                "Missing Dependencies", 
+                f"Beat-Composer dependencies are not installed.\n\n"
+                f"Error: {e}\n\n"
+                f"To install the required packages, run:\n"
+                f"  .\\install-beat-composer.ps1\n\n"
+                f"Or manually install:\n"
+                f"  pip install moviepy librosa ffmpeg-python"
+            )
+            logger.error(f"Video export error (missing dependencies): {e}")
         except Exception as e:
+            # Hide progress UI and re-enable buttons on error
+            self.beat_composer_composition_progress.setVisible(False)
+            self.beat_composer_composition_status.setVisible(False)
+            self.beat_composer_preview_btn.setEnabled(True)
+            self.beat_composer_export_btn.setEnabled(True)
+            
             QMessageBox.critical(self, "Error", f"Failed to export video:\n{e}")
             logger.error(f"Video export error: {e}")
     
@@ -14086,6 +14877,226 @@ DEPENDENCIES:
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load project:\n{e}")
             logger.error(f"Project load error: {e}")
+    
+    def _beat_composer_scaling_mode_changed(self):
+        """Handle global scaling mode change"""
+        mode_text = self.beat_composer_scaling_mode.currentText()
+        if "Crop" in mode_text:
+            self.beat_composer_manager.default_scaling_mode = 'crop'
+        else:
+            self.beat_composer_manager.default_scaling_mode = 'stretch'
+        
+        logger.info(f"Global scaling mode changed to: {self.beat_composer_manager.default_scaling_mode}")
+        self._beat_composer_save_state()
+    
+    def beat_composer_timeline_context_menu(self, position):
+        """Show context menu for timeline items"""
+        item = self.beat_composer_timeline_list.itemAt(position)
+        if not item:
+            return
+        
+        beat = item.data(Qt.UserRole)
+        if not beat or not beat.get('media'):
+            return
+        
+        menu = QMenu()
+        
+        # Show current scaling mode
+        current_mode = beat['media'].get('scaling_mode', self.beat_composer_manager.default_scaling_mode)
+        menu.addSection(f"Scaling: {current_mode.title()}")
+        
+        # Scaling mode options
+        crop_action = menu.addAction("🖼️ Crop to Fit")
+        crop_action.setCheckable(True)
+        crop_action.setChecked(current_mode == 'crop')
+        crop_action.triggered.connect(lambda: self._beat_composer_set_item_scaling(beat, 'crop'))
+        
+        stretch_action = menu.addAction("↔️ Stretch to Fill")
+        stretch_action.setCheckable(True)
+        stretch_action.setChecked(current_mode == 'stretch')
+        stretch_action.triggered.connect(lambda: self._beat_composer_set_item_scaling(beat, 'stretch'))
+        
+        menu.addSeparator()
+        
+        reset_action = menu.addAction("🔄 Use Default Mode")
+        reset_action.triggered.connect(lambda: self._beat_composer_set_item_scaling(beat, None))
+        
+        menu.exec_(self.beat_composer_timeline_list.mapToGlobal(position))
+    
+    def _beat_composer_set_item_scaling(self, beat, mode):
+        """Set scaling mode for a specific beat's media"""
+        if mode is None:
+            # Reset to default
+            mode = self.beat_composer_manager.default_scaling_mode
+        
+        beat['media']['scaling_mode'] = mode
+        
+        # Update the timeline display to show the new mode
+        self._beat_composer_update_timeline_display()
+        self._beat_composer_save_state()
+        
+        logger.info(f"Set scaling mode for beat {beat['index']} to: {mode}")
+    
+    def _beat_composer_save_state(self):
+        """Save current Beat Composer state to persistent settings"""
+        try:
+            state = {
+                'audio_path': self.beat_composer_audio_path,
+                'duration_mode': self.beat_composer_duration_mode.currentText(),
+                'duration_value': self.beat_composer_duration_value.value(),
+                'use_beats': self.beat_composer_use_beats.isChecked(),
+                'use_downbeats': self.beat_composer_use_downbeats.isChecked(),
+                'detection_method': self.beat_composer_method_combo.currentText(),
+                'media_duration': self.beat_composer_media_duration.value(),
+                'video_size': self.beat_composer_video_size.currentText(),
+                'scaling_mode': self.beat_composer_scaling_mode.currentText(),
+                'project_dir': str(self.beat_composer_manager.current_project_dir) if self.beat_composer_manager.current_project_dir else None,
+                # Manager state
+                'bpm': self.beat_composer_manager.bpm,
+                'beats': self.beat_composer_manager.beats,
+                'downbeats': self.beat_composer_manager.downbeats,
+                'time_signature': self.beat_composer_manager.time_signature,
+                'timeline_beats': self.beat_composer_manager.timeline_beats,
+                'beat_media_assignments': self.beat_composer_manager.beat_media_assignments,
+                'default_scaling_mode': self.beat_composer_manager.default_scaling_mode,
+            }
+            
+            # Convert to JSON
+            state_json = json.dumps(state)
+            self.account_manager.set_setting('beat_composer_state', state_json)
+            logger.debug("Beat Composer state saved")
+        except Exception as e:
+            logger.error(f"Failed to save Beat Composer state: {e}")
+    
+    def _beat_composer_restore_state(self):
+        """Restore Beat Composer state from persistent settings"""
+        try:
+            state_json = self.account_manager.get_setting('beat_composer_state', None)
+            if not state_json:
+                logger.debug("No Beat Composer state to restore")
+                return
+            
+            state = json.loads(state_json)
+            
+            # Restore UI state
+            if state.get('duration_mode'):
+                index = self.beat_composer_duration_mode.findText(state['duration_mode'])
+                if index >= 0:
+                    self.beat_composer_duration_mode.setCurrentIndex(index)
+            
+            if state.get('duration_value'):
+                self.beat_composer_duration_value.setValue(state['duration_value'])
+            
+            if 'use_beats' in state:
+                self.beat_composer_use_beats.setChecked(state['use_beats'])
+            
+            if 'use_downbeats' in state:
+                self.beat_composer_use_downbeats.setChecked(state['use_downbeats'])
+            
+            if state.get('detection_method'):
+                index = self.beat_composer_method_combo.findText(state['detection_method'])
+                if index >= 0:
+                    self.beat_composer_method_combo.setCurrentIndex(index)
+            
+            if state.get('media_duration'):
+                self.beat_composer_media_duration.setValue(state['media_duration'])
+            
+            if state.get('video_size'):
+                index = self.beat_composer_video_size.findText(state['video_size'])
+                if index >= 0:
+                    self.beat_composer_video_size.setCurrentIndex(index)
+            
+            if state.get('scaling_mode'):
+                index = self.beat_composer_scaling_mode.findText(state['scaling_mode'])
+                if index >= 0:
+                    self.beat_composer_scaling_mode.setCurrentIndex(index)
+            
+            # Restore manager state
+            if state.get('project_dir'):
+                self.beat_composer_manager.current_project_dir = Path(state['project_dir'])
+            
+            if state.get('default_scaling_mode'):
+                self.beat_composer_manager.default_scaling_mode = state['default_scaling_mode']
+            
+            if state.get('bpm') is not None:
+                self.beat_composer_manager.bpm = state['bpm']
+            
+            if state.get('beats'):
+                self.beat_composer_manager.beats = state['beats']
+            
+            if state.get('downbeats'):
+                self.beat_composer_manager.downbeats = state['downbeats']
+            
+            if state.get('time_signature'):
+                self.beat_composer_manager.time_signature = state['time_signature']
+            
+            if state.get('timeline_beats'):
+                self.beat_composer_manager.timeline_beats = state['timeline_beats']
+            
+            if state.get('beat_media_assignments'):
+                self.beat_composer_manager.beat_media_assignments = state['beat_media_assignments']
+            
+            # Restore audio file last (triggers UI updates)
+            audio_path = state.get('audio_path')
+            if audio_path and os.path.exists(audio_path):
+                # Check if we have existing beats - if so, don't auto-detect or clear timeline
+                has_beats = bool(self.beat_composer_manager.beats)
+                self._beat_composer_load_audio_file(
+                    audio_path, 
+                    auto_detect=not has_beats,
+                    clear_timeline=not has_beats
+                )
+                
+                # Update detection status if beats were detected
+                if self.beat_composer_manager.beats:
+                    beat_count = len(self.beat_composer_manager.beats)
+                    downbeat_count = len(self.beat_composer_manager.downbeats)
+                    bpm = self.beat_composer_manager.bpm or 0
+                    time_sig = self.beat_composer_manager.time_signature or (4, 4)
+                    
+                    status_text = (
+                        f"✅ Detected {beat_count} beats ({downbeat_count} downbeats) | "
+                        f"BPM: {bpm:.1f} | Time Signature: {time_sig[0]}/{time_sig[1]}"
+                    )
+                    self.beat_composer_detection_status.setText(status_text)
+                    self.beat_composer_build_timeline_btn.setEnabled(True)
+                
+                # Restore timeline if it was built
+                if self.beat_composer_manager.timeline_beats:
+                    self._beat_composer_update_timeline_display()
+                    self.beat_composer_save_project_btn.setEnabled(True)
+                    
+                    # Enable preview/export if media assigned
+                    has_media = any(b.get('media') for b in self.beat_composer_manager.timeline_beats)
+                    self.beat_composer_preview_btn.setEnabled(has_media)
+                    self.beat_composer_export_btn.setEnabled(has_media)
+                    
+                    beat_count = len(self.beat_composer_manager.beats)
+                    logger.info(f"Restored Beat Composer state: {beat_count} beats, {len(self.beat_composer_manager.timeline_beats)} timeline beats")
+            
+        except Exception as e:
+            logger.error(f"Failed to restore Beat Composer state: {e}")
+    
+    def _beat_composer_update_timeline_display(self):
+        """Update the timeline list display from manager data"""
+        self.beat_composer_timeline_list.clear()
+        
+        for beat in self.beat_composer_manager.timeline_beats:
+            time = beat['adjusted_time']
+            beat_type = beat['type']
+            media = beat.get('media')
+            
+            if media:
+                scaling_mode = media.get('scaling_mode', 'crop')
+                mode_icon = "🖼️" if scaling_mode == 'crop' else "↔️"
+                media_status = f"📁{mode_icon}"
+            else:
+                media_status = "⭕"
+            
+            item_text = f"{media_status} Beat {beat['index']:03d} | {time:.3f}s | Type: {beat_type}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, beat)
+            self.beat_composer_timeline_list.addItem(item)
     
     def create_topics_tab(self):
         """Create the Topics management tab"""
@@ -26175,12 +27186,12 @@ DEPENDENCIES:
                 close_dialog.accept()
 
     def send_tile_to_audio_extract(self, shortcode, close_dialog=None):
-        """Open Extract Audio tab and load the tile's video file as source."""
+        """Open Audio Tools tab and load the tile's video file as source."""
         video_path = self._get_video_file_for_shortcode(shortcode)
         if not video_path:
             QMessageBox.information(
                 self,
-                "Extract Audio",
+                "Audio Tools",
                 "No downloaded video file is available for this tile yet.\n\n"
                 "Download the post (video) first, then click To Audio again."
             )
@@ -26191,7 +27202,7 @@ DEPENDENCIES:
 
         audio_tab_index = -1
         for i in range(self.tabs.count()):
-            if self.tabs.tabText(i) == "Extract Audio":
+            if self.tabs.tabText(i) == "Audio Tools":
                 audio_tab_index = i
                 break
 
@@ -26669,7 +27680,7 @@ DEPENDENCIES:
                     footer_to_audio_btn.setMaximumHeight(28)
                     footer_to_audio_btn.setMinimumHeight(28)
                     footer_to_audio_btn.setMinimumWidth(92)
-                    footer_to_audio_btn.setToolTip("Send selected video to Extract Audio tab")
+                    footer_to_audio_btn.setToolTip("Send selected video to Audio Tools tab")
                     footer_to_audio_btn.setStyleSheet("QPushButton { background-color: #6f42c1; color: white; font-weight: bold; font-size: 7pt; padding: 1px 4px; }")
                     footer_to_audio_btn.clicked.connect(
                         lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_audio_extract(sc, close_dialog=dlg)
@@ -26755,7 +27766,7 @@ DEPENDENCIES:
                         to_audio_btn.setMaximumHeight(28)
                         to_audio_btn.setMinimumHeight(28)
                         to_audio_btn.setMaximumWidth(112)
-                    to_audio_btn.setToolTip("Send selected video to Extract Audio tab")
+                    to_audio_btn.setToolTip("Send selected video to Audio Tools tab")
                     to_audio_btn.setStyleSheet("QPushButton { background-color: #6f42c1; color: white; font-weight: bold; }")
                     to_audio_btn.clicked.connect(
                         lambda checked=False, sc=shortcode, dlg=tile.window() if viewer_mode else None: self.send_tile_to_audio_extract(sc, close_dialog=dlg)

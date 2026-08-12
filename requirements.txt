@@ -28,11 +28,14 @@ scenedetect[opencv]>=0.6.0
 Cython>=0.29.0   # Required for madmom compilation
 librosa>=0.10.0  # Audio analysis and beat detection
 madmom>=0.16.1   # Advanced beat/downbeat detection
-moviepy>=1.0.3   # Video composition and editing
+moviepy>=2.0.0   # Video composition and editing (2.x required - not compatible with 1.x)
 ffmpeg-python>=0.2.0  # Video rendering and encoding
 soundfile>=0.12.0  # Audio file I/O (librosa dependency)
 audioread>=3.0.0  # Audio format support (librosa dependency)
 mutagen>=1.45.0  # Audio metadata extraction (ID3 tags, etc.)
+
+# Audio transcription (optional, for speech-to-text in Audio Tools)
+faster-whisper>=0.10.0  # Fast and efficient speech-to-text transcription
 
 # VLC-based video player (alternative to Qt multimedia, includes codecs)
 python-vlc>=3.0.0

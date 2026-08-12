@@ -28,7 +28,8 @@ try:
     from scenedetect import detect, ContentDetector, AdaptiveDetector
     SCENEDETECT_AVAILABLE = True
 except ImportError:
-    logger.warning("PySceneDetect not available. Shot detection will use basic OpenCV method.")
+    logger.info("PySceneDetect not available - shot detection will use OpenCV fallback method. "
+                "To enable advanced scene detection, run: pip install scenedetect[opencv]")
     SCENEDETECT_AVAILABLE = False
 
 
