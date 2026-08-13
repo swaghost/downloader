@@ -18,6 +18,7 @@ import time
 import random
 import wave
 from pathlib import Path
+from typing import Tuple, List, Dict
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -40,6 +41,7 @@ from account_manager import AccountManager
 from instagram_manager import InstagramManager
 from content_database_manager import ContentDatabaseManager
 from shot_breakdown_manager import ShotBreakdownManager
+from stripe_composer_manager import StripeComposerManager
 from beat_composer_manager import BeatComposerManager
 
 logger = logging.getLogger(__name__)
@@ -2158,6 +2160,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.create_extract_audio_tab()
         self.create_framevid_tab()
         self.create_shot_breakdown_tab()
+        self.create_stripe_composer_tab()
         self.create_beat_composer_tab()
         self.create_topics_tab()
         self.create_settings_tab()
@@ -12362,11 +12365,14 @@ class InstagramDownloaderGUI(QMainWindow):
         input_group = QGroupBox("Step 1: Video Ingestion")
         input_layout = QVBoxLayout()
         
-        self.shot_breakdown_video_path_label = QLabel("No video selected")
+        self.shot_breakdown_video_path_label = VideoDropLabel("Drag & drop video here or click 'Select Video' below")
         self.shot_breakdown_video_path_label.setStyleSheet(
-            "padding: 10px; background-color: #1e293b; border-radius: 5px; color: #cbd5e1;"
+            "padding: 20px; background-color: #1e293b; border: 2px dashed #64748b; "
+            "border-radius: 5px; color: #cbd5e1; text-align: center;"
         )
         self.shot_breakdown_video_path_label.setWordWrap(True)
+        self.shot_breakdown_video_path_label.setAlignment(Qt.AlignCenter)
+        self.shot_breakdown_video_path_label.file_dropped.connect(self.shot_breakdown_video_dropped)
         input_layout.addWidget(self.shot_breakdown_video_path_label)
         
         btn_layout = QHBoxLayout()
@@ -12459,6 +12465,38 @@ class InstagramDownloaderGUI(QMainWindow):
         export_group = QGroupBox("Step 4: Export Results")
         export_layout = QVBoxLayout()
         
+        # Project name and file type settings
+        settings_row = QHBoxLayout()
+        
+        settings_row.addWidget(QLabel("Project Name:"))
+        self.shot_breakdown_project_name = QLineEdit()
+        self.shot_breakdown_project_name.setPlaceholderText("Enter project name")
+        self.shot_breakdown_project_name.setText("project")
+        self.shot_breakdown_project_name.setToolTip("Used for keyframe filenames")
+        settings_row.addWidget(self.shot_breakdown_project_name, 2)
+        
+        settings_row.addWidget(QLabel("Output Format:"))
+        self.shot_breakdown_output_format = QComboBox()
+        self.shot_breakdown_output_format.addItems(["PNG", "JPEG", "WEBP"])
+        self.shot_breakdown_output_format.setCurrentText("PNG")
+        self.shot_breakdown_output_format.setToolTip("Image format for saved keyframes")
+        settings_row.addWidget(self.shot_breakdown_output_format, 1)
+        
+        export_layout.addLayout(settings_row)
+        
+        # Save All Keyframes button
+        self.shot_breakdown_save_all_keyframes_btn = QPushButton("💾 Save All Keyframes")
+        self.shot_breakdown_save_all_keyframes_btn.clicked.connect(self.shot_breakdown_save_all_keyframes)
+        self.shot_breakdown_save_all_keyframes_btn.setEnabled(False)
+        self.shot_breakdown_save_all_keyframes_btn.setToolTip("Save keyframes from all shots to a folder")
+        self.shot_breakdown_save_all_keyframes_btn.setStyleSheet(
+            "QPushButton { background-color: #8b5cf6; color: white; padding: 10px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #7c3aed; } "
+            "QPushButton:disabled { background-color: #374151; color: #6b7280; }"
+        )
+        export_layout.addWidget(self.shot_breakdown_save_all_keyframes_btn)
+        
         export_btn_layout = QHBoxLayout()
         
         self.shot_breakdown_export_json_btn = QPushButton("📄 Preview & Export JSON")
@@ -12484,23 +12522,31 @@ class InstagramDownloaderGUI(QMainWindow):
         
         left_layout.addStretch()
         
-        # Right panel: Results display
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setSpacing(10)
+        # Middle panel: Shot/Keyframe list
+        middle_panel = QWidget()
+        middle_layout = QVBoxLayout(middle_panel)
+        middle_layout.setSpacing(10)
         
         results_label = QLabel("Step 3: Analysis Results")
         results_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
-        right_layout.addWidget(results_label)
+        middle_layout.addWidget(results_label)
         
         # Shot list
         self.shot_breakdown_shot_list = QListWidget()
         self.shot_breakdown_shot_list.itemClicked.connect(self.shot_breakdown_show_shot_details)
-        right_layout.addWidget(self.shot_breakdown_shot_list)
+        middle_layout.addWidget(self.shot_breakdown_shot_list)
+        
+        # Right panel: Details and keyframes
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setSpacing(10)
+        
+        details_header = QLabel("Keyframe Details")
+        details_header.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        right_layout.addWidget(details_header)
         
         # Create tabbed interface for details, prompt, and JSON
         self.shot_breakdown_details_tabs = QTabWidget()
-        self.shot_breakdown_details_tabs.setMaximumHeight(300)
         
         # Tab 1: Shot Details
         self.shot_breakdown_details_text = QTextEdit()
@@ -12562,12 +12608,14 @@ class InstagramDownloaderGUI(QMainWindow):
         # Store current shot data for keyframe saving
         self.shot_breakdown_current_shot = None
         
-        # Add panels to splitter
+        # Add panels to splitter (3-column layout)
         splitter.addWidget(left_panel)
+        splitter.addWidget(middle_panel)
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        splitter.setSizes([400, 600])
+        splitter.setStretchFactor(0, 2)  # Input details
+        splitter.setStretchFactor(1, 2)  # Keyframes list
+        splitter.setStretchFactor(2, 3)  # Detail tabstrip
+        splitter.setSizes([350, 350, 500])
         
         # Add splitter to layout with stretch to fill available space
         layout.addWidget(splitter, 1)
@@ -12576,6 +12624,296 @@ class InstagramDownloaderGUI(QMainWindow):
         self.tabs.addTab(tab, "🎬 Shot Breakdown")
         
         logger.info("Shot Breakdown tab initialized")
+    
+    def create_stripe_composer_tab(self):
+        """Create the 3-Stripe Composer tab"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(10)
+        
+        # Title
+        title = QLabel("3-Stripe Composer")
+        title.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        layout.addWidget(title)
+        
+        # Info
+        info = QLabel("Create split-screen videos with three parallel media stripes (horizontal or vertical)")
+        info.setStyleSheet("color: #94a3b8;")
+        layout.addWidget(info)
+        
+        # Main splitter for left controls and right preview
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Left panel: Controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setSpacing(10)
+        
+        # Output Settings
+        output_group = QGroupBox("Output Settings")
+        output_layout = QVBoxLayout()
+        
+        # Format mode toggle
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Size Mode:"))
+        self.stripe_size_mode = QComboBox()
+        self.stripe_size_mode.addItems(["Preset Formats", "Custom Dimensions"])
+        self.stripe_size_mode.currentTextChanged.connect(self.stripe_composer_size_mode_changed)
+        mode_layout.addWidget(self.stripe_size_mode, 1)
+        output_layout.addLayout(mode_layout)
+        
+        # Preset format dropdown
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("Format:"))
+        self.stripe_format = QComboBox()
+        self.stripe_format.addItems([
+            "📱 Vertical 9:16 (1080×1920)",
+            "📺 Wide 16:9 (1920×1080)",
+            "⬜ Square 1:1 (1080×1080)",
+            "📱 Social 4:5 (1080×1350)",
+            "🎬 Cinema 21:9 (2560×1080)"
+        ])
+        preset_layout.addWidget(self.stripe_format, 1)
+        output_layout.addLayout(preset_layout)
+        self.stripe_format_layout = preset_layout
+        
+        # Custom dimensions
+        custom_layout = QHBoxLayout()
+        custom_layout.addWidget(QLabel("Width:"))
+        self.stripe_width = QSpinBox()
+        self.stripe_width.setRange(320, 7680)
+        self.stripe_width.setValue(1920)
+        self.stripe_width.setSuffix(" px")
+        custom_layout.addWidget(self.stripe_width)
+        custom_layout.addWidget(QLabel("Height:"))
+        self.stripe_height = QSpinBox()
+        self.stripe_height.setRange(240, 4320)
+        self.stripe_height.setValue(1080)
+        self.stripe_height.setSuffix(" px")
+        custom_layout.addWidget(self.stripe_height)
+        output_layout.addLayout(custom_layout)
+        self.stripe_custom_layout_widgets = [self.stripe_width, self.stripe_height]
+        
+        # Direction
+        direction_layout = QHBoxLayout()
+        direction_layout.addWidget(QLabel("Direction:"))
+        self.stripe_direction = QComboBox()
+        self.stripe_direction.addItems(["↔️ Horizontal (Left/Center/Right)", "↕️ Vertical (Top/Middle/Bottom)"])
+        direction_layout.addWidget(self.stripe_direction, 1)
+        output_layout.addLayout(direction_layout)
+        
+        # FPS
+        fps_layout = QHBoxLayout()
+        fps_layout.addWidget(QLabel("FPS:"))
+        self.stripe_fps = QSpinBox()
+        self.stripe_fps.setRange(15, 60)
+        self.stripe_fps.setValue(30)
+        fps_layout.addWidget(self.stripe_fps)
+        fps_layout.addStretch()
+        output_layout.addLayout(fps_layout)
+        
+        output_group.setLayout(output_layout)
+        left_layout.addWidget(output_group)
+        
+        # Opening/Closing Files
+        bookend_group = QGroupBox("Opening & Closing Files (Optional)")
+        bookend_layout = QVBoxLayout()
+        
+        # Opening file
+        opening_layout = QHBoxLayout()
+        opening_layout.addWidget(QLabel("Opening:"))
+        self.stripe_opening_label = MediaDropLabel("Drop opening video/image")
+        self.stripe_opening_label.setStyleSheet(
+            "padding: 10px; background-color: #1e293b; border: 1px dashed #64748b; "
+            "border-radius: 5px; color: #94a3b8;"
+        )
+        self.stripe_opening_label.file_dropped.connect(self.stripe_opening_dropped)
+        opening_layout.addWidget(self.stripe_opening_label, 1)
+        self.stripe_opening_duration = QDoubleSpinBox()
+        self.stripe_opening_duration.setRange(0.1, 60.0)
+        self.stripe_opening_duration.setValue(2.0)
+        self.stripe_opening_duration.setSuffix(" sec")
+        self.stripe_opening_duration.setToolTip("Duration for opening")
+        opening_layout.addWidget(self.stripe_opening_duration)
+        clear_opening_btn = QPushButton("✖")
+        clear_opening_btn.clicked.connect(lambda: self.stripe_clear_bookend('opening'))
+        clear_opening_btn.setMaximumWidth(30)
+        opening_layout.addWidget(clear_opening_btn)
+        bookend_layout.addLayout(opening_layout)
+        
+        # Closing file
+        closing_layout = QHBoxLayout()
+        closing_layout.addWidget(QLabel("Closing:"))
+        self.stripe_closing_label = MediaDropLabel("Drop closing video/image")
+        self.stripe_closing_label.setStyleSheet(
+            "padding: 10px; background-color: #1e293b; border: 1px dashed #64748b; "
+            "border-radius: 5px; color: #94a3b8;"
+        )
+        self.stripe_closing_label.file_dropped.connect(self.stripe_closing_dropped)
+        closing_layout.addWidget(self.stripe_closing_label, 1)
+        self.stripe_closing_duration = QDoubleSpinBox()
+        self.stripe_closing_duration.setRange(0.1, 60.0)
+        self.stripe_closing_duration.setValue(2.0)
+        self.stripe_closing_duration.setSuffix(" sec")
+        self.stripe_closing_duration.setToolTip("Duration for closing")
+        closing_layout.addWidget(self.stripe_closing_duration)
+        clear_closing_btn = QPushButton("✖")
+        clear_closing_btn.clicked.connect(lambda: self.stripe_clear_bookend('closing'))
+        clear_closing_btn.setMaximumWidth(30)
+        closing_layout.addWidget(clear_closing_btn)
+        bookend_layout.addLayout(closing_layout)
+        
+        bookend_group.setLayout(bookend_layout)
+        left_layout.addWidget(bookend_group)
+        
+        # Duration Controls
+        duration_group = QGroupBox("Duration Settings")
+        duration_layout = QVBoxLayout()
+        
+        total_layout = QHBoxLayout()
+        total_layout.addWidget(QLabel("Total Video Duration:"))
+        self.stripe_total_duration = QDoubleSpinBox()
+        self.stripe_total_duration.setRange(1.0, 3600.0)
+        self.stripe_total_duration.setValue(30.0)
+        self.stripe_total_duration.setSuffix(" sec")
+        total_layout.addWidget(self.stripe_total_duration)
+        auto_calc_btn = QPushButton("🔢 Auto-Calculate")
+        auto_calc_btn.setToolTip("Calculate total duration from file durations")
+        auto_calc_btn.clicked.connect(self.stripe_auto_calculate_total)
+        total_layout.addWidget(auto_calc_btn)
+        duration_layout.addLayout(total_layout)
+        
+        duration_group.setLayout(duration_layout)
+        left_layout.addWidget(duration_group)
+        
+        # Export Buttons
+        export_layout = QHBoxLayout()
+        self.stripe_preview_btn = QPushButton("▶️ Preview")
+        self.stripe_preview_btn.clicked.connect(self.stripe_preview_video)
+        self.stripe_preview_btn.setStyleSheet(
+            "QPushButton { background-color: #10b981; color: white; padding: 10px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #059669; }"
+        )
+        export_layout.addWidget(self.stripe_preview_btn)
+        
+        self.stripe_export_btn = QPushButton("💾 Export Video")
+        self.stripe_export_btn.clicked.connect(self.stripe_export_video)
+        self.stripe_export_btn.setStyleSheet(
+            "QPushButton { background-color: #3b82f6; color: white; padding: 10px; "
+            "font-weight: bold; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #2563eb; }"
+        )
+        export_layout.addWidget(self.stripe_export_btn)
+        left_layout.addLayout(export_layout)
+        
+        # Progress
+        self.stripe_progress = QProgressBar()
+        self.stripe_progress.setVisible(False)
+        left_layout.addWidget(self.stripe_progress)
+        
+        self.stripe_status = QLabel("Ready")
+        self.stripe_status.setStyleSheet(
+            "padding: 8px; background-color: #1e293b; border-radius: 5px; color: #94a3b8;"
+        )
+        self.stripe_status.setWordWrap(True)
+        left_layout.addWidget(self.stripe_status)
+        
+        left_layout.addStretch()
+        
+        # Right panel: File Tables
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setSpacing(10)
+        
+        # Create three stripe file tables
+        self.stripe_tables = []
+        stripe_names = ["Stripe 1", "Stripe 2", "Stripe 3"]
+        stripe_colors = ["#3b82f6", "#10b981", "#f59e0b"]
+        
+        for i, (name, color) in enumerate(zip(stripe_names, stripe_colors)):
+            stripe_group = QGroupBox(name)
+            stripe_group.setStyleSheet(f"QGroupBox {{ font-weight: bold; color: {color}; }}")
+            stripe_layout = QVBoxLayout()
+            
+            # Table for files
+            table = QTableWidget()
+            table.setColumnCount(4)
+            table.setHorizontalHeaderLabels(["File", "Duration (sec)", "Type", "Actions"])
+            table.horizontalHeader().setStretchLastSection(False)
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+            table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+            table.setColumnWidth(1, 120)
+            table.setColumnWidth(2, 80)
+            table.setColumnWidth(3, 100)
+            table.setAcceptDrops(True)
+            table.setDragEnabled(False)
+            table.setSelectionBehavior(QTableWidget.SelectRows)
+            table.setSelectionMode(QTableWidget.ExtendedSelection)
+            
+            # Connect drag-drop events
+            table.dragEnterEvent = lambda e, t=table: self.stripe_table_drag_enter(e, t)
+            table.dragMoveEvent = lambda e, t=table: self.stripe_table_drag_move(e, t)
+            table.dropEvent = lambda e, t=table, idx=i: self.stripe_table_drop(e, t, idx)
+            
+            stripe_layout.addWidget(table)
+            
+            # Buttons for this stripe
+            btn_layout = QHBoxLayout()
+            
+            add_btn = QPushButton("📂 Add Files")
+            add_btn.clicked.connect(lambda checked, idx=i: self.stripe_add_files(idx))
+            btn_layout.addWidget(add_btn)
+            
+            set_duration_btn = QPushButton("⏱️ Set Duration")
+            set_duration_btn.setToolTip("Set duration for selected files")
+            set_duration_btn.clicked.connect(lambda checked, idx=i: self.stripe_set_duration(idx))
+            btn_layout.addWidget(set_duration_btn)
+            
+            auto_duration_btn = QPushButton("🔢 Auto-Divide")
+            auto_duration_btn.setToolTip("Divide total duration equally among files")
+            auto_duration_btn.clicked.connect(lambda checked, idx=i: self.stripe_auto_divide_duration(idx))
+            btn_layout.addWidget(auto_duration_btn)
+            
+            clear_btn = QPushButton("🗑️ Clear All")
+            clear_btn.clicked.connect(lambda checked, idx=i: self.stripe_clear_table(idx))
+            btn_layout.addWidget(clear_btn)
+            
+            stripe_layout.addLayout(btn_layout)
+            stripe_group.setLayout(stripe_layout)
+            right_layout.addWidget(stripe_group)
+            
+            self.stripe_tables.append(table)
+        
+        # Add panels to splitter
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([350, 850])
+        
+        layout.addWidget(splitter, 1)
+        
+        # Add tab
+        self.tabs.addTab(tab, "🎨 3-Stripe Composer")
+        
+        # Initialize manager
+        self.stripe_composer_manager = StripeComposerManager()
+        
+        # Initialize state
+        self.stripe_opening_file = None
+        self.stripe_closing_file = None
+        self.stripe_file_lists = [[], [], []]  # Three lists for the three stripes
+        
+        # Set initial UI state
+        self.stripe_composer_size_mode_changed("Preset Formats")
+        
+        # Restore state
+        self._stripe_composer_restore_state()
+        
+        logger.info("3-Stripe Composer tab initialized")
     
     def shot_breakdown_select_video(self):
         """Open file dialog to select a video file"""
@@ -12587,12 +12925,23 @@ class InstagramDownloaderGUI(QMainWindow):
         )
         
         if file_path:
-            self.shot_breakdown_current_video = file_path
-            self.shot_breakdown_video_path_label.setText(file_path)
-            self.shot_breakdown_video_info_btn.setEnabled(True)
-            self.shot_breakdown_process_btn.setEnabled(True)
-            self.shot_breakdown_status.setText(f"Video loaded: {Path(file_path).name}")
-            logger.info(f"Selected video: {file_path}")
+            self._shot_breakdown_load_video(file_path)
+    
+    def shot_breakdown_video_dropped(self, file_path):
+        """Handle video file dropped onto the label"""
+        self._shot_breakdown_load_video(file_path)
+    
+    def _shot_breakdown_load_video(self, file_path):
+        """Common method to load a video file (from dialog or drag-drop)"""
+        if not file_path:
+            return
+        
+        self.shot_breakdown_current_video = file_path
+        self.shot_breakdown_video_path_label.setText(file_path)
+        self.shot_breakdown_video_info_btn.setEnabled(True)
+        self.shot_breakdown_process_btn.setEnabled(True)
+        self.shot_breakdown_status.setText(f"Video loaded: {Path(file_path).name}")
+        logger.info(f"Selected video: {file_path}")
     
     def shot_breakdown_show_video_info(self):
         """Display video metadata"""
@@ -12678,6 +13027,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.shot_breakdown_export_json_btn.setEnabled(True)
         self.shot_breakdown_export_prompts_btn.setEnabled(True)
         self.shot_breakdown_open_folder_btn.setEnabled(True)
+        self.shot_breakdown_save_all_keyframes_btn.setEnabled(True)
         
         # Update status
         shot_count = results['shot_count']
@@ -13074,21 +13424,36 @@ DEPENDENCIES:
         
         try:
             import shutil
+            from PIL import Image
+            
             saved_count = 0
             shot_num = self.shot_breakdown_current_shot['shot_number']
+            project_name = self.shot_breakdown_project_name.text().strip() or "project"
+            output_format = self.shot_breakdown_output_format.currentText().lower()
+            extension = f".{output_format}"
             
             for i, keyframe_path in enumerate(keyframes):
                 if not os.path.exists(keyframe_path):
                     logger.warning(f"Keyframe not found: {keyframe_path}")
                     continue
                 
-                # Create descriptive filename
-                keyframe_file = Path(keyframe_path)
-                new_filename = f"shot_{shot_num:03d}_keyframe_{i+1}{keyframe_file.suffix}"
+                # Extract frame number from the keyframe path
+                # Format: shot_0001_first_frame_000123.jpg
+                frame_num = self._extract_frame_number_from_keyframe(keyframe_path)
+                
+                # Create new filename: [project-name].K[keyframe index].f[frame number].[extension]
+                new_filename = f"{project_name}.K{i+1:03d}.f{frame_num:06d}{extension}"
                 dest_path = Path(folder) / new_filename
                 
-                # Copy keyframe to destination
-                shutil.copy2(keyframe_path, dest_path)
+                # Convert image format if needed
+                if extension != Path(keyframe_path).suffix.lower():
+                    img = Image.open(keyframe_path)
+                    if output_format == 'jpeg':
+                        img = img.convert('RGB')  # JPEG doesn't support transparency
+                    img.save(dest_path, format=output_format.upper())
+                else:
+                    shutil.copy2(keyframe_path, dest_path)
+                
                 saved_count += 1
                 logger.info(f"Saved keyframe: {dest_path}")
             
@@ -13122,6 +13487,786 @@ DEPENDENCIES:
                 f"Failed to save keyframes:\n{e}"
             )
             logger.error(f"Keyframe save error: {e}")
+    
+    def shot_breakdown_save_all_keyframes(self):
+        """Save keyframes from all shots to a selected folder"""
+        if not self.shot_breakdown_results:
+            QMessageBox.warning(self, "No Analysis Results", "Please process a video first.")
+            return
+        
+        shots = self.shot_breakdown_results.get('shots', [])
+        if not shots:
+            QMessageBox.warning(self, "No Shots", "No shots found in analysis results.")
+            return
+        
+        # Ask user to select destination folder
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder to Save All Keyframes",
+            str(Path.home())
+        )
+        
+        if not folder:
+            return
+        
+        try:
+            import shutil
+            from PIL import Image
+            
+            project_name = self.shot_breakdown_project_name.text().strip() or "project"
+            output_format = self.shot_breakdown_output_format.currentText().lower()
+            extension = f".{output_format}"
+            
+            saved_count = 0
+            total_keyframes = 0
+            
+            # Count total keyframes for progress
+            for shot in shots:
+                total_keyframes += len(shot.get('keyframes', []))
+            
+            if total_keyframes == 0:
+                QMessageBox.warning(self, "No Keyframes", "No keyframes found in any shots.")
+                return
+            
+            # Show progress
+            progress_dialog = QProgressDialog(
+                "Saving keyframes...",
+                "Cancel",
+                0,
+                total_keyframes,
+                self
+            )
+            progress_dialog.setWindowTitle("Saving Keyframes")
+            progress_dialog.setWindowModality(Qt.WindowModal)
+            progress_dialog.show()
+            
+            keyframe_index = 1
+            
+            for shot in shots:
+                keyframes = shot.get('keyframes', [])
+                
+                for keyframe_path in keyframes:
+                    if progress_dialog.wasCanceled():
+                        break
+                    
+                    if not os.path.exists(keyframe_path):
+                        logger.warning(f"Keyframe not found: {keyframe_path}")
+                        progress_dialog.setValue(saved_count)
+                        continue
+                    
+                    # Extract frame number from the keyframe path
+                    frame_num = self._extract_frame_number_from_keyframe(keyframe_path)
+                    
+                    # Create new filename: [project-name].K[keyframe index].f[frame number].[extension]
+                    new_filename = f"{project_name}.K{keyframe_index:03d}.f{frame_num:06d}{extension}"
+                    dest_path = Path(folder) / new_filename
+                    
+                    # Convert image format if needed
+                    if extension != Path(keyframe_path).suffix.lower():
+                        img = Image.open(keyframe_path)
+                        if output_format == 'jpeg':
+                            img = img.convert('RGB')  # JPEG doesn't support transparency
+                        img.save(dest_path, format=output_format.upper())
+                    else:
+                        shutil.copy2(keyframe_path, dest_path)
+                    
+                    saved_count += 1
+                    keyframe_index += 1
+                    progress_dialog.setValue(saved_count)
+                    logger.info(f"Saved keyframe: {dest_path}")
+                    
+                    QApplication.processEvents()
+                
+                if progress_dialog.wasCanceled():
+                    break
+            
+            progress_dialog.close()
+            
+            # Show success message
+            QMessageBox.information(
+                self,
+                "Keyframes Saved",
+                f"Successfully saved {saved_count} keyframe(s) to:\n{folder}"
+            )
+            
+            # Optionally open the folder
+            reply = QMessageBox.question(
+                self,
+                "Open Folder?",
+                "Would you like to open the destination folder?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                if platform.system() == 'Windows':
+                    os.startfile(folder)
+                elif platform.system() == 'Darwin':  # macOS
+                    subprocess.Popen(['open', folder])
+                else:  # Linux
+                    subprocess.Popen(['xdg-open', folder])
+        
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error Saving Keyframes",
+                f"Failed to save keyframes:\n{e}"
+            )
+            logger.error(f"Save all keyframes error: {e}")
+    
+    def _extract_frame_number_from_keyframe(self, keyframe_path: str) -> int:
+        """Extract frame number from keyframe filename"""
+        # Format: shot_0001_first_frame_000123.jpg
+        import re
+        match = re.search(r'frame_(\d+)', Path(keyframe_path).stem)
+        if match:
+            return int(match.group(1))
+        return 0
+    
+    # ===== 3-Stripe Composer Methods =====
+    
+    def stripe_composer_size_mode_changed(self, mode):
+        """Toggle between preset and custom size modes"""
+        if mode == "Preset Formats":
+            # Show preset, hide custom
+            for widget in self.stripe_format_layout.parentWidget().findChildren(QWidget):
+                if widget in [self.stripe_format] + [self.stripe_format_layout.itemAt(i).widget() for i in range(self.stripe_format_layout.count())]:
+                    widget.setVisible(True)
+            for widget in self.stripe_custom_layout_widgets:
+                widget.setVisible(False)
+            # Hide the Width/Height labels
+            parent = self.stripe_width.parentWidget().layout()
+            for i in range(parent.count()):
+                item = parent.itemAt(i)
+                if item and item.widget():
+                    widget = item.widget()
+                    if isinstance(widget, QLabel) and widget.text() in ["Width:", "Height:"]:
+                        widget.setVisible(False)
+        else:
+            # Hide preset, show custom
+            for widget in self.stripe_format_layout.parentWidget().findChildren(QWidget):
+                if widget in [self.stripe_format] + [self.stripe_format_layout.itemAt(i).widget() for i in range(self.stripe_format_layout.count())]:
+                    widget.setVisible(False)
+            for widget in self.stripe_custom_layout_widgets:
+                widget.setVisible(True)
+            # Show the Width/Height labels
+            parent = self.stripe_width.parentWidget().layout()
+            for i in range(parent.count()):
+                item = parent.itemAt(i)
+                if item and item.widget():
+                    widget = item.widget()
+                    if isinstance(widget, QLabel) and widget.text() in ["Width:", "Height:"]:
+                        widget.setVisible(True)
+        
+        self._stripe_composer_save_state()
+    
+    def stripe_opening_dropped(self, file_path):
+        """Handle opening file dropped"""
+        self.stripe_opening_file = file_path
+        self.stripe_opening_label.setText(Path(file_path).name)
+        self._stripe_composer_save_state()
+    
+    def stripe_closing_dropped(self, file_path):
+        """Handle closing file dropped"""
+        self.stripe_closing_file = file_path
+        self.stripe_closing_label.setText(Path(file_path).name)
+        self._stripe_composer_save_state()
+    
+    def stripe_clear_bookend(self, which):
+        """Clear opening or closing file"""
+        if which == 'opening':
+            self.stripe_opening_file = None
+            self.stripe_opening_label.setText("Drop opening video/image")
+        else:
+            self.stripe_closing_file = None
+            self.stripe_closing_label.setText("Drop closing video/image")
+        self._stripe_composer_save_state()
+    
+    def stripe_table_drag_enter(self, event, table):
+        """Handle drag enter for file tables"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+    
+    def stripe_table_drag_move(self, event, table):
+        """Handle drag move for file tables"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+    
+    def stripe_table_drop(self, event, table, stripe_idx):
+        """Handle drop event for file tables"""
+        if not event.mimeData().hasUrls():
+            return
+        
+        files = []
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                ext = os.path.splitext(path)[1].lower()
+                if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v']:
+                    files.append(path)
+        
+        if files:
+            self._stripe_add_files_to_table(stripe_idx, files)
+            event.acceptProposedAction()
+    
+    def stripe_add_files(self, stripe_idx):
+        """Open dialog to add files to a stripe"""
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"Select Files for Stripe {stripe_idx + 1}",
+            str(Path.home()),
+            "Media Files (*.jpg *.jpeg *.png *.gif *.bmp *.webp *.mp4 *.mov *.avi *.mkv *.webm *.m4v);;All Files (*.*)"
+        )
+        
+        if files:
+            self._stripe_add_files_to_table(stripe_idx, files)
+    
+    def _stripe_add_files_to_table(self, stripe_idx, files):
+        """Add files to the specified stripe table"""
+        table = self.stripe_tables[stripe_idx]
+        
+        for file_path in files:
+            row = table.rowCount()
+            table.insertRow(row)
+            
+            # File name
+            name_item = QTableWidgetItem(Path(file_path).name)
+            name_item.setData(Qt.UserRole, file_path)
+            name_item.setToolTip(file_path)
+            table.setItem(row, 0, name_item)
+            
+            # Duration spinbox
+            duration_spin = QDoubleSpinBox()
+            duration_spin.setRange(0.1, 300.0)
+            duration_spin.setValue(3.0)
+            duration_spin.setSuffix(" sec")
+            duration_spin.valueChanged.connect(self._stripe_composer_save_state)
+            table.setCellWidget(row, 1, duration_spin)
+            
+            # Type
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v']:
+                file_type = "Video"
+            else:
+                file_type = "Image"
+            type_item = QTableWidgetItem(file_type)
+            table.setItem(row, 2, type_item)
+            
+            # Actions
+            btn_widget = QWidget()
+            btn_layout = QHBoxLayout(btn_widget)
+            btn_layout.setContentsMargins(2, 2, 2, 2)
+            btn_layout.setSpacing(2)
+            
+            remove_btn = QPushButton("🗑️")
+            remove_btn.setMaximumWidth(30)
+            remove_btn.setToolTip("Remove this file")
+            remove_btn.clicked.connect(lambda checked, r=row, t=table: self._stripe_remove_file(t, r))
+            btn_layout.addWidget(remove_btn)
+            
+            table.setCellWidget(row, 3, btn_widget)
+        
+        self._stripe_composer_save_state()
+    
+    def _stripe_remove_file(self, table, row):
+        """Remove a file from the table"""
+        # Find which stripe this table belongs to
+        try:
+            stripe_idx = self.stripe_tables.index(table)
+        except ValueError:
+            return
+        
+        # Get current row count to handle removal correctly
+        actual_row = None
+        for r in range(table.rowCount()):
+            if table.cellWidget(r, 3) and table.cellWidget(r, 3).findChild(QPushButton):
+                if table.cellWidget(r, 3).findChild(QPushButton).text() == "🗑️":
+                    actual_row = r
+                    break
+        
+        if actual_row is not None:
+            table.removeRow(actual_row)
+        else:
+            table.removeRow(row)
+        
+        self._stripe_composer_save_state()
+    
+    def stripe_set_duration(self, stripe_idx):
+        """Set duration for selected files in a stripe"""
+        table = self.stripe_tables[stripe_idx]
+        selected_rows = sorted(set(index.row() for index in table.selectedIndexes()))
+        
+        if not selected_rows:
+            QMessageBox.information(self, "No Selection", "Please select one or more files to set duration.")
+            return
+        
+        duration, ok = QInputDialog.getDouble(
+            self, 
+            "Set Duration",
+            f"Duration for {len(selected_rows)} selected file(s) in Stripe {stripe_idx + 1}:",
+            value=3.0,
+            min=0.1,
+            max=300.0,
+            decimals=1
+        )
+        
+        if ok:
+            for row in selected_rows:
+                duration_widget = table.cellWidget(row, 1)
+                if isinstance(duration_widget, QDoubleSpinBox):
+                    duration_widget.setValue(duration)
+            
+            self._stripe_composer_save_state()
+    
+    def stripe_auto_divide_duration(self, stripe_idx):
+        """Divide total duration equally among files in a stripe"""
+        table = self.stripe_tables[stripe_idx]
+        file_count = table.rowCount()
+        
+        if file_count == 0:
+            QMessageBox.information(self, "No Files", f"Stripe {stripe_idx + 1} has no files.")
+            return
+        
+        total_duration = self.stripe_total_duration.value()
+        duration_per_file = total_duration / file_count
+        
+        for row in range(file_count):
+            duration_widget = table.cellWidget(row, 1)
+            if isinstance(duration_widget, QDoubleSpinBox):
+                duration_widget.setValue(duration_per_file)
+        
+        QMessageBox.information(
+            self,
+            "Duration Set",
+            f"Set {file_count} files in Stripe {stripe_idx + 1} to {duration_per_file:.2f} seconds each."
+        )
+        self._stripe_composer_save_state()
+    
+    def stripe_clear_table(self, stripe_idx):
+        """Clear all files from a stripe"""
+        reply = QMessageBox.question(
+            self,
+            "Clear Stripe",
+            f"Remove all files from Stripe {stripe_idx + 1}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.stripe_tables[stripe_idx].setRowCount(0)
+            self._stripe_composer_save_state()
+    
+    def stripe_auto_calculate_total(self):
+        """Calculate total duration from longest stripe"""
+        max_duration = 0.0
+        
+        for table in self.stripe_tables:
+            stripe_duration = 0.0
+            for row in range(table.rowCount()):
+                duration_widget = table.cellWidget(row, 1)
+                if isinstance(duration_widget, QDoubleSpinBox):
+                    stripe_duration += duration_widget.value()
+            max_duration = max(max_duration, stripe_duration)
+        
+        if max_duration > 0:
+            self.stripe_total_duration.setValue(max_duration)
+            QMessageBox.information(
+                self,
+                "Duration Calculated",
+                f"Total duration set to {max_duration:.2f} seconds (longest stripe)."
+            )
+        else:
+            QMessageBox.information(self, "No Files", "Add files to stripes first.")
+    
+    def stripe_preview_video(self):
+        """Preview the stripe composition"""
+        try:
+            # Check dependencies
+            from stripe_composer_manager import check_dependencies_available
+            if not check_dependencies_available():
+                QMessageBox.critical(
+                    self,
+                    "Missing Dependencies",
+                    "MoviePy is not installed.\n\n"
+                    "Install with: pip install moviepy\n\n"
+                    "After installation, restart the application."
+                )
+                return
+            
+            # Validate files
+            has_files = any(table.rowCount() > 0 for table in self.stripe_tables)
+            if not has_files:
+                QMessageBox.information(
+                    self,
+                    "No Files",
+                    "Add files to at least one stripe before previewing."
+                )
+                return
+            
+            # Get resolution
+            resolution = self._stripe_get_resolution()
+            
+            # Get direction
+            direction = 'horizontal' if 'Horizontal' in self.stripe_direction.currentText() else 'vertical'
+            
+            # Collect stripe files
+            stripe_files = self._stripe_collect_files()
+            
+            # Get opening/closing
+            opening = None
+            if self.stripe_opening_file:
+                opening = {
+                    'path': self.stripe_opening_file,
+                    'duration': self.stripe_opening_duration.value()
+                }
+            
+            closing = None
+            if self.stripe_closing_file:
+                closing = {
+                    'path': self.stripe_closing_file,
+                    'duration': self.stripe_closing_duration.value()
+                }
+            
+            # Create preview in temp location
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / 'stripe_composer_preview'
+            temp_dir.mkdir(exist_ok=True)
+            preview_path = temp_dir / 'preview.mp4'
+            
+            # Show progress
+            self.stripe_progress.setVisible(True)
+            self.stripe_progress.setValue(0)
+            self.stripe_status.setText("Composing preview...")
+            self.stripe_preview_btn.setEnabled(False)
+            self.stripe_export_btn.setEnabled(False)
+            QApplication.processEvents()
+            
+            # Progress callback
+            def update_progress(current, total, status):
+                self.stripe_status.setText(f"🎬 Preview: {status}")
+                if total > 0:
+                    percent = int((current / total) * 100)
+                    self.stripe_progress.setValue(percent)
+                QApplication.processEvents()
+                return True
+            
+            # Compose video
+            video_path = self.stripe_composer_manager.compose_video(
+                stripe_files=stripe_files,
+                output_path=str(preview_path),
+                resolution=resolution,
+                direction=direction,
+                total_duration=self.stripe_total_duration.value(),
+                fps=self.stripe_fps.value(),
+                opening_file=opening,
+                closing_file=closing,
+                progress_callback=update_progress
+            )
+            
+            # Hide progress
+            self.stripe_progress.setVisible(False)
+            self.stripe_status.setText("Preview ready!")
+            self.stripe_preview_btn.setEnabled(True)
+            self.stripe_export_btn.setEnabled(True)
+            
+            # Open preview
+            if platform.system() == 'Windows':
+                os.startfile(video_path)
+            elif platform.system() == 'Darwin':
+                subprocess.Popen(['open', video_path])
+            else:
+                subprocess.Popen(['xdg-open', video_path])
+            
+            logger.info(f"Preview video created: {video_path}")
+        
+        except Exception as e:
+            self.stripe_progress.setVisible(False)
+            self.stripe_status.setText("Error creating preview")
+            self.stripe_preview_btn.setEnabled(True)
+            self.stripe_export_btn.setEnabled(True)
+            
+            QMessageBox.critical(self, "Error", f"Failed to create preview:\n{e}")
+            logger.error(f"Preview error: {e}", exc_info=True)
+    
+    def stripe_export_video(self):
+        """Export the stripe composition"""
+        # Get last export directory
+        last_export_dir = self.account_manager.get_setting(
+            'stripe_composer_last_export_dir',
+            str(Path.home() / 'Documents')
+        )
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export 3-Stripe Video",
+            str(Path(last_export_dir) / f"stripe_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"),
+            "Video Files (*.mp4);;All Files (*.*)"
+        )
+        
+        if not file_path:
+            return
+        
+        # Save directory
+        self.account_manager.set_setting('stripe_composer_last_export_dir', str(Path(file_path).parent))
+        
+        try:
+            # Check dependencies
+            from stripe_composer_manager import check_dependencies_available
+            if not check_dependencies_available():
+                QMessageBox.critical(
+                    self,
+                    "Missing Dependencies",
+                    "MoviePy is not installed.\n\n"
+                    "Install with: pip install moviepy\n\n"
+                    "After installation, restart the application."
+                )
+                return
+            
+            # Validate files
+            has_files = any(table.rowCount() > 0 for table in self.stripe_tables)
+            if not has_files:
+                QMessageBox.information(
+                    self,
+                    "No Files",
+                    "Add files to at least one stripe before exporting."
+                )
+                return
+            
+            # Get resolution
+            resolution = self._stripe_get_resolution()
+            
+            # Get direction
+            direction = 'horizontal' if 'Horizontal' in self.stripe_direction.currentText() else 'vertical'
+            
+            # Collect stripe files
+            stripe_files = self._stripe_collect_files()
+            
+            # Get opening/closing
+            opening = None
+            if self.stripe_opening_file:
+                opening = {
+                    'path': self.stripe_opening_file,
+                    'duration': self.stripe_opening_duration.value()
+                }
+            
+            closing = None
+            if self.stripe_closing_file:
+                closing = {
+                    'path': self.stripe_closing_file,
+                    'duration': self.stripe_closing_duration.value()
+                }
+            
+            # Show progress
+            self.stripe_progress.setVisible(True)
+            self.stripe_progress.setValue(0)
+            self.stripe_status.setText("Exporting video...")
+            self.stripe_preview_btn.setEnabled(False)
+            self.stripe_export_btn.setEnabled(False)
+            QApplication.processEvents()
+            
+            # Progress callback
+            def update_progress(current, total, status):
+                self.stripe_status.setText(f"💾 Export: {status}")
+                if total > 0:
+                    percent = int((current / total) * 100)
+                    self.stripe_progress.setValue(percent)
+                QApplication.processEvents()
+                return True
+            
+            # Compose video
+            video_path = self.stripe_composer_manager.compose_video(
+                stripe_files=stripe_files,
+                output_path=file_path,
+                resolution=resolution,
+                direction=direction,
+                total_duration=self.stripe_total_duration.value(),
+                fps=self.stripe_fps.value(),
+                opening_file=opening,
+                closing_file=closing,
+                progress_callback=update_progress
+            )
+            
+            # Hide progress
+            self.stripe_progress.setVisible(False)
+            self.stripe_status.setText("Export complete!")
+            self.stripe_preview_btn.setEnabled(True)
+            self.stripe_export_btn.setEnabled(True)
+            
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Video exported successfully!\n\n{video_path}"
+            )
+            
+            # Ask to open folder
+            reply = QMessageBox.question(
+                self,
+                "Open Folder?",
+                "Would you like to open the output folder?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                folder = str(Path(video_path).parent)
+                if platform.system() == 'Windows':
+                    os.startfile(folder)
+                elif platform.system() == 'Darwin':
+                    subprocess.Popen(['open', folder])
+                else:
+                    subprocess.Popen(['xdg-open', folder])
+            
+            logger.info(f"Video exported: {video_path}")
+        
+        except Exception as e:
+            self.stripe_progress.setVisible(False)
+            self.stripe_status.setText("Error exporting video")
+            self.stripe_preview_btn.setEnabled(True)
+            self.stripe_export_btn.setEnabled(True)
+            
+            QMessageBox.critical(self, "Error", f"Failed to export video:\n{e}")
+            logger.error(f"Export error: {e}", exc_info=True)
+    
+    def _stripe_get_resolution(self) -> Tuple[int, int]:
+        """Get the output resolution based on current settings"""
+        if self.stripe_size_mode.currentText() == "Preset Formats":
+            # Parse preset format
+            import re
+            format_text = self.stripe_format.currentText()
+            match = re.search(r'\((\d+)×(\d+)\)', format_text)
+            if match:
+                return (int(match.group(1)), int(match.group(2)))
+            return (1920, 1080)  # Default
+        else:
+            # Custom dimensions
+            return (self.stripe_width.value(), self.stripe_height.value())
+    
+    def _stripe_collect_files(self) -> List[List[Dict]]:
+        """Collect all files from the three stripe tables"""
+        stripe_files = []
+        
+        for table in self.stripe_tables:
+            files = []
+            for row in range(table.rowCount()):
+                name_item = table.item(row, 0)
+                duration_widget = table.cellWidget(row, 1)
+                
+                if name_item and duration_widget:
+                    file_path = name_item.data(Qt.UserRole)
+                    if file_path and os.path.exists(file_path):
+                        files.append({
+                            'path': file_path,
+                            'duration': duration_widget.value()
+                        })
+            
+            stripe_files.append(files)
+        
+        return stripe_files
+    
+    def _stripe_composer_save_state(self):
+        """Save 3-Stripe Composer state"""
+        try:
+            state = {
+                'size_mode': self.stripe_size_mode.currentText(),
+                'format': self.stripe_format.currentText(),
+                'width': self.stripe_width.value(),
+                'height': self.stripe_height.value(),
+                'direction': self.stripe_direction.currentText(),
+                'fps': self.stripe_fps.value(),
+                'opening_file': self.stripe_opening_file,
+                'opening_duration': self.stripe_opening_duration.value(),
+                'closing_file': self.stripe_closing_file,
+                'closing_duration': self.stripe_closing_duration.value(),
+                'total_duration': self.stripe_total_duration.value(),
+                'stripes': []
+            }
+            
+            # Save each stripe's files
+            for table in self.stripe_tables:
+                files = []
+                for row in range(table.rowCount()):
+                    name_item = table.item(row, 0)
+                    duration_widget = table.cellWidget(row, 1)
+                    if name_item and duration_widget:
+                        files.append({
+                            'path': name_item.data(Qt.UserRole),
+                            'duration': duration_widget.value()
+                        })
+                state['stripes'].append(files)
+            
+            state_json = json.dumps(state)
+            self.account_manager.set_setting('stripe_composer_state', state_json)
+            logger.debug("3-Stripe Composer state saved")
+        except Exception as e:
+            logger.error(f"Failed to save 3-Stripe Composer state: {e}")
+    
+    def _stripe_composer_restore_state(self):
+        """Restore 3-Stripe Composer state"""
+        try:
+            state_json = self.account_manager.get_setting('stripe_composer_state', None)
+            if not state_json:
+                logger.debug("No 3-Stripe Composer state to restore")
+                return
+            
+            state = json.loads(state_json)
+            
+            # Restore settings
+            if state.get('size_mode'):
+                idx = self.stripe_size_mode.findText(state['size_mode'])
+                if idx >= 0:
+                    self.stripe_size_mode.setCurrentIndex(idx)
+            
+            if state.get('format'):
+                idx = self.stripe_format.findText(state['format'])
+                if idx >= 0:
+                    self.stripe_format.setCurrentIndex(idx)
+            
+            if state.get('width'):
+                self.stripe_width.setValue(state['width'])
+            
+            if state.get('height'):
+                self.stripe_height.setValue(state['height'])
+            
+            if state.get('direction'):
+                idx = self.stripe_direction.findText(state['direction'])
+                if idx >= 0:
+                    self.stripe_direction.setCurrentIndex(idx)
+            
+            if state.get('fps'):
+                self.stripe_fps.setValue(state['fps'])
+            
+            if state.get('opening_file') and os.path.exists(state['opening_file']):
+                self.stripe_opening_file = state['opening_file']
+                self.stripe_opening_label.setText(Path(state['opening_file']).name)
+            
+            if state.get('opening_duration'):
+                self.stripe_opening_duration.setValue(state['opening_duration'])
+            
+            if state.get('closing_file') and os.path.exists(state['closing_file']):
+                self.stripe_closing_file = state['closing_file']
+                self.stripe_closing_label.setText(Path(state['closing_file']).name)
+            
+            if state.get('closing_duration'):
+                self.stripe_closing_duration.setValue(state['closing_duration'])
+            
+            if state.get('total_duration'):
+                self.stripe_total_duration.setValue(state['total_duration'])
+            
+            # Restore files for each stripe
+            if state.get('stripes'):
+                for stripe_idx, files in enumerate(state['stripes']):
+                    if stripe_idx < len(self.stripe_tables):
+                        existing_files = [f['path'] for f in files if os.path.exists(f['path'])]
+                        if existing_files:
+                            self._stripe_add_files_to_table(stripe_idx, existing_files)
+                            # Set durations
+                            table = self.stripe_tables[stripe_idx]
+                            for row, file_data in enumerate(files):
+                                if row < table.rowCount() and os.path.exists(file_data['path']):
+                                    duration_widget = table.cellWidget(row, 1)
+                                    if isinstance(duration_widget, QDoubleSpinBox):
+                                        duration_widget.setValue(file_data['duration'])
+            
+            logger.debug("3-Stripe Composer state restored")
+        except Exception as e:
+            logger.error(f"Failed to restore 3-Stripe Composer state: {e}")
     
     def create_beat_composer_tab(self):
         """Create the Beat-Composer tab for music video creation"""
